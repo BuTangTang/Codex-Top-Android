@@ -2983,8 +2983,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         return true;
     }
 
+    /** 原版会话页面在 Codex 包只加载电脑会话，删去联系人、贴纸等上游加载工作。 */
     public static void loadDialogs(AccountInstance accountInstance) {
         int currentAccount = accountInstance.getCurrentAccount();
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            com.butang.codextop.CodexRuntime.refreshDialogs(currentAccount);
+            return;
+        }
         if (!dialogsLoaded[currentAccount]) {
             MessagesController messagesController = accountInstance.getMessagesController();
             messagesController.loadGlobalNotificationsSettings();
@@ -3508,6 +3513,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 communityAvatarImage.setRoundRadius(dp(11));
                 communityAvatarImage.setForUserOrChat(community, communityAvatarDrawable);
                 actionBar.addView(communityAvatarImage, LayoutHelper.createFrame(32, 32, Gravity.BOTTOM | Gravity.LEFT, 58, 0, 0, 12f));
+            } else if (context.getPackageName().startsWith("com.butang.codextop.nativepreview")) {
+                actionBar.setTitle("会话");
             } else {
                 statusDrawable = new AnimatedEmojiDrawable.SwapAnimatedEmojiDrawable(null, dp(26));
                 statusDrawable.center = true;
@@ -7048,7 +7055,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             tosAccepted = true;
         }
         final NotificationManager notificationManager = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
-        if (tosAccepted && folderId == 0 && communityId == 0 && checkPermission && !onlySelect && Build.VERSION.SDK_INT >= 23) {
+        // Codex 当前只接文字会话，不请求上游通讯录、存储和通知权限。
+        if (!com.butang.codextop.CodexRuntime.enabled() && tosAccepted && folderId == 0 && communityId == 0 && checkPermission && !onlySelect && Build.VERSION.SDK_INT >= 23) {
             Activity activity = getParentActivity();
             if (activity != null) {
                 checkPermission = false;
@@ -8842,8 +8850,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         return false;
     }
 
+    /** 桌面对话列表不提供尚未接入的新建和动态相机入口，其余构建沿用原动画。 */
     private void updateFloatingButtonVisibility(boolean animated) {
-        final boolean isVisible = !(onlySelect && initialDialogsType != 10 || folderId != 0 || communityId != 0 || inPreviewMode || (searching && !onlySelect) || floatingButtonHidden);
+        final boolean isVisible = !com.butang.codextop.CodexRuntime.enabled() && !(onlySelect && initialDialogsType != 10 || folderId != 0 || communityId != 0 || inPreviewMode || (searching && !onlySelect) || floatingButtonHidden);
 
         if (floatingButton3 != null) {
             floatingButton3.setButtonVisible(isVisible, animated);
@@ -13628,6 +13637,18 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         ItemOptions io = ItemOptions.makeOptions(this, optionsItem);
         io.setColors(getThemedColor(Theme.key_actionBarDefaultTitle), getThemedColor(Theme.key_actionBarDefaultTitle));
         io.setDimAlpha(0x08);
+
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            io.add(R.drawable.settings_data, "电脑", () -> {
+                Bundle child = new Bundle();
+                child.putBoolean("codexComputerBrowser", true);
+                presentFragment(new SettingsActivity(child));
+            });
+            io.add(R.drawable.msg_settings_old, "设置", () -> presentFragment(new SettingsActivity()));
+            io.show();
+            io.setTranslationY(-dp(64));
+            return;
+        }
 
         final Activity activity = getParentActivity();
         final LaunchActivity launchActivity;

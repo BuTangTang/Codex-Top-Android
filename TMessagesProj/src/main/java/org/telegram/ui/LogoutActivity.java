@@ -160,12 +160,14 @@ public class LogoutActivity extends BaseFragment {
         return fragmentView;
     }
 
+    /** 复用原退出确认框；独立 Codex 包使用中文提示和自身账号退出处理。 */
     public static AlertDialog makeLogOutDialog(Context context, int currentAccount) {
         AlertDialog.Builder builder = new AlertDialog.Builder(context);
-        builder.setMessage(LocaleController.getString(R.string.AreYouSureLogout));
-        builder.setTitle(LocaleController.getString(R.string.LogOut));
-        builder.setPositiveButton(LocaleController.getString(R.string.LogOut), (dialogInterface, i) -> MessagesController.getInstance(currentAccount).performLogout(1));
-        builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
+        boolean codex = com.butang.codextop.CodexRuntime.enabled();
+        builder.setMessage(codex ? "确定退出当前账号？本地聊天记录和草稿将保留。" : LocaleController.getString(R.string.AreYouSureLogout));
+        builder.setTitle(codex ? "退出登录" : LocaleController.getString(R.string.LogOut));
+        builder.setPositiveButton(codex ? "退出登录" : LocaleController.getString(R.string.LogOut), (dialogInterface, i) -> MessagesController.getInstance(currentAccount).performLogout(1));
+        builder.setNegativeButton(codex ? "取消" : LocaleController.getString(R.string.Cancel), null);
         AlertDialog alertDialog = builder.create();
         TextView button = (TextView) alertDialog.getButton(DialogInterface.BUTTON_POSITIVE);
         if (button != null) {

@@ -110,6 +110,7 @@ public class ChatActivitySideControlsButtonsLayout extends FrameLayout implement
     }
 
     public void showButton(final int buttonId, boolean show, boolean animated) {
+        if (buttonId == BUTTON_ATTACH && com.butang.codextop.CodexRuntime.enabled()) show = false;
         if (buttonHolders[buttonId] == null && !show) {
             return;
         }

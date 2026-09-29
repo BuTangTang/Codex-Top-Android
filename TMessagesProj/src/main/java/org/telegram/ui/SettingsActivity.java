@@ -186,6 +186,63 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     private int versionViewPressCount = 0;
 
+    private com.google.gson.JsonArray codexBrowseRows = new com.google.gson.JsonArray();
+    private String codexBrowseError;
+    private boolean codexBrowseLoading;
+    private int codexBrowseGeneration;
+    private String codexBrowseCursor;
+    private boolean codexBrowseLoaded;
+    private boolean codexBrowseIncomplete;
+
+    /** 使用原设置列表承载电脑和项目子页，保留原导航栈与转场。 */
+    private boolean codexBrowser() {
+        return com.butang.codextop.CodexRuntime.enabled() && getArguments() != null
+                && getArguments().getBoolean("codexComputerBrowser", false);
+    }
+
+    /** 当前是否为独立的电脑或项目对话页。 */
+    private boolean codexConversations() {
+        return codexBrowser() && getArguments().getBoolean("codexConversations", false);
+    }
+
+    /** 加载所选电脑或项目的下一页；退出后的旧响应不更新界面，失败保留原列表。 */
+    private void loadCodexBrowser() {
+        if (!codexBrowser() || codexBrowseLoading) return;
+        codexBrowseLoading = true;
+        codexBrowseError = null;
+        int generation = ++codexBrowseGeneration;
+        if (codexConversations()) {
+            com.butang.codextop.CodexRuntime.browseConversations(currentAccount,
+                    getArguments().getString("codexMachine"), getArguments().getStringArrayList("codexRoots"),
+                    codexBrowseCursor, (page, error) -> {
+                if (generation != codexBrowseGeneration) return;
+                codexBrowseLoading = false;
+                codexBrowseError = error;
+                if (page != null) {
+                    if (codexBrowseCursor == null) codexBrowseRows = new com.google.gson.JsonArray();
+                    java.util.HashSet<Long> present = new java.util.HashSet<>();
+                    for (com.google.gson.JsonElement value : codexBrowseRows)
+                        present.add(value.getAsJsonObject().get("localDialogId").getAsLong());
+                    for (com.google.gson.JsonElement value : page.getAsJsonArray("candidates"))
+                        if (present.add(value.getAsJsonObject().get("localDialogId").getAsLong())) codexBrowseRows.add(value);
+                    codexBrowseCursor = page.has("nextCursor") && !page.get("nextCursor").isJsonNull()
+                            ? page.get("nextCursor").getAsString() : null;
+                    codexBrowseIncomplete = page.has("searchIncomplete") && page.get("searchIncomplete").getAsBoolean();
+                    codexBrowseLoaded = true;
+                }
+                if (listView != null) listView.adapter.update(true);
+            });
+            return;
+        }
+        com.butang.codextop.CodexRuntime.browseComputers(getArguments().getString("codexMachine"), (rows, error) -> {
+            if (generation != codexBrowseGeneration) return;
+            codexBrowseLoading = false;
+            codexBrowseError = error;
+            if (rows != null) codexBrowseRows = rows;
+            if (listView != null) listView.adapter.update(true);
+        });
+    }
+
     public SettingsActivity() {
         this(null);
     }
@@ -298,7 +355,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 if (id == -1) {
                     finishFragment();
                 } else if (id == 2) {
-                    presentSettingFragment(new LogoutActivity());
+                    if (com.butang.codextop.CodexRuntime.enabled()) {
+                        showDialog(LogoutActivity.makeLogOutDialog(getParentActivity(), currentAccount));
+                    } else {
+                        presentSettingFragment(new LogoutActivity());
+                    }
                 }
             }
         });
@@ -334,7 +395,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
         otherItem = menu.addItem(1, R.drawable.ic_ab_other);
         otherItem.setContentDescription(getString(R.string.AccDescrMoreOptions));
-        otherItem.addSubItem(2, R.drawable.msg_leave, getString(R.string.LogOut));
+        otherItem.addSubItem(2, R.drawable.msg_leave, com.butang.codextop.CodexRuntime.enabled() ? "退出登录" : getString(R.string.LogOut));
 
         search = new ProfileActivity.SearchAdapter(this, context) {
             @Override
@@ -342,9 +403,16 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 listView.adapter.update(true);
             }
         };
-        search.loadFaqWebPage();
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            actionBar.setTitle(codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "设置");
+            searchItem.setVisibility(View.GONE);
+            otherItem.setVisibility(codexBrowser() ? View.GONE : View.VISIBLE);
+        } else {
+            search.loadFaqWebPage();
+        }
 
         listView = new UniversalRecyclerView(this, this::fillItems, this::onClick, this::onLongClick);
+        if (codexBrowser()) loadCodexBrowser();
         listView.adapter.setApplyBackground(false);
         listView.setSections();
         listView.setPadding(0, AndroidUtilities.statusBarHeight + dp(12), 0, AndroidUtilities.navigationBarHeight + additionNavigationBarHeight);
@@ -497,6 +565,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     @Override
     public void onFragmentDestroy() {
+        ++codexBrowseGeneration;
         super.onFragmentDestroy();
 
         getNotificationCenter().removeObserver(this, NotificationCenter.updateInterfaces);
@@ -576,7 +645,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
     private void updateActionBarVisible(boolean force, boolean animated) {
         final boolean visible;
-        if (searchItem.isSearchFieldVisible2()) {
+        if (com.butang.codextop.CodexRuntime.enabled() || searchItem.isSearchFieldVisible2()) {
             visible = true;
         } else if (listView.getChildCount() > 0) {
             final View firstChild = listView.getChildAt(0);
@@ -611,7 +680,46 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private ArrayList<Integer> accountNumbers = new ArrayList<>();
+    /** 构造原设置列表；Codex 子页保留已有行，并按加载状态显示唯一的下一步操作。 */
     private void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            items.add(UItem.asSpace(ActionBar.getCurrentActionBarHeight()));
+            if (codexBrowser()) {
+                boolean computers = getArguments().getString("codexMachine") == null;
+                boolean conversations = codexConversations();
+                if (!computers && !conversations) {
+                    items.add(SettingCell.Factory.of(8, IconBackgroundColors.BLUE_DEEP.top,
+                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data, "所有对话", "查看此电脑的对话"));
+                }
+                for (int i = 0; i < codexBrowseRows.size(); i++) {
+                    com.google.gson.JsonObject row = codexBrowseRows.get(i).getAsJsonObject();
+                    String subtitle = conversations ? "" : computers ? (row.get("active").getAsBoolean() ? "在线" : "离线")
+                            : (row.get("available").getAsBoolean() ? "项目" : "暂不可用");
+                    items.add(SettingCell.Factory.of(1000 + i, IconBackgroundColors.BLUE_DEEP.top,
+                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data,
+                            conversations ? (row.has("title") && !row.get("title").isJsonNull()
+                                    ? row.get("title").getAsString() : "未命名对话") : row.get("name").getAsString(), subtitle));
+                }
+                if (codexBrowseLoading || codexBrowseError != null || codexBrowseRows.isEmpty() || codexBrowseIncomplete) {
+                    items.add(SettingCell.Factory.of(9, IconBackgroundColors.BLUE_DEEP.top,
+                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data,
+                            codexBrowseLoading ? "正在加载" : codexBrowseError != null ? codexBrowseError
+                                    : codexBrowseIncomplete ? "部分对话尚未读取" : conversations ? "当前页暂无匹配对话" : "暂无项目或电脑",
+                            codexBrowseLoading ? "" : "点击刷新"));
+                }
+                // 分页失败时上方已有原游标重试入口，避免同时展示两个相同操作。
+                if (conversations && codexBrowseCursor != null && !codexBrowseLoading && codexBrowseError == null) {
+                    items.add(SettingCell.Factory.of(10, IconBackgroundColors.BLUE_DEEP.top,
+                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data, "加载更多对话", ""));
+                }
+                items.add(UItem.asShadow(null));
+                return;
+            }
+            items.add(SettingCell.Factory.of(6, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.settings_data, "最近会话条数", com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+            items.add(UItem.asShadow(null));
+            return;
+        }
         if (searchItem.isSearchFieldVisible2()) {
             items.add(UItem.asSpace(ActionBar.getCurrentActionBarHeight()));
             search.fillItems(items);
@@ -773,6 +881,50 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private void onClick(UItem item, View view, int position, float x, float y) {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            if (codexBrowser()) {
+                if (item.id == 9 || item.id == 10) {
+                    if (item.id == 9 && codexBrowseError == null) codexBrowseCursor = null;
+                    loadCodexBrowser();
+                } else if (item.id == 8) {
+                    Bundle child = new Bundle(getArguments());
+                    child.putBoolean("codexConversations", true);
+                    child.putString("codexTitle", "所有对话");
+                    presentFragment(new SettingsActivity(child));
+                } else if (item.id >= 1000 && item.id - 1000 < codexBrowseRows.size()) {
+                    com.google.gson.JsonObject row = codexBrowseRows.get(item.id - 1000).getAsJsonObject();
+                    if (codexConversations()) {
+                        Bundle chat = new Bundle();
+                        chat.putLong("user_id", row.get("localDialogId").getAsLong());
+                        presentFragment(new ChatActivity(chat));
+                    } else {
+                        Bundle child = new Bundle(getArguments());
+                        if (getArguments().getString("codexMachine") == null) {
+                            child.putString("codexMachine", row.get("id").getAsString());
+                        } else {
+                            if (!row.get("available").getAsBoolean()) return;
+                            ArrayList<String> roots = new ArrayList<>();
+                            for (com.google.gson.JsonElement root : row.getAsJsonArray("rootPaths")) roots.add(root.getAsString());
+                            child.putStringArrayList("codexRoots", roots);
+                            child.putBoolean("codexConversations", true);
+                        }
+                        child.putString("codexTitle", row.get("name").getAsString());
+                        presentFragment(new SettingsActivity(child));
+                    }
+                }
+                return;
+            }
+            if (item.id == 6) {
+                final int[] counts = {20, 50, 100, 200, 500};
+                showDialog(new AlertDialog.Builder(getParentActivity(), resourceProvider)
+                        .setTitle("最近会话条数")
+                        .setItems(new CharSequence[]{"20 条", "50 条", "100 条", "200 条", "500 条"}, (dialog, which) -> {
+                            com.butang.codextop.CodexRuntime.setRecentDialogLimit(currentAccount, counts[which]);
+                            listView.adapter.update(true);
+                        }).create());
+            }
+            return;
+        }
         if (item.object instanceof TLRPC.TL_attachMenuBot) {
             TLRPC.TL_attachMenuBot attachMenuBot = (TLRPC.TL_attachMenuBot) item.object;
             if (attachMenuBot.inactive || attachMenuBot.side_menu_disclaimer_needed) {
@@ -2040,7 +2192,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private void checkUi_menuItems() {
-        FragmentFloatingButton.setAnimatedVisibility(otherItem, 1f - animatorSearchPageVisible.getFloatValue());
+        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && codexBrowser() ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
         FragmentFloatingButton.setAnimatedVisibility(actionBar.getBackButton(), lerp(hasMainTabs ? 0f : 1f, 1f, animatorSearchPageVisible.getFloatValue()));
     }
 

@@ -6161,6 +6161,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
 
         public long lastDrawnDialogId;
         public long lastDrawnMessageId;
+        private int lastDrawnCodexDate;
         public boolean lastDrawnTranslated;
         public boolean lastDrawnDialogIsFolder;
         public long lastDrawnReadState;
@@ -6179,6 +6180,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         long startWaitingTime;
 
 
+        /** 比较当前行的绘制依据；Codex 无 Telegram 消息编号更新时也要刷新最近时间。 */
         public boolean update() {
             TLRPC.Dialog dialog = MessagesController.getInstance(currentAccount).dialogs_dict.get(currentDialogId);
             if (dialog == null) {
@@ -6188,6 +6190,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 }
                 return false;
             }
+            int codexDate = com.butang.codextop.CodexRuntime.enabled() ? dialog.last_message_date : 0;
             int messageHash = message == null ? 0 : message.getId() + message.hashCode();
             Integer printingType = null;
             long readHash = dialog.read_inbox_max_id + ((long) dialog.read_outbox_max_id << 8) + ((long) (dialog.unread_count + (dialog.unread_mark ? -1 : 0)) << 16) +
@@ -6238,6 +6241,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             boolean hasCall = chat != null && chat.call_active && chat.call_not_empty;
             boolean translated = MessagesController.getInstance(currentAccount).getTranslateController().isTranslatingDialog(currentDialogId);
             if (lastDrawnSizeHash == sizeHash &&
+                    lastDrawnCodexDate == codexDate &&
                     lastDrawnMessageId == messageHash &&
                     lastDrawnTranslated == translated &&
                     lastDrawnDialogId == currentDialogId &&
@@ -6275,6 +6279,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             }
             lastDrawnDialogId = currentDialogId;
             lastDrawnMessageId = messageHash;
+            lastDrawnCodexDate = codexDate;
             lastDrawnDialogIsFolder = dialog.isFolder;
             lastDrawnReadState = readHash;
             lastDrawnPrintingType = printingType;

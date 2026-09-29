@@ -2845,6 +2845,7 @@ public class ChatActivityEnterView extends FrameLayout implements
                 delegate.didPressAttachButton();
             });
             attachButton.setContentDescription(getString(R.string.AccDescrAttachButton));
+            if (com.butang.codextop.CodexRuntime.enabled()) attachButton.setVisibility(GONE);
             updateFieldRight(1);
         }
 
@@ -3680,7 +3681,7 @@ public class ChatActivityEnterView extends FrameLayout implements
     }
 
     private void createScheduledButton() {
-        if (scheduledButton != null || parentFragment == null) {
+        if (com.butang.codextop.CodexRuntime.enabled() || scheduledButton != null || parentFragment == null) {
             return;
         }
 
@@ -4778,6 +4779,8 @@ public class ChatActivityEnterView extends FrameLayout implements
 
     private ActionBarMenuSubItem actionScheduleButton;
     private boolean onSendLongClick(View view) {
+        // 消费长按，避免关闭定时菜单后松手又触发普通发送。
+        if (com.butang.codextop.CodexRuntime.enabled()) return true;
         if (isInScheduleMode() || parentFragment != null && parentFragment.getChatMode() == ChatActivity.MODE_QUICK_REPLIES || animatorEphemeralMessageVisibility.getValue()) {
             return false;
         }
@@ -6076,8 +6079,9 @@ public class ChatActivityEnterView extends FrameLayout implements
     }
 
     private boolean shownAiButton;
+    /** 复用原输入框动画；Codex 不展示未接入的 AI 编辑按钮，也不触发其教学和请求。 */
     private void showAiButton(boolean show_) {
-        final boolean show = (show_ || richDraftActive) && parentFragment != null && !parentFragment.isSecretChat();
+        final boolean show = !com.butang.codextop.CodexRuntime.enabled() && (show_ || richDraftActive) && parentFragment != null && !parentFragment.isSecretChat();
 
         if (shownAiButton == show) return;
         if (show) {
@@ -6294,6 +6298,11 @@ public class ChatActivityEnterView extends FrameLayout implements
     }
 
     public void setAllowStickersAndGifs(boolean needAnimatedEmoji, boolean needStickers, boolean needGifs, boolean waitingForKeyboardOpen) {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            needAnimatedEmoji = false;
+            needStickers = false;
+            needGifs = false;
+        }
         if ((allowStickers != needStickers || allowGifs != needGifs) && emojiView != null) {
             if (emojiViewVisible && !waitingForKeyboardOpen) {
                 removeEmojiViewAfterAnimation = true;
@@ -8114,7 +8123,7 @@ public class ChatActivityEnterView extends FrameLayout implements
                     }
                 }
             }
-        } else if (message.length() > 0 || forceShowSendButton || richDraftActive || audioToSend != null || videoToSendMessageObject != null || slowModeTimer == Integer.MAX_VALUE && !isSlowModeIgnored() || isLiveComment && getStarsPrice() > 0 || animatorIsBlockedByStreaming.getValue()) {
+        } else if (com.butang.codextop.CodexRuntime.enabled() || message.length() > 0 || forceShowSendButton || richDraftActive || audioToSend != null || videoToSendMessageObject != null || slowModeTimer == Integer.MAX_VALUE && !isSlowModeIgnored() || isLiveComment && getStarsPrice() > 0 || animatorIsBlockedByStreaming.getValue()) {
             shownSendButton = true;
             final String caption = messageEditText == null ? null : messageEditText.getCaption();
             boolean showBotButton = caption != null && (getSendButtonInternal().getVisibility() == VISIBLE || expandStickersButton != null && expandStickersButton.getVisibility() == VISIBLE);
@@ -8766,6 +8775,7 @@ public class ChatActivityEnterView extends FrameLayout implements
 
     private int lastAttachVisible;
     private void updateFieldRight(int attachVisible) {
+        if (com.butang.codextop.CodexRuntime.enabled()) attachVisible = 0;
         lastAttachVisible = attachVisible;
         if (messageEditText == null || (editingMessageObject != null && !editingMessageObject.needResendWhenEdit())) {
             return;
@@ -15695,7 +15705,7 @@ public class ChatActivityEnterView extends FrameLayout implements
     public void setLiveComment(boolean isLiveComment, boolean isAdmin) {
         if (this.isLiveComment == isLiveComment) return;
         this.isLiveComment = isLiveComment;
-        attachButton.setVisibility(isLiveComment ? View.GONE : View.VISIBLE);
+        attachButton.setVisibility(com.butang.codextop.CodexRuntime.enabled() || isLiveComment ? View.GONE : View.VISIBLE);
         if (isLiveComment) {
             AndroidUtilities.removeFromParent(notifyButton);
         }

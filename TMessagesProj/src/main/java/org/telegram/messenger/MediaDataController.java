@@ -155,10 +155,21 @@ public class MediaDataController extends BaseController {
         return localInstance;
     }
 
-    public MediaDataController(int num) {
-        super(num);
+    /** 登录身份变化后只切换原草稿存储，不删除其他账号的草稿；在界面线程调用。 */
+    public void reloadCodexDrafts() {
+        if (!com.butang.codextop.CodexRuntime.enabled()) return;
+        drafts.clear();
+        draftMessages.clear();
+        draftsFolderIds.clear();
+        readLocalDrafts();
+    }
 
-        if (currentAccount == 0) {
+    /** 从所选账号文件恢复原版草稿结构，普通 Telegram 构建仍使用原文件。 */
+    private void readLocalDrafts() {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            draftPreferences = ApplicationLoader.applicationContext.getSharedPreferences(
+                    com.butang.codextop.CodexRuntime.draftPreferencesName(currentAccount), Activity.MODE_PRIVATE);
+        } else if (currentAccount == 0) {
             draftPreferences = ApplicationLoader.applicationContext.getSharedPreferences("drafts", Activity.MODE_PRIVATE);
         } else {
             draftPreferences = ApplicationLoader.applicationContext.getSharedPreferences("drafts" + currentAccount, Activity.MODE_PRIVATE);
@@ -205,6 +216,13 @@ public class MediaDataController extends BaseController {
             }
         }
         loadRepliesOfDraftReplies(replyMessageOwners);
+    }
+
+    /** 初始化原媒体模型及当前账号的本地草稿。 */
+    public MediaDataController(int num) {
+        super(num);
+
+        readLocalDrafts();
 
         loadStickersByEmojiOrName(AndroidUtilities.STICKERS_PLACEHOLDER_PACK_NAME, false, true);
         loadEmojiThemes();
@@ -344,6 +362,7 @@ public class MediaDataController extends BaseController {
     private boolean[] emojiStatusesFromCacheFetched = new boolean[4];
     private boolean[] emojiStatusesFetching = new boolean[4];
 
+    /** 清理当前媒体内存；Codex 的账号草稿文件保留供同账号重新登录恢复。 */
     public void cleanup() {
         for (int a = 0; a < recentStickers.length; a++) {
             if (recentStickers[a] != null) {
@@ -414,7 +433,8 @@ public class MediaDataController extends BaseController {
 
         drafts.clear();
         draftMessages.clear();
-        draftPreferences.edit().clear().apply();
+        // Codex 退出保留按账号归属的草稿，下次同账号登录时恢复。
+        if (!com.butang.codextop.CodexRuntime.enabled()) draftPreferences.edit().clear().apply();
 
         botInfos.clear();
         botKeyboards.clear();
@@ -7800,6 +7820,12 @@ public class MediaDataController extends BaseController {
         }
 
         saveDraft(dialogId, threadId, draftMessage, replyToMessage, false);
+
+        if (com.butang.codextop.CodexRuntime.ownsConversation(dialogId)) {
+            // 电脑对话草稿仅保存到原本地存储，不发往 Telegram。
+            getNotificationCenter().postNotificationName(NotificationCenter.dialogsNeedReload);
+            return;
+        }
 
         if (threadId == 0 || ChatObject.isForum(chat) || ChatObject.isMonoForum(chat)) {
             if (!DialogObject.isEncryptedDialog(dialogId)) {

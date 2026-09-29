@@ -1085,7 +1085,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         onUserLeaveHintListeners.remove(callback);
     }
 
+    /** Codex 直接进入原有账号页，跳过 Telegram 产品介绍和手机号注册入口。 */
     private BaseFragment getClientNotActivatedFragment() {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            return com.butang.codextop.CodexRuntime.loggedIn() ? new DialogsActivity(null) : new LoginActivity();
+        }
         if (LoginActivity.loadCurrentState(false, currentAccount).getInt("currentViewNum", 0) != 0) {
             return new LoginActivity();
         }
@@ -1258,7 +1262,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 layersActionBarLayout.rebuildLogout();
                 rightActionBarLayout.rebuildLogout();
             }
-            presentFragment(new IntroActivity().setOnLogout());
+            // Codex 继续使用原账号密码页，不进入 Telegram 手机号介绍流程。
+            presentFragment(com.butang.codextop.CodexRuntime.enabled()
+                    ? new LoginActivity() : new IntroActivity().setOnLogout());
         }
     }
 
@@ -8199,6 +8205,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
     private void updateCurrentConnectionState(int account) {
         if (actionBarLayout == null) {
+            return;
+        }
+        // 独立客户端不连接 Telegram；不能让其网络状态覆盖电脑会话标题。
+        if (getPackageName().startsWith("com.butang.codextop.nativepreview")) {
+            actionBarLayout.setTitleOverlayText(null, 0, null);
             return;
         }
         String title = null;

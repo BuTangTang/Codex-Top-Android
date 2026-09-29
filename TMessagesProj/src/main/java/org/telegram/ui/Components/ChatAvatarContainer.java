@@ -552,7 +552,13 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
         openProfile(byAvatar, true, false);
     }
 
+    /** Codex 对话顶栏打开原审批弹窗，其余构建继续原资料页行为。 */
     public void openProfile(boolean byAvatar, boolean fromChatAnimation, boolean removeLast) {
+        if (parentFragment != null && com.butang.codextop.CodexRuntime.enabled()
+                && com.butang.codextop.CodexRuntime.ownsConversation(parentFragment.getDialogId())) {
+            parentFragment.showCodexApprovals();
+            return;
+        }
         if (byAvatar && (AndroidUtilities.isTablet() || AndroidUtilities.displaySize.x > AndroidUtilities.displaySize.y || !avatarImageView.getImageReceiver().hasNotThumb())) {
             byAvatar = false;
         }
@@ -1084,8 +1090,15 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
 
     private boolean showingSavedMessagesHint;
 
+    /** 更新原顶栏副标题；Codex 待处理状态提示可点击，其他状态仍使用真实观察值。 */
     public void updateSubtitle(boolean animated) {
         if (parentFragment == null) {
+            return;
+        }
+        if (com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(parentFragment.getDialogId())) {
+            lastSubtitle = null;
+            String state = com.butang.codextop.CodexRuntime.statusText(parentFragment.getDialogId());
+            setSubtitle("待处理".equals(state) ? "待处理 · 点击查看" : state);
             return;
         }
         if (parentFragment.getChatMode() == ChatActivity.MODE_EDIT_BUSINESS_LINK) {
@@ -1580,6 +1593,11 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
     }
 
     private void updateCurrentConnectionState() {
+        if (parentFragment != null && com.butang.codextop.CodexRuntime.enabled()
+                && com.butang.codextop.CodexRuntime.ownsConversation(parentFragment.getDialogId())) {
+            updateSubtitle();
+            return;
+        }
         String title = null;
         if (currentConnectionState == ConnectionsManager.ConnectionStateWaitingForNetwork) {
             title = getString(R.string.WaitingForNetwork);

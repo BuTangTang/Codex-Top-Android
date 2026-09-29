@@ -4256,7 +4256,16 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         });
     }
 
+    /** 电脑对话的普通文字交给原生连接层，其他原版发送路径保持原样。 */
     public void sendMessage(SendMessageParams sendMessageParams) {
+        if (com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(sendMessageParams.peer)) {
+            String desktopText = sendMessageParams.retryMessageObject != null
+                    ? sendMessageParams.retryMessageObject.messageOwner.message : sendMessageParams.message;
+            if (desktopText != null && !desktopText.isEmpty()) {
+                com.butang.codextop.CodexRuntime.sendMessage(currentAccount, sendMessageParams);
+            }
+            return;
+        }
         final SendMessageChatArguments sendMessageChatArguments = sendMessageParams.sendMessageChatArguments != null ?
                 sendMessageParams.sendMessageChatArguments : SendMessageChatArguments.EMPTY;
         String message = sendMessageParams.message;

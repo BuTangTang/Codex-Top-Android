@@ -28,6 +28,11 @@ android {
     defaultConfig.applicationId = APP_PACKAGE
 
     sourceSets.main.jniLibs.srcDirs = ['../TMessagesProj/jni/']
+    // Codex Top 复用已发布手机端图标，普通 Telegram 构建保持原资源。
+    if (APP_PACKAGE == 'com.butang.codextop.nativepreview') {
+        sourceSets.main.res.srcDir 'src/codexIcons/res'
+    }
+
 
     lintOptions {
         disable 'MissingTranslation'
@@ -178,6 +183,7 @@ android {
 
     defaultConfig {
         minSdkVersion 21
+        manifestPlaceholders.firebaseAutoInitEnabled = APP_PACKAGE != 'com.butang.codextop.nativepreview'
         targetSdkVersion 36
         versionName APP_VERSION_NAME
         ndkVersion "27.2.12479018"
@@ -205,4 +211,7 @@ android {
     }
 }
 
-apply plugin: 'com.google.gms.google-services'
+// 独立 Codex 验证包不使用 Telegram 的推送项目；正式推送接入后再配置自己的项目。
+if (APP_PACKAGE != 'com.butang.codextop.nativepreview') {
+    apply plugin: 'com.google.gms.google-services'
+}

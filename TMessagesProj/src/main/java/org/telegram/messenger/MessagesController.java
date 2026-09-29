@@ -9317,6 +9317,7 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void deleteMessages(ArrayList<Integer> messages, ArrayList<Long> randoms, TLRPC.EncryptedChat encryptedChat, long dialogId, boolean forAll, int mode, boolean cacheOnly, long taskId, TLObject taskRequest, int topicId, boolean movedToScheduled, int movedToScheduledMessageId) {
+        if (taskId == 0 && com.butang.codextop.CodexRuntime.deletePendingMessages(currentAccount, dialogId, messages)) return;
         final boolean scheduled = mode == ChatActivity.MODE_SCHEDULED;
         final boolean quickReplies = mode == ChatActivity.MODE_QUICK_REPLIES;
         final boolean welcomeMessages = mode == ChatActivity.MODE_WELCOME_MESSAGES;
@@ -9667,7 +9668,9 @@ public class MessagesController extends BaseController implements NotificationCe
         return dialogsEndReached.get(folderId);
     }
 
+    /** 原加载提示绑定当前客户端实际使用的数据源。 */
     public boolean isLoadingDialogs(int folderId) {
+        if (com.butang.codextop.CodexRuntime.enabled()) return com.butang.codextop.CodexRuntime.loadingDialogs();
         return loadingDialogs.get(folderId);
     }
 
@@ -9843,7 +9846,9 @@ public class MessagesController extends BaseController implements NotificationCe
 
 
 
+    /** Codex 独立包沿用原列表模型，从电脑会话快照读取。 */
     public ArrayList<TLRPC.Dialog> getDialogs(int folderId) {
+        if (com.butang.codextop.CodexRuntime.enabled()) return com.butang.codextop.CodexRuntime.dialogs();
         ArrayList<TLRPC.Dialog> dialogs = dialogsByFolder.get(folderId);
         if (dialogs == null) {
             return new ArrayList<>();
@@ -11513,7 +11518,12 @@ public class MessagesController extends BaseController implements NotificationCe
         loadMessages(dialogId, mergeDialogId, loadInfo, count, max_id, offset_date, fromCache, midDate, classGuid, load_type, last_message_id, mode, threadMessageId, loadIndex, threadMessageId != 0 ? replyFirstUnread : 0, 0, 0, false, 0, isTopic);
     }
 
+    /** 独立包的电脑历史交给已有聊天页；原 Telegram 的加载路径保持原样。 */
     public void loadMessages(long dialogId, long mergeDialogId, boolean loadInfo, int count, int max_id, int offset_date, boolean fromCache, int midDate, int classGuid, int load_type, int last_message_id, int mode, long threadMessageId, int loadIndex, int first_unread, int unread_count, int last_date, boolean queryFromServer, int mentionsCount, boolean isTopic) {
+        if (com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(dialogId)) {
+            com.butang.codextop.CodexRuntime.loadMessages(currentAccount, dialogId, count, max_id, classGuid, load_type, loadIndex, mode);
+            return;
+        }
         loadMessagesInternal(dialogId, mergeDialogId, loadInfo, count, max_id, offset_date, fromCache, midDate, classGuid, load_type, last_message_id, mode, threadMessageId, loadIndex, first_unread, unread_count, last_date, queryFromServer, mentionsCount, true, true, isTopic, null, 0L);
     }
 
@@ -12466,7 +12476,12 @@ public class MessagesController extends BaseController implements NotificationCe
         loadDialogs(folderId, offset, count, fromCache, null);
     }
 
+    /** Codex 使用已有机器 RPC；原 Telegram 构建继续使用原请求路径。 */
     public void loadDialogs(final int folderId, int offset, int count, boolean fromCache, Runnable onEmptyCallback) {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            com.butang.codextop.CodexRuntime.refreshDialogs(currentAccount);
+            return;
+        }
         if (loadingDialogs.get(folderId) || resetingDialogs) {
             return;
         }
@@ -16130,7 +16145,14 @@ public class MessagesController extends BaseController implements NotificationCe
         }
     }
 
+    /** Codex 先结束自身账号任务，再沿原本地退出清理流程返回登录页。 */
     public void performLogout(int type) {
+        if (com.butang.codextop.CodexRuntime.enabled() && type != 0) {
+            com.butang.codextop.CodexRuntime.logout(() -> performLogout(0), message ->
+                    android.widget.Toast.makeText(ApplicationLoader.applicationContext, message,
+                            android.widget.Toast.LENGTH_SHORT).show());
+            return;
+        }
         if (type == 1) {
             unregistedPush();
             TLRPC.TL_auth_logOut req = new TLRPC.TL_auth_logOut();

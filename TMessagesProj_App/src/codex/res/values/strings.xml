@@ -1,0 +1,39 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="SearchChats">搜索会话</string>
+    <string name="TypeMessage">输入消息</string>
+    <string name="Message">消息</string>
+    <string name="Retry">重试</string>
+    <string name="Copy">复制</string>
+    <string name="Delete">删除</string>
+    <string name="Cancel">取消</string>
+    <string name="Send">发送</string>
+    <string name="OK">确定</string>
+    <string name="Done">完成</string>
+    <string name="Back">返回</string>
+    <string name="Edit">编辑</string>
+    <string name="Search">搜索</string>
+    <string name="SearchMessages">消息</string>
+    <string name="Draft">草稿</string>
+    <string name="NoResult">没有搜索结果</string>
+    <string name="NoChats">暂无会话</string>
+    <string name="Chats">会话</string>
+    <string name="Settings">设置</string>
+    <string name="Yesterday">昨天</string>
+    <string name="SendMessage">发送消息</string>
+    <string name="WaitingForNetwork">等待网络连接…</string>
+    <string name="Connecting">正在连接…</string>
+    <string name="Updating">正在更新…</string>
+    <string name="ClearHistory">清空记录</string>
+    <string name="DeleteSingleMessagesTitle">删除消息</string>
+    <string name="AreYouSureDeleteSingleMessage">确定删除这条消息吗？</string>
+    <string name="AreYouSureDeleteFewMessages">确定删除这些消息吗？</string>
+    <string name="DeleteMessagesTitle">删除%1$s</string>
+    <string name="formatterMonthYear">yyyy年M月</string>
+    <string name="formatterMonth">M月d日</string>
+    <string name="chatDate">M月d日</string>
+    <string name="chatDateShort">M月d日</string>
+    <string name="chatFullDate">yyyy年M月d日</string>
+    <string name="MessagesSelected_one">已选择 %d 条</string>
+    <string name="MessagesSelected_other">已选择 %d 条</string>
+</resources>

@@ -576,9 +576,13 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 return oldItems.get(oldItemPosition).compare(newItems.get(newItemPosition));
             }
 
+            /** Codex 列表没有 Telegram 消息更新事件，最近时间变化必须触发原单元格重新绑定。 */
             @Override
             public boolean areContentsTheSame(int oldItemPosition, int newItemPosition) {
-                return oldItems.get(oldItemPosition).viewType == newItems.get(newItemPosition).viewType;
+                ItemInternal oldItem = oldItems.get(oldItemPosition), newItem = newItems.get(newItemPosition);
+                if (com.butang.codextop.CodexRuntime.enabled() && oldItem.dialog != null && newItem.dialog != null
+                        && oldItem.dialog.last_message_date != newItem.dialog.last_message_date) return false;
+                return oldItem.viewType == newItem.viewType;
             }
         };
         if (itemInternals.size() < 50 || !ALLOW_UPDATE_IN_BACKGROUND) {

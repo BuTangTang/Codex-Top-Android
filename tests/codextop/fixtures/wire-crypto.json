@@ -1,0 +1,8 @@
+{
+  "secret": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "envelope": "AFfbSzWfI65eFG5OJRIFZwRyJQY0jBUMFHU9DJM9BNQhCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLE6D3BLj/QQr5icvRweGI3ZG2u/y1juN0Twy/3b6iCSI1FcGA1vDJqg+myrJzTbyb",
+  "message": "{\"text\":\"中文消息\",\"ok\":true}",
+  "aes": "AA0NDQ0NDQ0NDQ0NDbGOt5OpjiGNDay/3PzG9bw7VwyFjgIKtDcriHM52IG/QfpCqvOiScnQlouJOfLDbPE=",
+  "legacy": "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLbpjxtTD34R3DX06e0vz5N922xjKF6robZgMR57n6/6oQYa2flc3lY2kBktTlBD7qkA==",
+  "wrappedLegacy": "V1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXOIDEssZGN1b6sstqFp2mLZ02ahqk6WDadz3G333gTntUpT2lmCBqyh6VaKGr0mqqMXa+j6DSPRl9uHdGGk7hO8PbiALZ1odqoaK/ZABFt3I9L91yMuc2990MlTnG9Qy6/0a8RZZG4Wr9D0aQU8lc"
+}

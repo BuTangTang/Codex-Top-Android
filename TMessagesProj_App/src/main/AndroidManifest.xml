@@ -4,6 +4,12 @@
     android:installLocation="auto">
 
     <application android:name="org.telegram.messenger.ApplicationLoaderImpl" tools:replace="name">
+        <!-- 独立包没有推送项目，不在 Application.onCreate 前启动 Firebase。 -->
+        <provider
+            android:name="com.google.firebase.provider.FirebaseInitProvider"
+            android:authorities="${applicationId}.firebaseinitprovider"
+            android:enabled="${firebaseAutoInitEnabled}"
+            tools:replace="android:enabled" />
         <service
             android:name="org.telegram.messenger.GoogleVoiceClientService"
             android:exported="true"

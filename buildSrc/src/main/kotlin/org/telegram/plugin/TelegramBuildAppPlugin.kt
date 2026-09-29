@@ -33,6 +33,11 @@ class TelegramBuildAppPlugin : Plugin<Project> {
                     }
                 )
 
+                // 独立客户端的中文覆盖必须排在原版文件后，沿用原语言资产格式。
+                if (project.findProperty("APP_PACKAGE") == "com.butang.codextop.nativepreview") {
+                    stringsXml.from(project.file("src/codex/res/values/strings.xml"))
+                }
+
                 localizationFiles.from(
                     telegramModule.fileTree("src/main/res") {
                         include("values-*/strings.xml")

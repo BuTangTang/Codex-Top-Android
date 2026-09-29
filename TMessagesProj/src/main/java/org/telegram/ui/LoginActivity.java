@@ -319,6 +319,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
     @ViewNumber
     private int currentViewNum;
+    private String codexLoginName;
     private final SlideView[] views = new SlideView[19];
     private CustomPhoneKeyboardView keyboardView;
     private ValueAnimator keyboardAnimator;
@@ -692,7 +693,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             slideViewsContainer.addView(views[a], LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.CENTER, AndroidUtilities.isTablet() ? 26 : 18, needsTopMargin ? 30 : 0, AndroidUtilities.isTablet() ? 26 : 18, 0));
         }
 
-        Bundle savedInstanceState = activityMode == MODE_LOGIN ? loadCurrentState(newAccount, currentAccount) : null;
+        // Codex 沿用原邮箱输入页与密码页，只替换账号业务；不恢复短信验证流程。
+        if (com.butang.codextop.CodexRuntime.enabled()) currentViewNum = VIEW_ADD_EMAIL;
+        Bundle savedInstanceState = activityMode == MODE_LOGIN && !com.butang.codextop.CodexRuntime.enabled() ? loadCurrentState(newAccount, currentAccount) : null;
         if (savedInstanceState != null) {
             int viewNum = savedInstanceState.getInt("currentViewNum", 0);
             if (viewNum < 0 || viewNum >= views.length)
@@ -1090,7 +1093,15 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
     }
 
     @Override
+    /** 原有返回行为保留；Codex 密码页返回原账号输入页。 */
     public boolean onBackPressed(boolean invoked) {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            if (currentViewNum == VIEW_PASSWORD) {
+                if (invoked) setPage(VIEW_ADD_EMAIL, true, null, true);
+                return false;
+            }
+            return true;
+        }
         if (emailChangeIsSuggestion && currentViewNum == VIEW_ADD_EMAIL) {
             return false;
         }
@@ -5472,6 +5483,13 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                             .show();
                 }
             });
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                titleView.setText("输入密码");
+                confirmTextView.setText("输入你的 Codex Top 账号密码");
+                outlineCodeField.setText("密码");
+                cancelButton.setVisibility(GONE);
+                codeField.setSaveEnabled(false);
+            }
         }
 
         @Override
@@ -5535,6 +5553,36 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public void onNextPressed(String code) {
+            // 仅替换认证请求；复用原有加载动画、错误弹窗和会话页面切换。
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                if (nextPressed) return;
+                String password = codeField.getText().toString();
+                if (password.isEmpty()) { onPasscodeError(false); return; }
+                nextPressed = true;
+                needShowProgress(0);
+                Utilities.globalQueue.postRunnable(() -> {
+                    try {
+                        com.butang.codextop.CodexRuntime.login(codexLoginName, password);
+                        AndroidUtilities.runOnUIThread(() -> {
+                            nextPressed = false;
+                            needHideProgress(false);
+                            codeField.setText("");
+                            if (getParentActivity() != null && currentViewNum == VIEW_PASSWORD) {
+                                // 页面出现前切换原草稿文件，不能沿用登录页期间恢复的其他账号草稿。
+                                MediaDataController.getInstance(currentAccount).reloadCodexDrafts();
+                                presentFragment(new DialogsActivity(null), true);
+                            }
+                        });
+                    } catch (Exception error) {
+                        AndroidUtilities.runOnUIThread(() -> {
+                            nextPressed = false;
+                            needHideProgress(false);
+                            needShowAlert("登录失败", "请检查账号、密码及网络连接后重试");
+                        });
+                    }
+                });
+                return;
+            }
             if (nextPressed) {
                 return;
             }
@@ -5647,6 +5695,8 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public void saveStateParams(Bundle bundle) {
+            // Codex 密码只用于本次认证，不写入原登录状态文件。
+            if (com.butang.codextop.CodexRuntime.enabled()) return;
             String code = codeField.getText().toString();
             if (code.length() != 0) {
                 bundle.putString("passview_code", code);
@@ -6022,6 +6072,13 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                     getParentActivity().startActivityForResult(googleClient.getSignInIntent(), BasePermissionsActivity.REQUEST_CODE_SIGN_IN_WITH_GOOGLE);
                 });
             });
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                titleView.setText("登录 Codex Top");
+                subtitleView.setText("使用与电脑相同的账号");
+                emailOutlineView.setText("账号");
+                emailField.setInputType(InputType.TYPE_CLASS_TEXT);
+                bottomContainer.setVisibility(GONE);
+            }
         }
 
         @Override
@@ -6038,7 +6095,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public boolean needBackButton() {
-            return !emailChangeIsSuggestion;
+            return !com.butang.codextop.CodexRuntime.enabled() && !emailChangeIsSuggestion;
         }
 
         @Override
@@ -6084,6 +6141,14 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public void onNextPressed(String code) {
+            // 保留原有下一步按钮及翻页动画，账号无需经过 Telegram 邮件验证码。
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                String account = emailField.getText().toString().trim();
+                if (account.isEmpty() || account.length() > 128) { onPasscodeError(false); return; }
+                codexLoginName = account;
+                setPage(VIEW_PASSWORD, true, new Bundle(), false);
+                return;
+            }
             if (nextPressed) {
                 return;
             }

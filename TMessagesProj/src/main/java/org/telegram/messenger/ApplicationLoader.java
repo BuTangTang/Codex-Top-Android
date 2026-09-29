@@ -204,6 +204,7 @@ public class ApplicationLoader extends Application {
         try {
             connectivityManager = (ConnectivityManager) ApplicationLoader.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE);
             BroadcastReceiver networkStateReceiver = new BroadcastReceiver() {
+                /** 沿原广播更新传输状态，并通知独立客户端尝试恢复缺失的电脑连接。 */
                 @Override
                 public void onReceive(Context context, Intent intent) {
                     try {
@@ -216,6 +217,10 @@ public class ApplicationLoader extends Application {
                     for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
                         ConnectionsManager.getInstance(a).checkConnection();
                         FileLoader.getInstance(a).onNetworkChanged(isSlow);
+                    }
+                    // 冷启动离线时还没有 Socket 的网络回调，复用已有广播避免等待定时重试。
+                    if (currentNetworkInfo != null && currentNetworkInfo.isConnected()) {
+                        com.butang.codextop.CodexRuntime.onNetworkAvailable();
                     }
                 }
             };
@@ -364,7 +369,9 @@ public class ApplicationLoader extends Application {
         NotificationCenter.sanitize();
     });
 
+    /** Codex 验证包不启动上游通知服务；其余构建保持原行为。 */
     public static void startPushService() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         SharedPreferences preferences = MessagesController.getGlobalNotificationsSettings();
         boolean enabled;
         if (preferences.contains("pushService")) {
@@ -396,7 +403,9 @@ public class ApplicationLoader extends Application {
         }
     }
 
+    /** Codex 尚未配置自己的推送项目，不申请 Telegram 项目的推送令牌。 */
     private void initPushServices() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         AndroidUtilities.runOnUIThread(() -> {
             if (getPushProvider().hasServices()) {
                 getPushProvider().onRequestPushToken();

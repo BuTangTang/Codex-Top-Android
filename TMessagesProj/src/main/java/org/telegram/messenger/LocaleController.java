@@ -2643,6 +2643,8 @@ public class LocaleController {
     }
 
     private FastDateFormat createFormatter(Locale locale, String format, String defaultFormat) {
+        // 独立客户端仅使用中文日期名称，沿用原时区、时间戳和格式化流程。
+        if (com.butang.codextop.CodexRuntime.enabled()) locale = Locale.SIMPLIFIED_CHINESE;
         if (format == null || format.length() == 0) {
             format = defaultFormat;
         }
@@ -4445,7 +4447,8 @@ public class LocaleController {
         final Context context = ApplicationLoader.applicationContext;
         String value;
 
-        if (BuildVars.USE_CLOUD_STRINGS) {
+        // 独立客户端沿用随包中文，不让原 Telegram 云端语言包覆盖。
+        if (BuildVars.USE_CLOUD_STRINGS && !com.butang.codextop.CodexRuntime.enabled()) {
             value = localizationExternal.getByResNameOrResId(context, key, stringRes);
             if (value != null) {
                 return value;

@@ -821,6 +821,61 @@ public class ChatActivity extends BaseFragment implements
     private String pendingLinkSearchString;
     private Runnable pendingWebPageTimeoutRunnable;
     private Runnable waitingForCharaterEnterRunnable;
+    private Runnable codexDraftSaveRunnable;
+    private boolean codexApprovalBusy;
+
+    /** 复用原对话框按需展示当前桌面审批，不把历史工具记录当作待办。 */
+    public void showCodexApprovals() {
+        if (codexApprovalBusy || getParentActivity() == null) return;
+        codexApprovalBusy = true;
+        com.butang.codextop.CodexRuntime.readApprovals(dialog_id, (review, error) -> {
+            codexApprovalBusy = false;
+            if (getParentActivity() == null) return;
+            if (error != null || review == null || review.requests.isEmpty()) {
+                showDialog(new AlertDialog.Builder(getParentActivity()).setTitle("待处理操作")
+                        .setMessage(error != null ? error : "当前没有待批准操作。")
+                        .setPositiveButton("知道了", null).create());
+                return;
+            }
+            if (review.requests.size() == 1) showCodexApproval(review, review.requests.get(0));
+            else {
+                CharSequence[] titles = new CharSequence[review.requests.size()];
+                for (int i = 0; i < titles.length; i++)
+                    titles[i] = (i + 1) + ". " + review.requests.get(i).details.split("\n", 2)[0];
+                showDialog(new AlertDialog.Builder(getParentActivity()).setTitle("待处理操作")
+                        .setItems(titles, (dialog, which) -> showCodexApproval(review, review.requests.get(which)))
+                        .setNegativeButton("取消", null).create());
+            }
+        });
+    }
+
+    /** 用户先看到完整命令或文件差异；已提交未知结果的请求不再次开放决定。 */
+    private void showCodexApproval(com.butang.codextop.CodexRuntime.ApprovalReview review,
+            com.butang.codextop.DesktopApproval request) {
+        if (getParentActivity() == null) return;
+        boolean issued = review.alreadyIssued(request);
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity()).setTitle("待处理操作")
+                .setMessage(request.details + (issued ? "\n\n已提交，处理结果请在电脑核对。"
+                        : request.canDecide ? "" : "\n\n当前无法在手机决定，请在电脑处理。"))
+                .setNeutralButton("关闭", null);
+        if (request.canDecide && !issued) {
+            builder.setPositiveButton("允许本次", (dialog, which) -> submitCodexApproval(review, request, true));
+            builder.setNegativeButton("拒绝", (dialog, which) -> submitCodexApproval(review, request, false));
+        }
+        showDialog(builder.create());
+    }
+
+    /** 仅由明确按钮触发决定；回执使用真实核对结果，不显示推测的成功。 */
+    private void submitCodexApproval(com.butang.codextop.CodexRuntime.ApprovalReview review,
+            com.butang.codextop.DesktopApproval request, boolean allow) {
+        if (codexApprovalBusy) return;
+        codexApprovalBusy = true;
+        com.butang.codextop.CodexRuntime.decideApproval(review, request, allow, message -> {
+            codexApprovalBusy = false;
+            if (getParentActivity() != null) showDialog(new AlertDialog.Builder(getParentActivity())
+                    .setTitle("处理结果").setMessage(message).setPositiveButton("知道了", null).create());
+        });
+    }
     private Runnable onChatMessagesLoaded;
 
     private TLRPC.ChatInvite chatInvite;
@@ -2219,6 +2274,14 @@ public class ChatActivity extends BaseFragment implements
 
         @Override
         public void onTextChanged(final CharSequence text, boolean bigChange, boolean fromDraft) {
+            if (!fromDraft && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
+                if (codexDraftSaveRunnable != null) AndroidUtilities.cancelRunOnUIThread(codexDraftSaveRunnable);
+                codexDraftSaveRunnable = () -> {
+                    codexDraftSaveRunnable = null;
+                    ChatActivity.this.saveDraft();
+                };
+                AndroidUtilities.runOnUIThread(codexDraftSaveRunnable, 250);
+            }
             MediaController.getInstance().setInputFieldHasText(!TextUtils.isEmpty(text) || chatActivityEnterView.isEditingMessage());
             if (mentionContainer != null && mentionContainer.getAdapter() != null) {
                 mentionContainer.getAdapter().searchUsernameOrHashtag(text, chatActivityEnterView.getCursorPosition(), messages, false, false);
@@ -3563,6 +3626,7 @@ public class ChatActivity extends BaseFragment implements
 
     private Runnable justForTest;
 
+    /** 构建原版对话页面；Codex 对话不创建尚未接入的 Telegram 管理和附件菜单。 */
     @Override
     public View createView(Context context) {
         Timer t = Timer.create("ChatActivity.createView");
@@ -4289,7 +4353,8 @@ public class ChatActivity extends BaseFragment implements
         );
         otherIcon.setIconTranslate(-dp(6), dp(6.66f));
 
-        if (((chatMode == 0 && (threadMessageId == 0 || isTopic)) || chatMode == MODE_SUGGESTIONS) && !UserObject.isReplyUser(currentUser) && !isReport()) {
+        // Codex 尚未接入原版搜索、静音、壁纸和删除接口，移除入口，审批仍沿顶栏点击。
+        if (!com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) && ((chatMode == 0 && (threadMessageId == 0 || isTopic)) || chatMode == MODE_SUGGESTIONS) && !UserObject.isReplyUser(currentUser) && !isReport()) {
             TLRPC.UserFull userFull = null;
             if (currentUser != null) {
                 userFull = getMessagesController().getUserFull(currentUser.id);
@@ -4514,7 +4579,7 @@ public class ChatActivity extends BaseFragment implements
         avatarContainer.updateSubtitle();
         updateTitleIcons();
 
-        if (chatMode == 0 && (!isThreadChat() || isTopic) && !isReport()) {
+        if (!com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) && chatMode == 0 && (!isThreadChat() || isTopic) && !isReport()) {
             attachItem = menu.lazilyAddItem(chat_menu_attach, otherIcon, themeDelegate);
             attachItem.onView(cell -> otherIcon.addView(cell.getIconView()));
             attachItem.setOverrideMenuClick(true);
@@ -10252,6 +10317,7 @@ public class ChatActivity extends BaseFragment implements
         return INavigationLayout.BackButtonState.BACK;
     }
 
+    /** 创建原版多选工具栏；Codex 消息只提供本地复制，不暴露未接入的远端修改。 */
     private void createActionMode() {
         if (selectedMessagesCountTextView != null || getContext() == null) {
             return;
@@ -10303,7 +10369,9 @@ public class ChatActivity extends BaseFragment implements
         actionMode.addView(selectedMessagesCountTextView, LayoutHelper.createLinear(0, LayoutHelper.MATCH_PARENT, 1.0f, 85, 0, 5, 0));
         actionMode.setOnLayoutListener(actionBar::invalidate);
 
-        if (currentEncryptedChat == null) {
+        if (com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
+            actionModeViews.add(actionMode.addItemWithWidth(copy, R.drawable.msg_copy, dp(48), LocaleController.getString(R.string.Copy)));
+        } else if (currentEncryptedChat == null) {
             final boolean isSavedMessages = getDialogId() == getUserConfig().getClientUserId() && (chatMode == 0 || chatMode == MODE_SAVED);
             actionModeViews.add(actionMode.addItemWithWidth(save_to, R.drawable.msg_download, dp(48), LocaleController.getString(R.string.SaveToMusic)));
             actionModeViews.add(actionMode.addItemWithWidth(edit, R.drawable.msg_edit, dp(48), LocaleController.getString(R.string.Edit)));
@@ -13158,7 +13226,9 @@ public class ChatActivity extends BaseFragment implements
         timerHintView.showForView(avatarContainer.getTimeItem(), true);
     }
 
+    /** 原版保留定时发送教学；Codex Top 未提供该能力，不展示误导提示。 */
     private void showScheduledHint() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         boolean disableNoSound = (UserObject.isUserSelf(currentUser) || (chatInfo != null && chatInfo.slowmode_next_send_date > 0) && chatMode == 0);
         if (scheduledHintShown || scheduledOrNoSoundHintShown || disableNoSound || SharedConfig.scheduledHintShows >= 3 || chatActivityEnterView.isEditingMessage()) {
             return;
@@ -13167,7 +13237,9 @@ public class ChatActivity extends BaseFragment implements
         AndroidUtilities.runOnUIThread(showScheduledHintRunnable, 4000);
     }
 
+    /** 只向支持原版发送能力的构建展示定时或静音发送教学。 */
     private void showScheduledOrNoSoundHint() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         boolean disableNoSound = UserObject.isUserSelf(currentUser) || (chatInfo != null && chatInfo.slowmode_next_send_date > 0) && chatMode == 0 || chatMode == MODE_EDIT_BUSINESS_LINK;
         long scheduledOrNoSoundHintTimeFromLastSeen = System.currentTimeMillis() - SharedConfig.scheduledOrNoSoundHintSeenAt;
         long scheduledHintTimeFromLastSeen = System.currentTimeMillis() - SharedConfig.scheduledHintSeenAt;
@@ -22345,6 +22417,8 @@ public class ChatActivity extends BaseFragment implements
             }
             Integer msgId = (Integer) args[0];
             MessageObject obj = messagesDict[0].get(msgId);
+            if (com.butang.codextop.CodexRuntime.enabled() && org.telegram.messenger.BuildVars.DEBUG_VERSION)
+                android.util.Log.i("CodexBridge", "ack old=" + msgId + " new=" + args[1] + " found=" + (obj != null) + " tail=" + forwardEndReached[0]);
             if (isThreadChat() && pendingSendMessagesDict.size() > 0) {
                 MessageObject object = pendingSendMessagesDict.get(msgId);
                 if (object != null) {
@@ -29760,7 +29834,10 @@ public class ChatActivity extends BaseFragment implements
     Bulletin.Delegate bulletinDelegate;
 
     @Override
+    /** 保留原页面恢复流程，并为电脑对话启动前台增量读取。 */
     public void onResume() {
+        codexApprovalBusy = false;
+        if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexRuntime.watchConversation(currentAccount, dialog_id);
         super.onResume();
         checkShowBlur(false);
         activityResumeTime = System.currentTimeMillis();
@@ -29933,6 +30010,12 @@ public class ChatActivity extends BaseFragment implements
     }
 
     public void saveDraft() {
+        if (com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
+            if (chatActivityEnterView != null && !chatActivityEnterView.isEditingMessage()) {
+                getMediaDataController().saveDraft(dialog_id, 0, chatActivityEnterView.getDraftMessage(), null, null, true, 0);
+            }
+            return;
+        }
         if (chatActivityEnterView != null && chatActivityEnterView.isRichDraftActive()) {
             return;
         }
@@ -29972,7 +30055,9 @@ public class ChatActivity extends BaseFragment implements
     }
 
     @Override
+    /** 保留原页面暂停流程，并停止离开后的电脑消息轮询。 */
     public void onPause() {
+        if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexRuntime.stopWatching(dialog_id);
         super.onPause();
         scrolling = false;
         if (scrimPopupWindow != null) {
@@ -30677,6 +30762,7 @@ public class ChatActivity extends BaseFragment implements
         return createMenu(v, single, listView, x, y, searchGroup, longpress, false);
     }
 
+    /** 沿用原版消息菜单和选择动画，Codex 多选不显示回复与转发操作栏。 */
     @SuppressLint("ClickableViewAccessibility")
     private boolean createMenu(View v, boolean single, boolean listView, float x, float y, boolean searchGroup, boolean longpress, boolean suggestEdit) {
         if (actionBar.isActionModeShowed() || isReport()) {
@@ -32454,7 +32540,8 @@ public class ChatActivity extends BaseFragment implements
         final ActionBarMenu actionMode = actionBar.createActionMode();
         actionMode.setItemVisibility(delete, View.VISIBLE);
         actionsButtonsLayout.bringToFront();
-        bottomViewsVisibilityController.setViewVisible(MESSAGE_ACTION_CONTAINER, true, true);
+        bottomViewsVisibilityController.setViewVisible(MESSAGE_ACTION_CONTAINER,
+                !com.butang.codextop.CodexRuntime.ownsConversation(dialog_id), true);
 
         int translationY = chatActivityEnterView.getMeasuredHeight() - AndroidUtilities.dp(51);
         createActionMode();
@@ -45669,6 +45756,7 @@ public class ChatActivity extends BaseFragment implements
         return -1;
     }
 
+    /** 构建原消息弹出菜单；Codex 保留复制和既有失败重试，移除未接入的远端操作。 */
     public void fillMessageMenu(
         MessageObject primaryMessage,
 
@@ -45677,6 +45765,17 @@ public class ChatActivity extends BaseFragment implements
         ArrayList<Integer> options
     ) {
         final MessageObject message = selectedObject;
+        if (com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
+            if (message.isSendError()) {
+                items.add(LocaleController.getString(R.string.Retry));
+                options.add(OPTION_RETRY);
+                icons.add(R.drawable.msg_retry);
+            }
+            items.add(LocaleController.getString(R.string.Copy));
+            options.add(OPTION_COPY);
+            icons.add(R.drawable.msg_copy);
+            return;
+        }
         final MessageObject.GroupedMessages groupedMessages = selectedObjectGroup;
         final int type = getMessageType(message);
         final boolean isEphemeral = message.isEphemeral();
