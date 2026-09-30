@@ -12753,6 +12753,12 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
     }
 
+    /** 原文件气泡只按Codex描述区分未知大小，模型占位的零不冒充真实字节数。 */
+    private static String documentSizeText(MessageObject messageObject, long sizeBytes) {
+        com.butang.codextop.DesktopAttachment attachment = com.butang.codextop.CodexRuntime.attachment(messageObject);
+        return attachment != null && attachment.sizeBytes == null ? "大小未知" : AndroidUtilities.formatFileSize(sizeBytes);
+    }
+
     /** 保留原文件气泡排版；电脑文件的图片缩略图只能来自本地缓存。 */
     private int createDocumentLayout(int maxWidth, MessageObject messageObject) {
         if (messageObject.sponsoredMedia != null) {
@@ -12879,8 +12885,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                 docTitleOffsetX = 0;
             }
 
-            String str = AndroidUtilities.formatFileSize(documentAttach.size) + " " + FileLoader.getDocumentExtension(documentAttach);
-            infoWidth = Math.min(maxWidth - dp(30), (int) Math.ceil(Theme.chat_infoPaint.measureText("000.0 mm / " + AndroidUtilities.formatFileSize(documentAttach.size))));
+            String sizeText = documentSizeText(messageObject, documentAttach.size);
+            String str = sizeText + " " + FileLoader.getDocumentExtension(documentAttach);
+            infoWidth = Math.min(maxWidth - dp(30), (int) Math.ceil(Theme.chat_infoPaint.measureText("000.0 mm / " + sizeText)));
             CharSequence str2 = TextUtils.ellipsize(str, Theme.chat_infoPaint, infoWidth, TextUtils.TruncateAt.END);
             try {
                 if (infoWidth < 0) {
@@ -27304,7 +27311,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                         }
                         if (buttonState == 0 || documentAttachType == DOCUMENT_ATTACH_TYPE_DOCUMENT) {
                             sb.append(", ");
-                            sb.append(AndroidUtilities.formatFileSize(documentAttach.size));
+                            sb.append(documentSizeText(currentMessageObject, documentAttach.size));
                         }
                     }
                     if (currentMessageObject.isVoiceTranscriptionOpen()) {
