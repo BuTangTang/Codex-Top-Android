@@ -36,4 +36,16 @@
     <string name="chatFullDate">yyyy年M月d日</string>
     <string name="MessagesSelected_one">已选择 %d 条</string>
     <string name="MessagesSelected_other">已选择 %d 条</string>
+    <string name="Emoji1">表情与人物</string>
+    <string name="Emoji2">动物与自然</string>
+    <string name="Emoji3">食物与饮品</string>
+    <string name="Emoji4">活动</string>
+    <string name="Emoji5">旅行与地点</string>
+    <string name="Emoji6">物品</string>
+    <string name="Emoji7">符号</string>
+    <string name="Emoji8">旗帜</string>
+    <string name="ClearRecentEmojiTitle">清空最近使用的表情</string>
+    <string name="ClearRecentEmojiText">确定清空最近使用的所有表情吗？</string>
+    <string name="RecentlyUsed">最近使用</string>
+    <string name="EmojiCopied">已复制表情</string>
 </resources>
