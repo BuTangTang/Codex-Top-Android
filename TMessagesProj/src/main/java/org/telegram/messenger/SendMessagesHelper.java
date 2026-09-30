@@ -4256,12 +4256,14 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         });
     }
 
-    /** 电脑对话的普通文字交给原生连接层，其他原版发送路径保持原样。 */
+    /** 电脑对话的文字和原版准备好的附件统一交连接层，绝不进入 Telegram 上传。 */
     public void sendMessage(SendMessageParams sendMessageParams) {
         if (com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(sendMessageParams.peer)) {
             String desktopText = sendMessageParams.retryMessageObject != null
                     ? sendMessageParams.retryMessageObject.messageOwner.message : sendMessageParams.message;
-            if (desktopText != null && !desktopText.isEmpty()) {
+            if (desktopText != null && !desktopText.isEmpty() || sendMessageParams.photo != null
+                    || sendMessageParams.document != null || sendMessageParams.retryMessageObject != null
+                    && com.butang.codextop.CodexRuntime.isAttachmentMessage(sendMessageParams.retryMessageObject)) {
                 com.butang.codextop.CodexRuntime.sendMessage(currentAccount, sendMessageParams);
             }
             return;
@@ -9893,8 +9895,10 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         }).start();
     }
 
+    /** 原准备器的类型切换或失败边界也结束 Codex 批次，不使用延时猜测 final。 */
     private static void finishGroup(AccountInstance accountInstance, long groupId, int scheduleDate) {
         AndroidUtilities.runOnUIThread(() -> {
+            if (com.butang.codextop.CodexRuntime.finishAttachmentGroup(accountInstance.getCurrentAccount(), groupId)) return;
             SendMessagesHelper instance = accountInstance.getSendMessagesHelper();
             ArrayList<DelayedMessage> arrayList = instance.delayedMessages.get("group_" + groupId);
             if (arrayList != null && !arrayList.isEmpty()) {

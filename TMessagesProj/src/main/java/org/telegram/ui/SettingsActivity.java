@@ -194,6 +194,87 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     private boolean codexBrowseLoaded;
     private boolean codexBrowseIncomplete;
     private String codexBrowseRequestCursor;
+    private com.butang.codextop.AccountUsage codexUsage;
+    private String codexUsageError;
+    private boolean codexUsageLoading;
+    private int codexUsageGeneration;
+
+    /** 额度沿原设置页和电脑选择子栈组织，不新建个人中心。 */
+    private boolean codexQuota() {
+        return com.butang.codextop.CodexRuntime.enabled() && getArguments() != null
+                && getArguments().getBoolean("codexQuota", false);
+    }
+
+    /** 只有明确选择电脑后才读取该电脑额度，不将多台电脑的账号混合。 */
+    private boolean codexQuotaDetail() {
+        return codexQuota() && getArguments().getString("codexMachine") != null;
+    }
+
+    /** 打开详情或点刷新时读取一次，已有快照保留采集时间，不添加后台轮询。 */
+    private void loadCodexUsage() {
+        if (!codexQuotaDetail() || codexUsageLoading) return;
+        codexUsageLoading = true;
+        codexUsageError = null;
+        int generation = ++codexUsageGeneration;
+        com.butang.codextop.CodexRuntime.readAccountUsage(getArguments().getString("codexMachine"), (usage, error) -> {
+            if (generation != codexUsageGeneration) return;
+            codexUsageLoading = false;
+            codexUsage = usage;
+            codexUsageError = error;
+            updateCodexBrowserItems();
+        });
+        updateCodexBrowserItems();
+    }
+
+    /** 日期使用手机本地格式；不存在的时间不推算。 */
+    private String codexQuotaTime(long time) {
+        return java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+                .format(new java.util.Date(time));
+    }
+
+    /** 周期按来源实际毫秒值显示，不预设必须有小时和周两个窗口。 */
+    private String codexQuotaWindow(Long duration) {
+        if (duration == null) return "周期未返回";
+        if (duration % 86400000 == 0) return duration / 86400000 + " 天";
+        if (duration % 3600000 == 0) return duration / 3600000 + " 小时";
+        if (duration % 60000 == 0) return duration / 60000 + " 分钟";
+        return java.text.NumberFormat.getNumberInstance().format(duration / 1000.0) + " 秒";
+    }
+
+    /** 额度详情复用原分组设置行，明确来源、采集时间、缺失与刷新失败。 */
+    private void fillCodexUsageItems(ArrayList<UItem> items) {
+        items.add(SettingCell.Factory.of(30, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                R.drawable.settings_devices, "来源电脑", getArguments().getString("codexMachineName", "电脑")).setEnabled(false));
+        items.add(UItem.asShadow("该电脑当前用户的 Codex 账号"));
+        if (codexUsage != null && codexUsage.available) {
+            if (!TextUtils.isEmpty(codexUsage.accountLabel)) {
+                items.add(SettingCell.Factory.of(31, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                        R.drawable.msg_info, "Codex 账号", codexUsage.accountLabel).setEnabled(false));
+            }
+            items.add(SettingCell.Factory.of(32, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.msg_info, codexUsage.isStale(System.currentTimeMillis()) ? "采集时间（已过期）" : "采集时间",
+                    codexQuotaTime(codexUsage.fetchedAtMs)).setEnabled(false));
+            items.add(UItem.asShadow(null));
+            int id = 40;
+            java.text.NumberFormat percent = java.text.NumberFormat.getNumberInstance();
+            percent.setMaximumFractionDigits(1);
+            for (com.butang.codextop.AccountUsage.Meter meter : codexUsage.meters) {
+                String remaining = meter.remainingPercent == null ? "剩余比例未返回"
+                        : (meter.estimated ? "预计剩余 " : "剩余 ") + percent.format(meter.remainingPercent) + "%";
+                items.add(SettingCell.Factory.of(id++, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                        R.drawable.settings_data, meter.label, remaining + " · " + codexQuotaWindow(meter.windowDurationMs)).setEnabled(false));
+                items.add(SettingCell.Factory.of(id++, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                        R.drawable.msg_info, "重置时间", meter.resetsAtMs == null ? "来源未返回" : codexQuotaTime(meter.resetsAtMs)).setEnabled(false));
+                items.add(UItem.asShadow(null));
+            }
+        }
+        String status = codexUsageLoading ? "正在读取" : codexUsageError != null ? codexUsageError
+                : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
+        items.add(SettingCell.Factory.of(33, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                R.drawable.settings_data, "刷新额度", status).setEnabled(!codexUsageLoading));
+        items.add(UItem.asShadow(null));
+    }
+
 
     /** 使用原设置列表承载电脑和项目子页，保留原导航栈与转场。 */
     private boolean codexBrowser() {
@@ -421,9 +502,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         };
         if (com.butang.codextop.CodexRuntime.enabled()) {
-            actionBar.setTitle(codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "我的");
+            actionBar.setTitle(codexQuota() ? "Codex 额度" : codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "我的");
             searchItem.setVisibility(View.GONE);
-            otherItem.setVisibility(codexBrowser() ? View.GONE : View.VISIBLE);
+            otherItem.setVisibility(codexBrowser() || codexQuota() ? View.GONE : View.VISIBLE);
         } else {
             search.loadFaqWebPage();
         }
@@ -433,6 +514,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             com.google.gson.JsonObject cached = com.butang.codextop.CodexRuntime.cachedBrowse(
                     getArguments().getString("codexMachine"), getArguments().getStringArrayList("codexRoots"), codexConversations());
             if (cached != null) applyCodexBrowse(cached);
+        }
+        if (codexQuotaDetail()) {
+            codexUsage = com.butang.codextop.CodexRuntime.cachedAccountUsage(getArguments().getString("codexMachine"));
         }
         listView = new UniversalRecyclerView(this, this::fillItems, this::onClick, this::onLongClick);
         listView.adapter.setApplyBackground(false);
@@ -585,15 +669,18 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return fragmentView = contentView;
     }
 
-    /** 每次进入浏览页沿原入口刷新一次；先保留本地行及多页位置。 */
+    /** 回到子页先保留本地内容再按需更新；额度请求不跟随消息或定时列表刷新。 */
     @Override
     public void onResume() {
         super.onResume();
-        if (codexBrowser() && listView != null) loadCodexBrowser(false);
+        if (codexQuotaDetail() && listView != null) loadCodexUsage();
+        else if (codexBrowser() && listView != null) loadCodexBrowser(false);
     }
 
+    /** 离开页面后废弃额度和浏览列表的迟到响应。 */
     @Override
     public void onFragmentDestroy() {
+        ++codexUsageGeneration;
         ++codexBrowseGeneration;
         super.onFragmentDestroy();
 
@@ -717,6 +804,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     private void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
             items.add(UItem.asSpace(ActionBar.getCurrentActionBarHeight()));
+            if (codexQuotaDetail()) {
+                fillCodexUsageItems(items);
+                return;
+            }
             if (codexBrowser()) {
                 boolean computers = getArguments().getString("codexMachine") == null;
                 boolean conversations = codexConversations();
@@ -758,6 +849,8 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             items.add(SettingCell.Factory.of(22, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
                     R.drawable.settings_data, "服务地址", account.server).setEnabled(false));
             items.add(UItem.asShadow(null));
+            items.add(SettingCell.Factory.of(25, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.settings_data, "Codex 额度", "按来源电脑查看"));
             items.add(SettingCell.Factory.of(6, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
                     R.drawable.settings_data, "最近会话条数", com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
             items.add(UItem.asShadow(null));
@@ -931,6 +1024,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     /** 子页不继承主栏标记，返回时恢复原电脑页和列表位置。 */
     private void onClick(UItem item, View view, int position, float x, float y) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
+            if (codexQuotaDetail()) {
+                if (item.id == 33) loadCodexUsage();
+                return;
+            }
             if (codexBrowser()) {
                 if (item.id == 9 || item.id == 10) {
                     loadCodexBrowser(item.id == 10 || (codexBrowseError != null && codexBrowseRequestCursor != null));
@@ -942,7 +1039,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                     presentFragment(new SettingsActivity(child));
                 } else if (item.id == 1000 && item.object instanceof com.google.gson.JsonObject) {
                     com.google.gson.JsonObject row = (com.google.gson.JsonObject) item.object;
-                    if (codexConversations()) {
+                    if (codexQuota()) {
+                        Bundle child = new Bundle();
+                        child.putBoolean("codexQuota", true);
+                        child.putString("codexMachine", row.get("id").getAsString());
+                        child.putString("codexMachineName", row.get("name").getAsString());
+                        presentFragment(new SettingsActivity(child));
+                    } else if (codexConversations()) {
                         Bundle chat = new Bundle();
                         chat.putLong("user_id", row.get("localDialogId").getAsLong());
                         presentFragment(new ChatActivity(chat));
@@ -964,7 +1067,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 }
                 return;
             }
-            if (item.id == 6) {
+            if (item.id == 25) {
+                Bundle child = new Bundle();
+                child.putBoolean("codexComputerBrowser", true);
+                child.putBoolean("codexQuota", true);
+                presentFragment(new SettingsActivity(child));
+            } else if (item.id == 6) {
                 final int[] counts = {20, 50, 100, 200, 500};
                 showDialog(new AlertDialog.Builder(getParentActivity(), resourceProvider)
                         .setTitle("最近会话条数")
@@ -2269,8 +2377,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         }
     }
 
+    /** 电脑与额度子页只保留返回，不带入根设置菜单。 */
     private void checkUi_menuItems() {
-        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && codexBrowser() ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
+        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && (codexBrowser() || codexQuota()) ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
         FragmentFloatingButton.setAnimatedVisibility(actionBar.getBackButton(), lerp(hasMainTabs ? 0f : 1f, 1f, animatorSearchPageVisible.getFloatValue()));
     }
 

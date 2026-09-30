@@ -2845,7 +2845,6 @@ public class ChatActivityEnterView extends FrameLayout implements
                 delegate.didPressAttachButton();
             });
             attachButton.setContentDescription(getString(R.string.AccDescrAttachButton));
-            if (com.butang.codextop.CodexRuntime.enabled()) attachButton.setVisibility(GONE);
             updateFieldRight(1);
         }
 
@@ -8774,8 +8773,8 @@ public class ChatActivityEnterView extends FrameLayout implements
     }
 
     private int lastAttachVisible;
+    /** 沿原版附件按钮的可见性预留输入框空间，电脑对话同样可以选择图片和文件。 */
     private void updateFieldRight(int attachVisible) {
-        if (com.butang.codextop.CodexRuntime.enabled()) attachVisible = 0;
         lastAttachVisible = attachVisible;
         if (messageEditText == null || (editingMessageObject != null && !editingMessageObject.needResendWhenEdit())) {
             return;
@@ -15702,10 +15701,11 @@ public class ChatActivityEnterView extends FrameLayout implements
     }
 
     private boolean isLiveComment;
+    /** 仅直播评论隐藏附件入口，普通电脑对话保留原版按钮。 */
     public void setLiveComment(boolean isLiveComment, boolean isAdmin) {
         if (this.isLiveComment == isLiveComment) return;
         this.isLiveComment = isLiveComment;
-        attachButton.setVisibility(com.butang.codextop.CodexRuntime.enabled() || isLiveComment ? View.GONE : View.VISIBLE);
+        attachButton.setVisibility(isLiveComment ? View.GONE : View.VISIBLE);
         if (isLiveComment) {
             AndroidUtilities.removeFromParent(notifyButton);
         }

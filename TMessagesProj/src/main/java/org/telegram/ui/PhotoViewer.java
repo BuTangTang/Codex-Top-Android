@@ -4917,6 +4917,19 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                         return;
                     }
 
+                    if (com.butang.codextop.CodexRuntime.isAttachmentMessage(currentMessageObject)) {
+                        // 已下载电脑图片沿原保存器落盘，不按合成 TL 标识重新寻找或下载文件。
+                        File local = com.butang.codextop.CodexRuntime.attachmentFile(currentMessageObject);
+                        if (local == null) {
+                            showDownloadAlert();
+                        } else {
+                            MediaController.saveFile(local.getAbsolutePath(), parentActivity, 0, null, null,
+                                    uri -> BulletinFactory.createSaveToGalleryBulletin(containerView,
+                                            false, 0xf9222222, 0xffffffff).show());
+                        }
+                        return;
+                    }
+
                     ArrayList<MessageObject> msgs = new ArrayList<>(1);
                     MessageObject.GroupedMessages group = parentChatActivity != null ? parentChatActivity.getGroup(currentMessageObject.getGroupId()) : null;
                     if (group != null) {
@@ -13593,6 +13606,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         return null;
     }
 
+    /** 电脑附件预览只使用已校验本地文件，原 Telegram 消息仍按原位置解析。 */
     private ImageLocation getImageLocation(int index, long[] size) {
         if (index < 0) {
             return null;
@@ -13618,6 +13632,11 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 return null;
             }
             MessageObject message = imagesArr.get(index);
+            if (com.butang.codextop.CodexRuntime.isAttachmentMessage(message)) {
+                File local = com.butang.codextop.CodexRuntime.attachmentFile(message);
+                if (size != null) size[0] = local == null ? 0 : local.length();
+                return local == null ? null : ImageLocation.getForPath(local.getAbsolutePath());
+            }
             if (message.messageOwner instanceof TLRPC.TL_messageService) {
                 if (message.messageOwner.action instanceof TLRPC.TL_messageActionUserUpdatedPhoto) {
                     return null;
@@ -13866,6 +13885,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
     }
 
+    /** 沿原版建立预览；电脑附件的媒体范围仅来自当前本地消息。 */
     private void onPhotoShow(final MessageObject messageObject, final TLRPC.FileLocation fileLocation, ImageLocation imageLocation, ImageLocation videoLocation, final ArrayList<MessageObject> messages, final ArrayList<SecureDocument> documents, final List<Object> photos, int index, final PlaceProviderObject object) {
         classGuid = ConnectionsManager.generateClassGuid();
         customTitle = null;
@@ -14126,7 +14146,12 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             if (slideshowMessageId == 0) {
                 imagesArr.add(messageObject);
                 menuItem.setSubItemShown(gallery_menu_create_sticker, !noforwards && messageObject.isPhoto() && !messageObject.isLivePhoto());
-                if (messageObject.eventId != 0) {
+                if (com.butang.codextop.CodexRuntime.isAttachmentMessage(messageObject)) {
+                    // 本次只预览已下载的原附件，不以电脑会话编号查询 Telegram 媒体历史。
+                    needSearchImageInArr = false;
+                    totalImagesCount = 1;
+                    endReached[0] = endReached[1] = true;
+                } else if (messageObject.eventId != 0) {
                     needSearchImageInArr = false;
                 } else if (currentAnimation != null) {
                     needSearchImageInArr = false;
@@ -14369,7 +14394,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
 
         dialogPhotos = null;
-        if (currentAnimation == null && !isEvent) {
+        if (currentAnimation == null && !isEvent
+                && !com.butang.codextop.CodexRuntime.isAttachmentMessage(currentMessageObject)) {
             if (currentDialogId != 0 && totalImagesCount == 0 && currentMessageObject != null && !currentMessageObject.scheduled) {
                 /*if (currentFilterTag != null && TextUtils.isEmpty(currentFilterQuery)) {
                     if (needSearchImageInArr && isFirstLoading) {
@@ -14477,6 +14503,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
     private void setIsAboutToSwitchToIndex(int index, boolean init, boolean animated) {
         setIsAboutToSwitchToIndex(index, init, animated, false);
     }
+    /** 切换原预览内容；电脑附件保留本地查看和保存，不开启远端媒体操作。 */
     private void setIsAboutToSwitchToIndex(int index, boolean init, boolean animated, boolean force) {
         if (!init && switchingToIndex == index && !force) {
             return;
@@ -14549,7 +14576,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     captionTranslated = false;
                     captionDetectedLanguage = null;
                 }
-                if (translateController.isContextTranslateEnabled()) {
+                if (translateController.isContextTranslateEnabled()
+                        && !com.butang.codextop.CodexRuntime.isAttachmentMessage(newMessageObject)) {
                     final MessageObject messageObject = newMessageObject;
                     translateController.detectPhotoLanguage(messageObject, lng -> {
                         if (index != switchingToIndex) {
@@ -14672,7 +14700,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     countView.updateShow(true, animated);
                     countView.set(1 + switchingToIndex, imagesArr.size());
                 }
-            } else if (totalImagesCount + totalImagesCountMerge != 0 && !needSearchImageInArr) {
+            } else if (totalImagesCount + totalImagesCountMerge != 0 && !needSearchImageInArr
+                    && !com.butang.codextop.CodexRuntime.isAttachmentMessage(newMessageObject)) {
                 if (opennedFromMedia) {
                     if (startOffset + imagesArr.size() < totalImagesCount + totalImagesCountMerge && !loadingMoreImages && switchingToIndex > imagesArr.size() - 5) {
                         int loadFromMaxId = imagesArr.isEmpty() ? 0 : imagesArr.get(imagesArr.size() - 1).getId();
@@ -15214,6 +15243,21 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
         }
         setCurrentCaption(newMessageObject, caption, captionTranslating, animateCaption);
+        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(newMessageObject)) {
+            menuItem.hideSubItem(gallery_menu_showall);
+            menuItem.hideSubItem(gallery_menu_reply);
+            menuItem.hideSubItem(gallery_menu_delete);
+            menuItem.hideSubItem(gallery_menu_create_sticker);
+            menuItem.hideSubItem(gallery_menu_savegif);
+            menuItem.hideSubItem(gallery_menu_masks2);
+            menuItem.hideSubItem(gallery_menu_translate);
+            menuItem.hideSubItem(gallery_menu_hide_translation);
+            menuItem.hideSubItem(gallery_menu_cancel_loading);
+            setItemVisible(sendItem, false, false);
+            setItemVisible(editItem, false, false);
+            setItemVisible(masksItem, false, false);
+            menuItem.checkHideMenuItem();
+        }
     }
 
     private void checkActionBarStyle() {
@@ -16367,12 +16411,22 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
     }
 
+    /** 电脑附件只检查现有本地文件，不挂接 Telegram 下载进度或自动预取。 */
     private void checkProgress(int a, boolean scroll, boolean animated) {
         int index = currentIndex;
         if (a == 1) {
             index += 1;
         } else if (a == 2) {
             index -= 1;
+        }
+        if (index >= 0 && index < imagesArr.size()
+                && com.butang.codextop.CodexRuntime.isAttachmentMessage(imagesArr.get(index))) {
+            photoProgressViews[a].setBackgroundState(PROGRESS_NONE, animated, true);
+            if (a == 0) {
+                canZoom = com.butang.codextop.CodexRuntime.attachmentFile(imagesArr.get(index)) != null;
+                menuItem.hideSubItem(gallery_menu_cancel_loading);
+            }
+            return;
         }
         if (currentFileNames[a] != null) {
             File f1 = null;
@@ -16591,6 +16645,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
     }
 
+    /** 原版接收器负责显示；电脑图片不提供任何 Telegram 远端缩略图后备。 */
     private void setIndexToImage(ImageReceiver imageReceiver, int index, CropTransform cropTransform) {
         imageReceiver.setOrientation(0, false);
         if (!secureDocuments.isEmpty()) {
@@ -16802,6 +16857,19 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 messageObject = null;
             }
 
+            if (messageObject != null && com.butang.codextop.CodexRuntime.isAttachmentMessage(messageObject)) {
+                // 原图片接收器直接读取本地文件，不附合成 TL 缩略图作为后备请求。
+                File local = com.butang.codextop.CodexRuntime.attachmentFile(messageObject);
+                imageReceiver.setNeedsQualityThumb(false);
+                imageReceiver.setShouldGenerateQualityThumb(false);
+                if (local != null) {
+                    imageReceiver.setImage(ImageLocation.getForPath(local.getAbsolutePath()), null,
+                            null, null, null, local.length(), null, messageObject, 0);
+                } else {
+                    imageReceiver.setImageBitmap(parentActivity.getResources().getDrawable(R.drawable.photoview_placeholder));
+                }
+                return;
+            }
             if (messageObject != null) {
                 String restrictionReason = MessagesController.getInstance(messageObject.currentAccount).getRestrictionReason(messageObject.messageOwner.restriction_reason);
                 if (!TextUtils.isEmpty(restrictionReason)) {

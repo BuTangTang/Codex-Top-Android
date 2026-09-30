@@ -252,20 +252,33 @@ public final class DesktopConnection implements AutoCloseable {
 
     /** 使用调用方保存的唯一消息身份发送一次，失败或超时不擅自重发。 */
     public JsonObject send(String sessionId, String text, String localId) throws Exception {
-        if (sessionId == null || sessionId.isEmpty() || text == null || text.isEmpty()
+        return send(sessionId, text, localId, java.util.Collections.emptyList());
+    }
+
+    /** 正文与已完成上传的附件使用同一原生输入及发送编号，纯附件不被当作空消息。 */
+    public JsonObject send(String sessionId, String text, String localId,
+            java.util.List<DesktopAttachment> attachments) throws Exception {
+        if (sessionId == null || sessionId.isEmpty() || text == null || attachments == null
+                || text.isEmpty() && attachments.isEmpty()
                 || localId == null || localId.isEmpty()) throw new IllegalArgumentException("发送消息缺少必要信息");
         JsonObject params = new JsonObject();
         params.addProperty("machineId", machineId);
         params.addProperty("sessionId", sessionId);
         params.addProperty("text", text);
         params.addProperty("localId", localId);
-        JsonObject meta = new JsonObject();
+        JsonObject meta = attachments.isEmpty() ? new JsonObject() : DesktopAttachment.meta(attachments);
         meta.addProperty("desktopTextSendProtocol", "native-auto-v1");
         params.add("meta", meta);
         return rpc("daemon.directSessions.send", params);
     }
 
-    /** 构造已支持的用户 Codex 来源，不新增源路径猜测。 */
+    /** 原分块传输也走此电脑已有的认证加密RPC，不创建另一条连接或自动重试。 */
+    public JsonObject transfer(String method, JsonObject params) throws Exception {
+        if (!method.matches("daemon\\.bulkTransfer\\.(?:upload|download)\\.(?:init|chunk|finalize|abort)"))
+            throw new IllegalArgumentException("未知附件传输方法");
+        return rpc(method, params);
+    }
+
     /** 按需读取原桌面待审批内容，不放入常规状态轮询或本地历史缓存。 */
     public java.util.ArrayList<DesktopApproval> readApprovals(String sessionId) throws Exception {
         if (sessionId == null || sessionId.isEmpty()) throw new IllegalArgumentException("缺少关联会话");
@@ -280,6 +293,29 @@ public final class DesktopConnection implements AutoCloseable {
                 .getAsJsonObject("result");
     }
 
+    /** 只在用户查看问题时读取完整原题，旧审批读取保持原快照契约。 */
+    public java.util.ArrayList<DesktopQuestion> readQuestions(String sessionId) throws Exception {
+        JsonObject params = new JsonObject();
+        params.addProperty("machineId", machineId); params.addProperty("sessionId", sessionId);
+        params.addProperty("includeQuestions", true);
+        return DesktopQuestion.read(rpc("daemon.directSessions.control.read", params).getAsJsonObject("snapshot"));
+    }
+
+    /** 完整答案一次提交到原结构化请求，不走普通消息发送或 Telegram 投票。 */
+    public JsonObject answerQuestions(String sessionId, DesktopQuestion request, String operationId,
+            java.util.Map<String, String> answers) throws Exception {
+        return rpc("daemon.directSessions.control.action", request.action(machineId, sessionId, operationId, answers))
+                .getAsJsonObject("result");
+    }
+
+    /** 按需读取所选电脑当前用户 Codex 的实际额度，沿用浏览会话的同一来源。 */
+    public AccountUsage readAccountUsage() throws Exception {
+        JsonObject params = base(null);
+        params.remove("providerId");
+        return AccountUsage.parse(rpc("daemon.directSessions.accountUsage.read", params).getAsJsonObject("result"));
+    }
+
+    /** 构造已支持的用户 Codex 来源，不新增源路径猜测。 */
     private JsonObject base(String remoteSessionId) {
         JsonObject params = new JsonObject();
         params.addProperty("machineId", machineId);
@@ -291,9 +327,22 @@ public final class DesktopConnection implements AutoCloseable {
         return params;
     }
 
+    /** 仅表示本机传输门禁明确阻止了emit；已发出后的断线和超时仍属于未知结果。 */
+    static final class RpcNotDispatchedException extends IOException {
+        /** 未发送可由调用方保留草稿，等待用户手动重试。 */
+        private RpcNotDispatchedException() { super("电脑连接正在恢复，请稍后重试"); }
+    }
+
+    /** 原发送handler明确返回未接受，保留原因供原待发状态决定是否允许手动重试。 */
+    static final class SendRejectedException extends IOException {
+        final String reason;
+        /** 与超时和未知送达分开，不声称这个拒绝发生在传输派发之前。 */
+        private SendRejectedException(String reason) { super("电脑暂未接受此消息"); this.reason = reason; }
+    }
+
     /** 对现有机器 RPC 做一次认证加密调用；超时不自动重发，避免未来发送重复消息。 */
     private JsonObject rpc(String method, JsonObject params) throws Exception {
-        if (closed || !socket.connected()) throw new IOException("电脑连接正在恢复");
+        if (closed || !socket.connected()) throw new RpcNotDispatchedException();
         JSONObject call = new JSONObject();
         call.put("method", machineId + ":" + method);
         call.put("params", crypto.encrypt(params.toString()));
@@ -310,7 +359,7 @@ public final class DesktopConnection implements AutoCloseable {
         EventThread.exec(() -> {
             // 检查与发出使用同一 Socket.IO 事件线程，断线时不进入离线发送缓冲。
             if (closed || !socket.connected() || result.isDone()) {
-                result.completeExceptionally(new IOException("电脑连接正在恢复"));
+                result.completeExceptionally(new RpcNotDispatchedException());
                 return;
             }
             socket.emit("rpc-call", new Object[]{call}, new AckWithTimeout(25000) {
@@ -320,16 +369,34 @@ public final class DesktopConnection implements AutoCloseable {
                 JSONObject envelope = (JSONObject) args[0];
                 if (!envelope.optBoolean("ok")) throw new IOException("电脑暂时无法响应，请稍后重试");
                 JsonObject response = JsonParser.parseString(crypto.decrypt(envelope.getString("result"))).getAsJsonObject();
-                if (!response.has("ok") || !response.get("ok").isJsonPrimitive()
-                        || !response.get("ok").getAsJsonPrimitive().isBoolean()
-                        || !response.get("ok").getAsBoolean()) throw new IOException("电脑未能完成此请求");
+                // 原bulk handler返回success，其余机器会话handler返回ok，不能改变传输既有封套。
+                String success = method.startsWith("daemon.bulkTransfer.") ? "success" : "ok";
+                if (!response.has(success) || !response.get(success).isJsonPrimitive()
+                        || !response.get(success).getAsJsonPrimitive().isBoolean()
+                        || !response.get(success).getAsBoolean()) {
+                    if ("daemon.directSessions.send".equals(method) && response.has("errorCode")
+                            && response.get("errorCode").isJsonPrimitive()
+                            && response.get("errorCode").getAsJsonPrimitive().isString()) {
+                        String reason = response.get("errorCode").getAsString();
+                        if (!reason.isEmpty() && !"delivery_outcome_unknown".equals(reason))
+                            throw new SendRejectedException(reason);
+                    }
+                    throw new IOException("电脑未能完成此请求");
+                }
                 result.complete(response);
             } catch (Exception error) { result.completeExceptionally(error); } }
             @Override public void onTimeout() { result.completeExceptionally(new java.util.concurrent.TimeoutException()); }
             });
         });
         try { return result.get(25, TimeUnit.SECONDS); }
-        finally { pending.remove(result); result.cancel(false); }
+        catch (java.util.concurrent.ExecutionException error) {
+            // 只解包明确未emit；其他传输错误保持原未知语义，不能据此重新发送。
+            if (error.getCause() instanceof RpcNotDispatchedException)
+                throw (RpcNotDispatchedException) error.getCause();
+            if (error.getCause() instanceof SendRejectedException)
+                throw (SendRejectedException) error.getCause();
+            throw error;
+        } finally { pending.remove(result); result.cancel(false); }
     }
 
     /** 页面释放时关闭连接并擦除机器密钥。 */

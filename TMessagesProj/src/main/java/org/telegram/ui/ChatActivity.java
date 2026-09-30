@@ -250,6 +250,7 @@ import org.telegram.ui.Cells.DialogCell;
 import org.telegram.ui.Cells.IMessageCell;
 import org.telegram.ui.Cells.MentionCell;
 import org.telegram.ui.Cells.ProfileChannelCell;
+import org.telegram.ui.Cells.RadioButtonCell;
 import org.telegram.ui.Cells.ShareDialogCell;
 import org.telegram.ui.Cells.StickerCell;
 import org.telegram.ui.Cells.TextSelectionHelper;
@@ -823,8 +824,12 @@ public class ChatActivity extends BaseFragment implements
     private Runnable waitingForCharaterEnterRunnable;
     private Runnable codexDraftSaveRunnable;
     private boolean codexApprovalBusy;
+    private boolean codexQuestionBusy;
+    private long codexQuestionUiGeneration;
+    private final HashMap<String, java.util.LinkedHashMap<String, String>> codexQuestionDrafts = new HashMap<>();
+    private final HashMap<String, String> codexQuestionCustomDrafts = new HashMap<>();
 
-    /** 顶栏用原弹窗展示完整来源，仅真实且有效的审批待办提供操作入口。 */
+    /** 顶栏用原弹窗展示完整来源，真实待回复与审批分别可达。 */
     public void showCodexConversationInfo() {
         if (getParentActivity() == null) return;
         com.butang.codextop.CodexRuntime.ConversationInfo source = com.butang.codextop.CodexRuntime.conversationInfo(dialog_id);
@@ -839,6 +844,11 @@ public class ChatActivity extends BaseFragment implements
         if ("current".equals(status.validity) && "needs_input".equals(status.state)
                 && ("approval".equals(status.pendingKind) || "mixed".equals(status.pendingKind))) {
             builder.setNeutralButton("查看待批准操作", (dialog, which) -> showCodexApprovals());
+        }
+        if ("current".equals(status.validity) && "needs_input".equals(status.state)
+                && ("question".equals(status.pendingKind) || "mixed".equals(status.pendingKind))) {
+            builder.setPositiveButton("回答问题", (dialog, which) -> showCodexQuestions());
+            builder.setNegativeButton("关闭", null);
         }
         showDialog(builder.create());
     }
@@ -895,6 +905,244 @@ public class ChatActivity extends BaseFragment implements
                     .setTitle("处理结果").setMessage(message).setPositiveButton("知道了", null).create());
         });
     }
+    /** 仅点击真实待回复入口时读题；离开页面后的迟到结果不打开弹窗。 */
+    public void showCodexQuestions() {
+        if (codexQuestionBusy || getParentActivity() == null || paused) return;
+        codexQuestionBusy = true;
+        final long generation = codexQuestionUiGeneration;
+        com.butang.codextop.CodexRuntime.readQuestions(dialog_id, (review, error) -> {
+            // 同一片段离开再回来也不能展示上次读取的题目。
+            if (generation != codexQuestionUiGeneration || paused || getParentActivity() == null) return;
+            codexQuestionBusy = false;
+            if (error != null || review == null || review.requests.isEmpty()) {
+                showDialog(new AlertDialog.Builder(getParentActivity(), themeDelegate).setTitle("回答问题")
+                        .setMessage(error != null ? error : "当前没有待回答的问题。")
+                        .setPositiveButton("知道了", null).create());
+                return;
+            }
+            if (review.requests.size() == 1) showCodexQuestion(review, review.requests.get(0), 0);
+            else {
+                CharSequence[] titles = new CharSequence[review.requests.size()];
+                for (int i = 0; i < titles.length; i++) {
+                    com.butang.codextop.DesktopQuestion request = review.requests.get(i);
+                    String question = request.questions.isEmpty() ? "问题" : request.questions.get(0).question;
+                    titles[i] = (i + 1) + ". " + question + ("answered".equals(request.status) ? "（已回答）"
+                            : "expired".equals(request.status) ? "（已失效）" : "");
+                }
+                showDialog(new AlertDialog.Builder(getParentActivity(), themeDelegate).setTitle("回答问题")
+                        .setItems(titles, (dialog, which) -> {
+                            if (generation == codexQuestionUiGeneration && !paused)
+                                showCodexQuestion(review, review.requests.get(which), 0);
+                        })
+                        .setNegativeButton("关闭", null).create());
+            }
+        });
+    }
+
+    /** 沿原单选弹窗逐题作答；原题没有授权的自填入口不会出现。 */
+    private void showCodexQuestion(com.butang.codextop.CodexRuntime.QuestionReview review,
+            com.butang.codextop.DesktopQuestion request, int index) {
+        if (getParentActivity() == null || paused) return;
+        final long generation = codexQuestionUiGeneration;
+        final int questionIndex = codexUnansweredQuestionIndex(request, index, 1);
+        if (!request.canAnswer || review.alreadyIssued(request) || questionIndex < 0) {
+            String state = "answered".equals(request.status) ? "此问题已回答。"
+                    : "expired".equals(request.status) ? "此问题已失效。"
+                    : questionIndex < 0 && !request.questions.isEmpty() ? "此问题已回答。"
+                    : review.alreadyIssued(request) ? "回答已提交，结果尚需核对，请查看最新进展。"
+                    : "此问题当前不能回答。";
+            showDialog(new AlertDialog.Builder(getParentActivity(), themeDelegate).setTitle("回答问题")
+                    .setMessage(state).setPositiveButton("知道了", null).create());
+            return;
+        }
+        final int previousIndex = codexUnansweredQuestionIndex(request, questionIndex - 1, -1);
+        final int nextIndex = codexUnansweredQuestionIndex(request, questionIndex + 1, 1);
+        final com.butang.codextop.DesktopQuestion.Question question = request.questions.get(questionIndex);
+        final java.util.LinkedHashMap<String, String> answers = codexQuestionDrafts.computeIfAbsent(
+                request.identity(), key -> new java.util.LinkedHashMap<>());
+        // 桌面已确认的原答覆盖同题旧草稿，只补剩余题；保密原答不进入任何输入框。
+        answers.putAll(request.answers);
+        String selected = answers.get(question.id);
+        final String customKey = request.identity() + "\n" + question.id;
+        final int[] selectedIndex = {-1};
+        for (int i = 0; i < question.options.size(); i++) {
+            if (question.options.get(i).label.equals(selected)) selectedIndex[0] = i;
+        }
+        final boolean allowsText = question.options.isEmpty() || question.isOther;
+        final int customIndex = question.options.size();
+        if (allowsText && (question.options.isEmpty() || selected != null && selectedIndex[0] < 0)) {
+            selectedIndex[0] = customIndex;
+        }
+        LinearLayout content = new LinearLayout(getParentActivity());
+        content.setOrientation(LinearLayout.VERTICAL);
+        ArrayList<RadioButtonCell> cells = new ArrayList<>();
+        for (int i = 0; i < question.options.size(); i++) {
+            com.butang.codextop.DesktopQuestion.Option option = question.options.get(i);
+            RadioButtonCell cell = new CodexQuestionOptionCell(getParentActivity());
+            cell.setTextAndValue(option.label, option.description, false, selectedIndex[0] == i);
+            cell.valueTextView.setVisibility(TextUtils.isEmpty(option.description) ? View.GONE : View.VISIBLE);
+            cell.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+            content.addView(cell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            cells.add(cell);
+        }
+        EditTextBoldCursor field = allowsText ? new EditTextBoldCursor(getParentActivity()) : null;
+        if (allowsText && !question.options.isEmpty()) {
+            RadioButtonCell cell = new CodexQuestionOptionCell(getParentActivity());
+            cell.setTextAndValue("自行填写", "", false, selectedIndex[0] == customIndex);
+            cell.valueTextView.setVisibility(View.GONE);
+            cell.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 2));
+            content.addView(cell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            cells.add(cell);
+        }
+        if (field != null) {
+            field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18);
+            field.setTextColor(getThemedColor(Theme.key_dialogTextBlack));
+            field.setHintTextColor(getThemedColor(Theme.key_dialogTextHint));
+            field.setCursorColor(getThemedColor(Theme.key_dialogTextBlack));
+            field.setBackgroundDrawable(Theme.createEditTextDrawable(getParentActivity(), true));
+            field.setHint("填写回答");
+            field.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                    | (question.isSecret ? android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD : android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES));
+            if (question.isSecret) field.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
+            field.setMinLines(1);
+            field.setMaxLines(5);
+            field.setGravity((LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP);
+            field.setText(selectedIndex[0] == customIndex ? selected : codexQuestionCustomDrafts.get(customKey));
+            field.setSelection(field.length());
+            field.setVisibility(selectedIndex[0] == customIndex ? View.VISIBLE : View.GONE);
+            content.addView(field, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 24, 8, 24, 16));
+            field.addTextChangedListener(new android.text.TextWatcher() {
+                /** 输入前不改变其他题目的草稿。 */
+                @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) { }
+                /** 每次输入保存在当前片段，不写进聊天记录或磁盘。 */
+                @Override public void onTextChanged(CharSequence text, int start, int before, int count) {
+                    codexQuestionCustomDrafts.put(customKey, text.toString());
+                    if (selectedIndex[0] == customIndex) answers.put(question.id, text.toString());
+                }
+                /** 文本已原样保存，不再二次改写。 */
+                @Override public void afterTextChanged(android.text.Editable text) { }
+            });
+        }
+        for (int i = 0; i < cells.size(); i++) {
+            final int optionIndex = i;
+            cells.get(i).setOnClickListener(view -> {
+                if (generation != codexQuestionUiGeneration || paused) return;
+                selectedIndex[0] = optionIndex;
+                for (int j = 0; j < cells.size(); j++) cells.get(j).setChecked(j == optionIndex, true);
+                boolean custom = optionIndex == customIndex;
+                answers.put(question.id, custom ? field.getText().toString() : question.options.get(optionIndex).label);
+                if (field != null) {
+                    field.setVisibility(custom ? View.VISIBLE : View.GONE);
+                    if (custom) { field.requestFocus(); AndroidUtilities.showKeyboard(field); }
+                    else AndroidUtilities.hideKeyboard(field);
+                }
+            });
+        }
+        String title = TextUtils.isEmpty(question.header) ? "回答问题" : question.header;
+        if (request.questions.size() > 1) title += "（" + (questionIndex + 1) + "/" + request.questions.size() + "）";
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(title).setMessage(question.question).setView(content)
+                .setPositiveButton(nextIndex < 0 ? "提交回答" : "下一题", null)
+                .setNegativeButton("关闭", null);
+        if (previousIndex >= 0) builder.setNeutralButton("上一题", null);
+        AlertDialog dialog = builder.create();
+        dialog.setDismissDialogByButtons(false);
+        dialog.setOnShowListener(ignored -> {
+            // 原弹窗按钮只推进当前原题，不把局部答案提前发送。
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(view -> {
+                if (generation != codexQuestionUiGeneration || paused || codexQuestionBusy) return;
+                if (!question.accepts(answers.get(question.id))) {
+                    AndroidUtilities.shakeView(field != null && field.getVisibility() == View.VISIBLE ? field : content);
+                    return;
+                }
+                dialog.dismiss();
+                if (nextIndex >= 0) showCodexQuestion(review, request, nextIndex);
+                else submitCodexQuestions(review, request, answers);
+            });
+            dialog.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(view -> dialog.dismiss());
+            if (previousIndex >= 0) dialog.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                dialog.dismiss();
+                if (generation == codexQuestionUiGeneration && !paused) showCodexQuestion(review, request, previousIndex);
+            });
+            if (field != null && field.getVisibility() == View.VISIBLE) {
+                field.requestFocus();
+                AndroidUtilities.showKeyboard(field);
+            }
+        });
+        // 由 BaseFragment 接管关闭监听，保留它自己的可见弹窗清理。
+        showDialog(dialog, ignored -> {
+            // 切换到下一题后，上一题的迟到关闭事件不能收起新题键盘。
+            if (field != null && visibleDialog == dialog) AndroidUtilities.hideKeyboard(field);
+        });
+    }
+
+    /** 按原顺序跳过桌面已经确认的题目，前后导航不会重新编辑或展示其保密答案。 */
+    private static int codexUnansweredQuestionIndex(com.butang.codextop.DesktopQuestion request, int start, int direction) {
+        for (int i = start; i >= 0 && i < request.questions.size(); i += direction) {
+            if (!request.answers.containsKey(request.questions.get(i).id)) return i;
+        }
+        return -1;
+    }
+
+    /** 只由完整表单的提交按钮调用一次；未知保留答案，明确成功才清理本题草稿。 */
+    private void submitCodexQuestions(com.butang.codextop.CodexRuntime.QuestionReview review,
+            com.butang.codextop.DesktopQuestion request, java.util.LinkedHashMap<String, String> answers) {
+        if (codexQuestionBusy || paused || getParentActivity() == null) return;
+        codexQuestionBusy = true;
+        final long generation = codexQuestionUiGeneration;
+        com.butang.codextop.CodexRuntime.answerQuestions(review, request, answers, (status, message) -> {
+            if (generation != codexQuestionUiGeneration || paused || getParentActivity() == null) return;
+            codexQuestionBusy = false;
+            if ("accepted".equals(status)) {
+                codexQuestionDrafts.remove(request.identity());
+                for (com.butang.codextop.DesktopQuestion.Question question : request.questions)
+                    codexQuestionCustomDrafts.remove(request.identity() + "\n" + question.id);
+            }
+            String title = "accepted".equals(status) ? "回答已收到" : "recorded".equals(status) ? "回答已记录"
+                    : "unknown".equals(status) ? "结果待确认" : "回答未提交";
+            AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                    .setTitle(title).setMessage(message).setPositiveButton("知道了", null);
+            if ("rejected".equals(status)) builder.setNeutralButton("重新查看", (dialog, which) -> showCodexQuestions());
+            showDialog(builder.create());
+        });
+    }
+
+    /** 仅为原单选行解除单行标题限制，长选项说明仍使用原字色、间距与勾选控件。 */
+    private static final class CodexQuestionOptionCell extends RadioButtonCell {
+        private TextView titleView;
+
+        /** 找到原行标题，不复制原控件的绘制与可访问实现。 */
+        private CodexQuestionOptionCell(Context context) {
+            super(context, true);
+            for (int i = 0; i < getChildCount(); i++) {
+                if (getChildAt(i) instanceof TextView && getChildAt(i) != valueTextView) {
+                    titleView = (TextView) getChildAt(i);
+                    titleView.setSingleLine(false);
+                    titleView.setMaxLines(Integer.MAX_VALUE);
+                    FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) titleView.getLayoutParams();
+                    params.width = LayoutHelper.MATCH_PARENT;
+                    params.bottomMargin = dp(12);
+                }
+            }
+            valueTextView.setMaxLines(Integer.MAX_VALUE);
+            ((FrameLayout.LayoutParams) valueTextView.getLayoutParams()).width = LayoutHelper.MATCH_PARENT;
+            setMinimumHeight(dp(48));
+        }
+
+        /** 标题换行后把原说明排在标题下方，避免固定 35dp 起点造成文字重叠。 */
+        @Override protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            if (titleView != null) {
+                FrameLayout.LayoutParams titleParams = (FrameLayout.LayoutParams) titleView.getLayoutParams();
+                int width = Math.max(0, MeasureSpec.getSize(widthMeasureSpec) - titleParams.leftMargin - titleParams.rightMargin);
+                titleView.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+                        MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                ((FrameLayout.LayoutParams) valueTextView.getLayoutParams()).topMargin =
+                        titleParams.topMargin + titleView.getMeasuredHeight() + dp(3);
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+        }
+    }
+
     private Runnable onChatMessagesLoaded;
 
     private TLRPC.ChatInvite chatInvite;
@@ -12676,7 +12924,7 @@ public class ChatActivity extends BaseFragment implements
                 }
             };
             chatAttachAlert.setDialogId(getDialogId());
-            chatAttachAlert.allowLivePhotos = true;
+            chatAttachAlert.allowLivePhotos = !com.butang.codextop.CodexRuntime.ownsConversation(dialog_id);
             chatAttachAlert.setDelegate(new ChatAttachAlert.ChatAttachViewDelegate() {
                 @Override
                 public void didPressedButton(int button, boolean arg, boolean notify, int scheduleDate, int scheduleRepeatPeriod, long effectId, boolean invertMedia, boolean forceDocument, long payStars) {
@@ -22006,6 +22254,19 @@ public class ChatActivity extends BaseFragment implements
             }
         } else if (id == NotificationCenter.updateInterfaces) {
             int updateMask = (Integer) args[0];
+            // 字节进度沿原通知只更新可见附件，不重建消息列表或触发网络刷新。
+            if ((updateMask & MessagesController.UPDATE_MASK_SEND_STATE) != 0
+                    && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) && chatListView != null) {
+                for (int i = 0; i < chatListView.getChildCount(); i++) {
+                    View child = chatListView.getChildAt(i);
+                    if (child instanceof ChatMessageCell) {
+                        ChatMessageCell cell = (ChatMessageCell) child;
+                        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(cell.getMessageObject())) {
+                            cell.updateButtonState(false, true, false);
+                        }
+                    }
+                }
+            }
             if ((updateMask & MessagesController.UPDATE_MASK_NAME) != 0 || (updateMask & MessagesController.UPDATE_MASK_CHAT_NAME) != 0 || (updateMask & MessagesController.UPDATE_MASK_EMOJI_STATUS) != 0) {
                 if (currentChat != null) {
                     TLRPC.Chat chat = getMessagesController().getChat(currentChat.id);
@@ -29858,9 +30119,10 @@ public class ChatActivity extends BaseFragment implements
     Bulletin.Delegate bulletinDelegate;
 
     @Override
-    /** 保留原页面恢复流程，并为电脑对话启动前台增量读取。 */
+    /** 保留原页面恢复流程，恢复提问入口并为电脑对话启动前台增量读取。 */
     public void onResume() {
         codexApprovalBusy = false;
+        codexQuestionBusy = false;
         if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexRuntime.watchConversation(currentAccount, dialog_id);
         super.onResume();
         checkShowBlur(false);
@@ -30079,8 +30341,10 @@ public class ChatActivity extends BaseFragment implements
     }
 
     @Override
-    /** 保留原页面暂停流程，并停止离开后的电脑消息轮询。 */
+    /** 保留原页面暂停流程，撤销旧提问弹窗回调并停止离开后的电脑消息轮询。 */
     public void onPause() {
+        codexQuestionUiGeneration++;
+        codexQuestionBusy = false;
         if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexRuntime.stopWatching(dialog_id);
         super.onPause();
         scrolling = false;
@@ -33763,6 +34027,21 @@ public class ChatActivity extends BaseFragment implements
                     selectedObjectGroup = null;
                     selectedObjectToEditCaption = null;
                     return;
+                }
+                if (com.butang.codextop.CodexRuntime.isAttachmentMessage(selectedObject)) {
+                    File local = com.butang.codextop.CodexRuntime.attachmentFile(selectedObject);
+                    if (local != null) {
+                        // 复用原保存进度，文件失效时也不回退到 Telegram 下载器。
+                        TLRPC.Document document = selectedObject.getDocument();
+                        MediaController.saveFile(local.getAbsolutePath(), getParentActivity(), 2,
+                                selectedObject.getDocumentName(), document == null ? null : document.mime_type, uri -> {
+                                    if (uri != null && getParentActivity() != null && fragmentView != null) {
+                                        BulletinFactory.of(this).createDownloadBulletin(
+                                                BulletinFactory.FileType.UNKNOWNS, 1, themeDelegate).show();
+                                    }
+                                });
+                    }
+                    break;
                 }
                 boolean isMusic = selectedObject.isMusic();
                 boolean isDocument = selectedObject.isDocument();
@@ -40743,9 +41022,11 @@ public class ChatActivity extends BaseFragment implements
             }
         }
 
+        /** 电脑附件暂不提供取消契约，不能调用 Telegram 的取消发送或删除逻辑。 */
         @Override
         public void didPressCancelSendButton(ChatMessageCell cell) {
             MessageObject message = cell.getMessageObject();
+            if (com.butang.codextop.CodexRuntime.isAttachmentMessage(message)) return;
             if (message.messageOwner.send_state != 0) {
                 getSendMessagesHelper().cancelSendingMessage(message);
             }
@@ -41505,9 +41786,48 @@ public class ChatActivity extends BaseFragment implements
             }
         }
 
+        /** 图片与文件沿原版预览，未缓存电脑附件先交连接层下载。 */
         @Override
         public void didPressImage(ChatMessageCell cell, float x, float y, boolean fullPreview) {
             MessageObject message = cell.getMessageObject();
+            if (com.butang.codextop.CodexRuntime.isAttachmentMessage(message)) {
+                com.butang.codextop.DesktopAttachment attachment = com.butang.codextop.CodexRuntime.attachment(message);
+                if (attachment != null && !attachment.isAvailable()) {
+                    String reason = attachment.reason;
+                    String explanation = "电脑未提供可下载的文件。";
+                    if ("file_too_large".equals(reason)) explanation = "附件超过当前传输大小上限。";
+                    else if ("unsupported_reference".equals(reason)) explanation = "这张图片的引用暂不支持下载。";
+                    else if ("materialization_failed".equals(reason)) explanation = "电脑未能保存生成图片。";
+                    else if ("materialization_required".equals(reason)) explanation = "电脑尚未提供生成图片的文件。";
+                    else if (!TextUtils.isEmpty(reason)) explanation = "暂时无法下载该附件：" + reason;
+                    showDialog(new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                            .setTitle(attachment.name).setMessage(explanation)
+                            .setPositiveButton(LocaleController.getString(R.string.OK), null).create());
+                    return;
+                }
+                com.butang.codextop.CodexRuntime.AttachmentState state =
+                        com.butang.codextop.CodexRuntime.attachmentTransferState(message);
+                if (state != null && state.active) return;
+                if (!message.isSending() && !message.isSendError()
+                        && com.butang.codextop.CodexRuntime.attachmentFile(message) == null) {
+                    final int messageId = message.getId();
+                    com.butang.codextop.CodexRuntime.downloadAttachment(currentAccount, message, () -> {
+                        if (isPaused || getParentActivity() == null || cell.getMessageObject() == null
+                                || cell.getMessageObject().getId() != messageId
+                                || cell.getMessageObject().getDialogId() != dialog_id) return;
+                        MessageObject current = cell.getMessageObject();
+                        cell.updateButtonState(false, true, false);
+                        if (com.butang.codextop.CodexRuntime.attachmentFile(current) != null) {
+                            didPressImage(cell, x, y, fullPreview);
+                        } else {
+                            showDialog(new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                                    .setTitle("附件下载失败").setMessage("请检查电脑连接，点按附件可以重试。")
+                                    .setPositiveButton(LocaleController.getString(R.string.OK), null).create());
+                        }
+                    });
+                    return;
+                }
+            }
             if (message.type == MessageObject.TYPE_STORY) {
                 if (message.messageOwner.media.storyItem != null && !(message.messageOwner.media.storyItem instanceof TL_stories.TL_storyItemDeleted)) {
                     TL_stories.StoryItem storyItem = message.messageOwner.media.storyItem;
@@ -45780,7 +46100,7 @@ public class ChatActivity extends BaseFragment implements
         return -1;
     }
 
-    /** 构建原消息弹出菜单；Codex 保留复制和既有失败重试，移除未接入的远端操作。 */
+    /** 构建原消息弹出菜单；电脑附件复用本地保存、复制和既有失败重试。 */
     public void fillMessageMenu(
         MessageObject primaryMessage,
 
@@ -45790,10 +46110,22 @@ public class ChatActivity extends BaseFragment implements
     ) {
         final MessageObject message = selectedObject;
         if (com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
-            if (message.isSendError()) {
+            if (message.isSendError() && com.butang.codextop.CodexRuntime.canRetryMessage(message)) {
                 items.add(LocaleController.getString(R.string.Retry));
                 options.add(OPTION_RETRY);
                 icons.add(R.drawable.msg_retry);
+            }
+            if (com.butang.codextop.CodexRuntime.isAttachmentMessage(message)
+                    && com.butang.codextop.CodexRuntime.attachmentFile(message) != null) {
+                if (message.isPhoto()) {
+                    items.add(LocaleController.getString(R.string.SaveToGallery));
+                    options.add(OPTION_SAVE_TO_GALLERY);
+                    icons.add(R.drawable.msg_gallery);
+                } else {
+                    items.add(LocaleController.getString(R.string.SaveToDownloads));
+                    options.add(OPTION_SAVE_TO_DOWNLOADS_OR_MUSIC);
+                    icons.add(R.drawable.msg_download);
+                }
             }
             items.add(LocaleController.getString(R.string.Copy));
             options.add(OPTION_COPY);

@@ -10384,7 +10384,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                     } else if (messageObject.type == MessageObject.TYPE_EXTENDED_MEDIA_PREVIEW) {
                         photoImage.setImage(null, null, ImageLocation.getForObject(currentPhotoObjectThumb, photoParentObject), currentPhotoFilterThumb, currentPhotoObjectThumbStripped, 0, null, currentMessageObject, cacheType);
                     } else if (messageObject.type == MessageObject.TYPE_PHOTO) {
-                        if (messageObject.useCustomPhoto) {
+                        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(messageObject)) {
+                            bindCodexAttachmentPhoto(com.butang.codextop.CodexRuntime.attachmentFile(messageObject));
+                        } else if (messageObject.useCustomPhoto) {
                             photoImage.setImageBitmap(getResources().getDrawable(R.drawable.theme_preview_image));
                         } else {
                             if (currentPhotoObject != null) {
@@ -12751,6 +12753,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
     }
 
+    /** 保留原文件气泡排版；电脑文件的图片缩略图只能来自本地缓存。 */
     private int createDocumentLayout(int maxWidth, MessageObject messageObject) {
         if (messageObject.sponsoredMedia != null) {
             documentAttach = messageObject.sponsoredMedia.document;
@@ -12850,6 +12853,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
             return 0;
         } else {
             drawPhotoImage = documentAttach.mime_type != null && (documentAttach.mime_type.toLowerCase().startsWith("image/") || documentAttach.mime_type.toLowerCase().startsWith("video/mp4")) || MessageObject.isDocumentHasThumb(documentAttach);
+            if (com.butang.codextop.CodexRuntime.isAttachmentMessage(messageObject)) {
+                drawPhotoImage = documentAttach.mime_type != null && documentAttach.mime_type.startsWith("image/");
+            }
             if (!drawPhotoImage) {
                 maxWidth += dp(30);
             }
@@ -12886,6 +12892,11 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
             }
 
             if (drawPhotoImage) {
+                if (com.butang.codextop.CodexRuntime.isAttachmentMessage(messageObject)) {
+                    currentPhotoFilter = "86_86";
+                    bindCodexAttachmentPhoto(com.butang.codextop.CodexRuntime.attachmentFile(messageObject));
+                    return width;
+                }
                 currentPhotoObject = FileLoader.getClosestPhotoSizeWithSize(messageObject.photoThumbs, 320);
                 currentPhotoObjectThumb = FileLoader.getClosestPhotoSizeWithSize(messageObject.photoThumbs, 40);
 
@@ -17243,9 +17254,26 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
     }
 
+    /** 电脑附件沿原版图标与配色显示进度，未接入取消时不绘制取消按钮。 */
     private int getIconForCurrentState() {
         if (currentMessageObject == null || currentMessageObject.hasExtendedMedia()) {
             return MediaActionDrawable.ICON_NONE;
+        }
+        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(currentMessageObject)) {
+            if (currentMessageObject.type == MessageObject.TYPE_PHOTO) {
+                radialProgress.setColorKeys(Theme.key_chat_mediaLoaderPhoto, Theme.key_chat_mediaLoaderPhotoSelected,
+                        Theme.key_chat_mediaLoaderPhotoIcon, Theme.key_chat_mediaLoaderPhotoIconSelected);
+            } else if (currentMessageObject.isOutOwner()) {
+                radialProgress.setColorKeys(Theme.key_chat_outLoader, Theme.key_chat_outLoaderSelected,
+                        Theme.key_chat_outMediaIcon, Theme.key_chat_outMediaIconSelected);
+            } else {
+                radialProgress.setColorKeys(Theme.key_chat_inLoader, Theme.key_chat_inLoaderSelected,
+                        Theme.key_chat_inMediaIcon, Theme.key_chat_inMediaIconSelected);
+            }
+            if (buttonState == 1) return MediaActionDrawable.ICON_EMPTY;
+            if (buttonState == 0) return MediaActionDrawable.ICON_DOWNLOAD;
+            return currentMessageObject.type == MessageObject.TYPE_PHOTO
+                    ? MediaActionDrawable.ICON_NONE : MediaActionDrawable.ICON_FILE;
         }
         if (documentAttachType == DOCUMENT_ATTACH_TYPE_ROUND && currentMessageObject.isVoiceTranscriptionOpen() && canStreamVideo) {
             if (buttonState == 1 || buttonState == 4) {
@@ -17373,8 +17401,53 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         invalidate();
     }
 
+    /** 图片只绑定连接层已经校验的本地文件，不使用合成 TL 标识发起 Telegram 下载。 */
+    private void bindCodexAttachmentPhoto(File file) {
+        photoImage.setNeedsQualityThumb(false);
+        photoImage.setShouldGenerateQualityThumb(false);
+        if (file == null) {
+            photoNotSet = true;
+            photoImage.setImageBitmap(getResources().getDrawable(R.drawable.photoview_placeholder));
+        } else {
+            photoNotSet = false;
+            photoImage.setImage(ImageLocation.getForPath(file.getAbsolutePath()), currentPhotoFilter,
+                    null, null, null, file.length(), null, currentMessageObject, 0);
+        }
+    }
+
+    /** 传输状态只读现有连接层；沿原版进度控件更新，不创建计时器或请求。 */
+    private void updateCodexAttachmentButtonState(boolean ifSame, boolean animated) {
+        DownloadController.getInstance(currentAccount).removeLoadingFileObserver(this);
+        com.butang.codextop.CodexRuntime.AttachmentState state =
+                com.butang.codextop.CodexRuntime.attachmentTransferState(currentMessageObject);
+        com.butang.codextop.DesktopAttachment attachment =
+                com.butang.codextop.CodexRuntime.attachment(currentMessageObject);
+        File file = com.butang.codextop.CodexRuntime.attachmentFile(currentMessageObject);
+        boolean active = state != null && state.active;
+        buttonState = active ? 1 : file != null || attachment != null && !attachment.isAvailable()
+                || currentMessageObject.isSending() || currentMessageObject.isSendError() ? -1 : 0;
+        hasMiniProgress = 0;
+        miniButtonState = -1;
+        drawRadialCheckBackground = false;
+        radialProgress.setIcon(getIconForCurrentState(), ifSame, animated);
+        radialProgress.setMiniIcon(MediaActionDrawable.ICON_NONE, ifSame, false);
+        videoRadialProgress.setIcon(MediaActionDrawable.ICON_NONE, ifSame, false);
+        videoRadialProgress.setMiniIcon(MediaActionDrawable.ICON_NONE, ifSame, false);
+        float progress = active && state.totalBytes > 0
+                ? Math.max(0f, Math.min(1f, (float) state.transferredBytes / state.totalBytes)) : 0f;
+        radialProgress.setProgress(progress, animated);
+        if (currentMessageObject.type == MessageObject.TYPE_PHOTO || drawPhotoImage
+                && currentMessageObject.type == MessageObject.TYPE_FILE) bindCodexAttachmentPhoto(file);
+        invalidate();
+    }
+
+    /** 电脑附件使用现有 owner 的字节进度，其余消息沿原版下载状态。 */
     public void updateButtonState(boolean ifSame, boolean animated, boolean fromSet) {
         if (currentMessageObject == null) {
+            return;
+        }
+        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(currentMessageObject)) {
+            updateCodexAttachmentButtonState(ifSame, animated && attachedToWindow);
             return;
         }
         if (currentMessageObject.type == MessageObject.TYPE_STORY && currentMessageObject.isVideoStory()) {
@@ -17820,7 +17893,12 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
     }
 
+    /** 电脑附件不使用 Telegram 的迷你下载入口。 */
     private void didPressMiniButton(boolean animated) {
+        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(currentMessageObject)) {
+            didPressButton(animated, false);
+            return;
+        }
         if (miniButtonState == 0) {
             miniButtonState = 1;
             radialProgress.setProgress(0, false);
@@ -17851,7 +17929,16 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
     }
 
+    /** 电脑附件点击统一交聊天页处理下载或预览，不调用 Telegram 文件传输。 */
     private void didPressButton(boolean animated, boolean video) {
+        if (com.butang.codextop.CodexRuntime.isAttachmentMessage(currentMessageObject)) {
+            com.butang.codextop.CodexRuntime.AttachmentState state =
+                    com.butang.codextop.CodexRuntime.attachmentTransferState(currentMessageObject);
+            if (delegate != null && (state == null || !state.active)) {
+                delegate.didPressImage(this, lastTouchX, lastTouchY, false);
+            }
+            return;
+        }
         if (delegate != null && currentMessageObject.isSensitive() && currentMessageObject.hasMediaSpoilers() && !currentMessageObject.needDrawBluredPreview() && !currentMessageObject.isMediaSpoilersRevealed) {
             delegate.didPressRevealSensitiveContent(this);
             return;

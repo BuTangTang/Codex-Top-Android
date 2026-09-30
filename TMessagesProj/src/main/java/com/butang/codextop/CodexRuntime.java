@@ -10,6 +10,10 @@ import com.google.gson.JsonObject;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.io.File;
+import java.io.IOException;
+import org.telegram.messenger.MessageObject;
+import org.telegram.messenger.SendMessagesHelper.SendMessageParams;
 
 /** 原有 Telegram 页面共享的 Codex 业务状态，不创建或管理任何新界面。 */
 public final class CodexRuntime {
@@ -27,6 +31,8 @@ public final class CodexRuntime {
     private static final Object dialogIdentityLock = new Object();
     // 仅缓存浏览元数据；界面快读不等待网络队列或磁盘。
     private static final Map<String, JsonObject> browseSnapshots = new java.util.concurrent.ConcurrentHashMap<>();
+    // 只保留本次账号内各电脑用户来源的最近采集值；页面始终展示原采集时间。
+    private static final Map<String, AccountUsage> accountUsageSnapshots = new java.util.concurrent.ConcurrentHashMap<>();
     private static final org.telegram.messenger.DispatchQueue dialogQueue = new org.telegram.messenger.DispatchQueue("codex-dialogs");
     private static final ArrayList<TLRPC.Dialog> dialogs = new ArrayList<>();
     private static final Map<Long, String> remoteIds = new java.util.concurrent.ConcurrentHashMap<>();
@@ -39,6 +45,11 @@ public final class CodexRuntime {
     private static final org.telegram.messenger.DispatchQueue historyQueue = new org.telegram.messenger.DispatchQueue("codex-history");
     private static final Map<Long, String> linkedSessions = new java.util.concurrent.ConcurrentHashMap<>();
     private static final Map<String, org.telegram.messenger.MessageObject> pendingMessages = new HashMap<>();
+    // 原选择器按 groupId/final 交付；仅在界面线程收齐同批，不新增发送队列。
+    private static final Map<String, ArrayList<SendMessageParams>> attachmentGroups = new HashMap<>();
+    private static final Map<String, AttachmentState> attachmentStates = new HashMap<>();
+    private static final Map<String, ArrayList<Runnable>> attachmentCallbacks = new HashMap<>();
+    private static final java.util.HashSet<String> sendingBatches = new java.util.HashSet<>();
     private static final org.telegram.messenger.DispatchQueue statusQueue = new org.telegram.messenger.DispatchQueue("codex-status");
     private static final SessionStatus.Store statuses = new SessionStatus.Store();
     private static final Map<Long, String> dialogTitles = new HashMap<>();
@@ -161,6 +172,7 @@ public final class CodexRuntime {
                         sessionRestored = true;
                         desktop = null;
                         desktopConnections.clear();
+                        accountUsageSnapshots.clear();
                         preferredMachine = null;
                         cachedDialogsRead = false;
                         // 与冷盘恢复共用小锁；旧账号绑定不能越过清理写入下一账号。
@@ -170,6 +182,7 @@ public final class CodexRuntime {
                         }
                         dialogs.clear();
                         histories.clear(); linkedSessions.clear(); pendingMessages.clear();
+                        attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear();
                         statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
                         loading = false; listRefreshScheduled = false; loadError = null;
@@ -442,86 +455,428 @@ public final class CodexRuntime {
         return machine == null ? null : desktopConnections.get(machine);
     }
 
-    /** 原输入框继续负责清空与动画；先发布本地气泡，再在独立队列向电脑发送。 */
-    public static void sendMessage(int account, org.telegram.messenger.SendMessagesHelper.SendMessageParams params) {
-        final long accountEpoch = accountGeneration;
-        if (!isAccountCurrent(accountEpoch)) return;
-        String remote = remoteIds.get(params.peer);
-        org.telegram.messenger.MessageObject object = params.retryMessageObject;
-        if (object == null) {
-            TLRPC.TL_message message = new TLRPC.TL_message();
-            message.local_id = message.id = org.telegram.messenger.UserConfig.getInstance(account).getNewMessageId();
-            org.telegram.messenger.UserConfig.getInstance(account).saveConfig(false);
-            message.dialog_id = params.peer;
-            message.date = (int) (System.currentTimeMillis() / 1000);
-            message.message = params.message;
-            message.out = true;
-            message.unread = true;
-            message.peer_id = new TLRPC.TL_peerUser();
-            message.peer_id.user_id = params.peer;
-            message.from_id = new TLRPC.TL_peerUser();
-            message.flags |= 256;
-            message.media = new TLRPC.TL_messageMediaEmpty();
-            message.params = new HashMap<>();
-            message.params.put("codexLocalId", java.util.UUID.randomUUID().toString());
-            message.send_state = org.telegram.messenger.MessageObject.MESSAGE_SEND_STATE_SENDING;
-            object = new org.telegram.messenger.MessageObject(account, message, true, false);
-            object.wasJustSent = true;
-            ArrayList<org.telegram.messenger.MessageObject> added = new ArrayList<>();
-            added.add(object);
+    /** 传输只发布实际字节；没有取消契约时不把进度伪装成可取消操作。 */
+    public static final class AttachmentState {
+        public final boolean active, upload, failed;
+        public final long transferredBytes, totalBytes;
+        /** 保存一个分块传输快照，原气泡自行使用已有进度绘制。 */
+        private AttachmentState(boolean active, boolean upload, boolean failed, long transferred, long total) {
+            this.active = active; this.upload = upload; this.failed = failed;
+            transferredBytes = transferred; totalBytes = total;
+        }
+    }
+
+    /** 仅识别本产品在原消息模型内保存的附件，不将普通 Telegram 媒体改走电脑连接。 */
+    public static boolean isAttachmentMessage(MessageObject message) {
+        return message != null && ownsConversation(message.getDialogId()) && message.messageOwner.params != null
+                && (message.messageOwner.params.containsKey("codexAttachment")
+                || message.messageOwner.params.containsKey("codexPendingFile")
+                || message.messageOwner.params.containsKey("codexSelectedFile"));
+    }
+
+    /** 描述只从已验证的本地消息参数恢复；不可用引用允许没有下载路径。 */
+    public static DesktopAttachment attachment(MessageObject message) {
+        if (!isAttachmentMessage(message)) return null;
+        String encoded = message.messageOwner.params.get("codexAttachment");
+        if (encoded == null) return null;
+        try {
+            com.google.gson.JsonArray values = new com.google.gson.JsonArray();
+            values.add(com.google.gson.JsonParser.parseString(encoded));
+            JsonObject payload = new JsonObject(); payload.add("attachments", values);
+            JsonObject happier = new JsonObject(); happier.addProperty("kind", "attachments.v1"); happier.add("payload", payload);
+            JsonObject meta = new JsonObject(); meta.add("happier", happier);
+            JsonObject raw = new JsonObject(); raw.add("meta", meta);
+            return DesktopAttachment.readRaw(raw).get(0);
+        } catch (RuntimeException error) { return null; }
+    }
+
+    /** 文件缓存沿当前账号、电脑和会话的既有归属，服务地址与本机路径不用于公开诊断。 */
+    private static File attachmentDirectory(long dialogId) {
+        PasswordLogin.Session owner = session;
+        String remote = remoteIds.get(dialogId);
+        if (owner == null || remote == null) throw new IllegalStateException("附件会话归属缺失");
+        File root = ApplicationLoader.applicationContext.getExternalFilesDir("codex-attachments");
+        if (root == null) root = new File(ApplicationLoader.applicationContext.getNoBackupFilesDir(), "codex-attachments");
+        return new File(root, TranscriptStore.digest(owner.server + "\n" + owner.accountId
+                + "\n" + dialogMachine(dialogId) + "\n" + remote));
+    }
+
+    /** 只有已原子发布或上传前保留的原件可就绪；界面线程不重新读取整图计算摘要。 */
+    private static File cachedAttachment(File directory, String localId, DesktopAttachment value) {
+        if (value == null || !value.isAvailable()) return null;
+        try {
+            if (localId != null) {
+                File original = AttachmentFiles.target(directory, "send\n" + localId, value.name);
+                if (original.isFile() && (value.sizeBytes == null || original.length() == value.sizeBytes)) return original;
+            }
+            File target = AttachmentFiles.target(directory, "receive\n" + value.toJson(), value.name);
+            return target.isFile() && (value.sizeBytes == null || target.length() == value.sizeBytes) ? target : null;
+        } catch (IOException error) { return null; }
+    }
+
+    /** 原预览和打开文件仅获得已就绪本地文件，不触发 Telegram 下载或网络预读。 */
+    public static File attachmentFile(MessageObject message) {
+        if (!isAttachmentMessage(message)) return null;
+        try {
+            Map<String, String> params = message.messageOwner.params;
+            String pending = params.get("codexPendingFile");
+            if (pending != null) {
+                DesktopAttachment.Pending value = DesktopAttachment.Pending.read(com.google.gson.JsonParser.parseString(pending).getAsJsonObject());
+                File local = new File(value.localPath);
+                File expected = AttachmentFiles.target(attachmentDirectory(message.getDialogId()),
+                        "send\n" + params.get("codexLocalId"), value.name);
+                return local.equals(expected) && local.isFile() && local.length() == value.sizeBytes ? local : null;
+            }
+            String selected = params.get("codexSelectedFile");
+            if (selected != null) {
+                File local = new File(selected);
+                return local.isAbsolute() && local.isFile() ? local : null;
+            }
+            return cachedAttachment(attachmentDirectory(message.getDialogId()), params.get("codexLocalId"), attachment(message));
+        } catch (Exception error) { return null; }
+    }
+
+    /** 同一附件的进度由消息身份关联；账号切换后旧标识不能命中新账号。 */
+    private static String attachmentKey(MessageObject message) {
+        String localId = message.messageOwner.params == null ? null : message.messageOwner.params.get("codexLocalId");
+        DesktopAttachment value = attachment(message);
+        return accountGeneration + ":" + message.getDialogId() + ":"
+                + (localId != null ? localId : value == null ? message.getId() : TranscriptStore.digest(value.toJson().toString()));
+    }
+
+    /** 原气泡只读内存快照，不为显示进度轮询电脑。 */
+    public static AttachmentState attachmentTransferState(MessageObject message) {
+        return isAttachmentMessage(message) ? attachmentStates.get(attachmentKey(message)) : null;
+    }
+
+    /** 每次网络操作及回调都核对账号、电脑、会话和连接实例，旧响应不得落到新归属。 */
+    private static boolean attachmentCurrent(long epoch, long dialogId, String remote, DesktopConnection connection) {
+        return isAccountCurrent(epoch) && remote.equals(remoteIds.get(dialogId))
+                && connection != null && dialogConnection(dialogId) == connection;
+    }
+
+    /** 分块 RPC 沿原认证连接执行，归属变化立即结束后续传输。 */
+    private static AttachmentTransfer transfer(long epoch, long dialogId, String remote, DesktopConnection connection,
+            AttachmentTransfer.Progress progress) {
+        return new AttachmentTransfer((method, params) -> {
+            if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("附件连接已变化");
+            JsonObject result = connection.transfer(method, params);
+            if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("附件连接已变化");
+            return result;
+        }, progress);
+    }
+
+    /** 分块回调仅更新原气泡；不重新装载聊天历史或改变列表滚动。 */
+    private static void attachmentProgress(int account, long epoch, long dialogId, String remote,
+            DesktopConnection connection, String key, boolean upload, long done, long total) {
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!attachmentCurrent(epoch, dialogId, remote, connection)) return;
+            attachmentStates.put(key, new AttachmentState(true, upload, false, done, total));
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces,
+                    MessagesController.UPDATE_MASK_SEND_STATE);
+        });
+    }
+
+    /** 点击原附件按钮才下载；同一文件复用在途操作，完成与失败均回到原页面的主线程回调。 */
+    public static void downloadAttachment(int account, MessageObject message, Runnable completed) {
+        final long epoch = accountGeneration;
+        final DesktopAttachment value = attachment(message);
+        if (!isAccountCurrent(epoch) || value == null || !value.isAvailable() || attachmentFile(message) != null) {
+            AndroidUtilities.runOnUIThread(completed); return;
+        }
+        final String key = attachmentKey(message);
+        ArrayList<Runnable> callbacks = attachmentCallbacks.get(key);
+        if (callbacks != null) { callbacks.add(completed); return; }
+        callbacks = new ArrayList<>(); callbacks.add(completed); attachmentCallbacks.put(key, callbacks);
+        final long dialogId = message.getDialogId();
+        final String remote = remoteIds.get(dialogId);
+        final DesktopConnection connection = dialogConnection(dialogId);
+        final File directory = attachmentDirectory(dialogId);
+        attachmentStates.put(key, new AttachmentState(true, false, false, 0, value.sizeBytes == null ? 0 : value.sizeBytes));
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
+        historyQueue.postRunnable(() -> {
+            File ready = null;
+            try {
+                File target = AttachmentFiles.target(directory, "receive\n" + value.toJson(), value.name);
+                transfer(epoch, dialogId, remote, connection,
+                        (done, total) -> attachmentProgress(account, epoch, dialogId, remote, connection, key, false, done, total))
+                        .download(value.path, value.sizeBytes, value.sha256, target);
+                ready = target;
+            } catch (Exception ignored) { /* 原有效文件由传输层保留，失败可再次点击重试。 */ }
+            final File received = ready;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!isAccountCurrent(epoch)) return;
+                boolean valid = received != null && attachmentCurrent(epoch, dialogId, remote, connection);
+                AttachmentState previous = attachmentStates.get(key);
+                attachmentStates.put(key, new AttachmentState(false, false, !valid,
+                        valid ? received.length() : previous == null ? 0 : previous.transferredBytes,
+                        previous == null ? 0 : previous.totalBytes));
+                if (valid && message.messageOwner instanceof TLRPC.TL_message) {
+                    AttachmentMessages.apply((TLRPC.TL_message) message.messageOwner, value, received);
+                    message.attachPathExists = message.mediaExists = true;
+                    message.generateThumbs(false);
+                }
+                NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
+                ArrayList<Runnable> finished = attachmentCallbacks.remove(key);
+                if (finished != null) for (Runnable callback : finished) callback.run();
+            });
+        });
+    }
+
+    /** 创建原本地气泡的最小共同字段，发送和重启恢复保持相同编号与正文。 */
+    private static TLRPC.TL_message pendingMessage(long dialogId, int id, int date, String text, String base, int index) {
+        TLRPC.TL_message message = new TLRPC.TL_message();
+        message.id = message.local_id = id; message.dialog_id = dialogId; message.date = date;
+        message.message = text == null ? "" : text; message.out = message.unread = true;
+        message.peer_id = new TLRPC.TL_peerUser(); message.peer_id.user_id = dialogId;
+        message.from_id = new TLRPC.TL_peerUser(); message.flags |= 256;
+        message.media = new TLRPC.TL_messageMediaEmpty(); message.params = new HashMap<>();
+        message.params.put("codexLocalId", TranscriptText.attachmentIdentity(base, index));
+        message.params.put("codexBatchLocalId", base);
+        message.params.put("codexAttachmentIndex", Integer.toString(index));
+        return message;
+    }
+
+    /** 读取原准备器的实际文件；originalPath 只是来源标识，不能作为上传路径。 */
+    private static File selectedAttachment(int account, SendMessageParams params) {
+        File expected = params.path != null && new File(params.path).isAbsolute() ? new File(params.path) : null;
+        if (expected != null && expected.isFile()) return expected;
+        if (params.photo != null) for (int i = params.photo.sizes.size() - 1; i >= 0; i--) {
+            File cached = org.telegram.messenger.FileLoader.getInstance(account).getPathToAttach(params.photo.sizes.get(i), true);
+            if (expected == null) expected = cached;
+            if (cached.isFile()) return cached;
+        }
+        return expected;
+    }
+
+    /** 原失败菜单不提供无效重试；发送结果未知时只等待同身份回显。 */
+    public static boolean canRetryMessage(MessageObject message) {
+        return message != null && (message.messageOwner.params == null
+                || !"true".equals(message.messageOwner.params.get("codexSendUncertain")));
+    }
+
+    /** 原输入框清空后立刻产生本地气泡；同组图片或文件收齐后只提交一个桌面输入。 */
+    public static void sendMessage(int account, SendMessageParams params) {
+        final long epoch = accountGeneration;
+        if (!isAccountCurrent(epoch) || !ownsConversation(params.peer)) return;
+        ArrayList<SendMessageParams> selected = new ArrayList<>();
+        String groupId = params.params == null ? null : params.params.get("groupId");
+        if (params.retryMessageObject == null && (params.photo != null || params.document != null)
+                && groupId != null && !"0".equals(groupId)) {
+            String key = account + ":" + params.peer + ":" + groupId;
+            selected = attachmentGroups.computeIfAbsent(key, ignored -> new ArrayList<>());
+            selected.add(params);
+            if (!params.params.containsKey("final")) return;
+            attachmentGroups.remove(key);
+        } else selected.add(params);
+        sendBatch(account, params, selected);
+    }
+
+    /** 原准备器结束不完整分组时沿同一个收齐入口交付，不靠超时猜测批次结束。 */
+    public static boolean finishAttachmentGroup(int account, long groupId) {
+        String suffix = ":" + groupId;
+        for (String key : new ArrayList<>(attachmentGroups.keySet())) {
+            if (key.startsWith(account + ":") && key.endsWith(suffix)) {
+                ArrayList<SendMessageParams> selected = attachmentGroups.remove(key);
+                if (selected != null && !selected.isEmpty()) sendBatch(account, selected.get(0), selected);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 重试复用原批次和气泡，首次发送保留每个附件的原生消息样式。 */
+    private static void sendBatch(int account, SendMessageParams params, ArrayList<SendMessageParams> selected) {
+        final long epoch = accountGeneration;
+        if (!isAccountCurrent(epoch)) return;
+        final long dialogId = params.peer;
+        final String remote = remoteIds.get(dialogId);
+        final String cwd = dialogDirectories.get(dialogId);
+        final File directory = attachmentDirectory(dialogId);
+        final OutboxStore outbox = outboxStore(dialogId);
+        final ArrayList<MessageObject> messages = new ArrayList<>();
+        final String base;
+        if (params.retryMessageObject != null) {
+            MessageObject retry = params.retryMessageObject;
+            if (!canRetryMessage(retry)) return;
+            base = retry.messageOwner.params.getOrDefault("codexBatchLocalId", retry.messageOwner.params.get("codexLocalId"));
+            if (base == null || sendingBatches.contains(base)) return;
+            for (MessageObject pending : pendingMessages.values()) {
+                if (pending.getDialogId() == dialogId && base.equals(pending.messageOwner.params.getOrDefault(
+                        "codexBatchLocalId", pending.messageOwner.params.get("codexLocalId")))) messages.add(pending);
+            }
+            if (messages.isEmpty()) messages.add(retry);
+            messages.sort((left, right) -> Integer.compare(right.getId(), left.getId()));
+        } else {
+            base = java.util.UUID.randomUUID().toString();
+            StringBuilder text = new StringBuilder();
+            for (SendMessageParams item : selected) {
+                String caption = item.photo != null || item.document != null ? item.caption : item.message;
+                if (caption != null && !caption.isEmpty()) { if (text.length() > 0) text.append('\n'); text.append(caption); }
+            }
+            org.telegram.messenger.UserConfig config = org.telegram.messenger.UserConfig.getInstance(account);
+            for (int i = 0; i < selected.size(); i++) {
+                SendMessageParams item = selected.get(i);
+                TLRPC.TL_message message = pendingMessage(dialogId, config.getNewMessageId(),
+                        (int) (System.currentTimeMillis() / 1000), i == 0 ? text.toString() : "", base, i);
+                if (item.photo != null || item.document != null) {
+                    File source = selectedAttachment(account, item);
+                    String name = item.document == null ? source == null ? "图片.jpg" : source.getName()
+                            : org.telegram.messenger.FileLoader.getDocumentFileName(item.document);
+                    if (name == null || name.isEmpty()) name = source == null ? "文件" : source.getName();
+                    String kind = item.photo == null ? "file" : "image";
+                    message.params.put("codexSelectedFile", source == null ? "" : source.getAbsolutePath());
+                    message.params.put("codexSelectedName", name); message.params.put("codexSelectedKind", kind);
+                    message.params.put("codexSelectedMime", item.document == null ? "image/jpeg"
+                            : item.document.mime_type == null ? "application/octet-stream" : item.document.mime_type);
+                    AttachmentMessages.applySelected(message, source, name, kind);
+                }
+                message.send_state = MessageObject.MESSAGE_SEND_STATE_SENDING;
+                MessageObject object = new MessageObject(account, message, true, false);
+                object.wasJustSent = true;
+                object.attachPathExists = object.mediaExists = attachmentFile(object) != null;
+                messages.add(object);
+            }
+            config.saveConfig(false);
             NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages,
-                    params.peer, added, false, 0);
-            // 只在提交当下清除这一份原草稿，异步回执不得清除用户随后输入的新草稿。
-            org.telegram.messenger.MediaDataController.getInstance(account).cleanDraft(params.peer,
+                    dialogId, messages, false, 0);
+            org.telegram.messenger.MediaDataController.getInstance(account).cleanDraft(dialogId,
                     params.replyToTopMsg == null ? 0 : params.replyToTopMsg.getId(), false);
         }
-        final org.telegram.messenger.MessageObject pending = object;
-        pendingMessages.put(pending.messageOwner.params.get("codexLocalId"), pending);
-        if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge", "pending_key=" + pending.messageOwner.params.get("codexLocalId").hashCode());
-        final long dialogId = params.peer;
-        // 调试仅记录阶段耗时和随机消息身份的哈希；不记录正文、账号或会话路径。
+        sendingBatches.add(base);
+        for (MessageObject pending : messages) {
+            pending.messageOwner.send_state = MessageObject.MESSAGE_SEND_STATE_SENDING;
+            pendingMessages.put(pending.messageOwner.params.get("codexLocalId"), pending);
+        }
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
         final long sendStarted = android.os.SystemClock.elapsedRealtime();
-        final int sendTrace = pending.messageOwner.params.get("codexLocalId").hashCode();
-        final OutboxStore outbox = outboxStore(dialogId);
+        final ArrayList<Map<String, String>> selectedMetadata = new ArrayList<>();
+        for (MessageObject pending : messages) selectedMetadata.add(new HashMap<>(pending.messageOwner.params));
+        // UI 可继续输入；暂存、摘要、上传和一次桌面发送始终串行进入既有发送队列。
         sendQueue.postRunnable(() -> {
+            DesktopConnection connection = null;
+            boolean uncertain = false;
             try {
-                if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge",
-                        "send_phase=queue key=" + sendTrace + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - sendStarted));
-                // 先保存原身份，再接触网络；重启恢复只展示，不自动重发。
-                outbox.put(new OutboxStore.Item(pending.messageOwner.params.get("codexLocalId"), remote,
-                        pending.messageOwner.message, pending.getId(), pending.messageOwner.date));
-                if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge",
-                        "send_phase=persisted key=" + sendTrace + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - sendStarted));
-                // 退出前已经出现的气泡仍落盘，但退出后不再发出新的网络请求。
-                if (!isAccountCurrent(accountEpoch)) return;
-                DesktopConnection connection = dialogConnection(dialogId);
-                if (connection == null) throw new java.io.IOException("对话所属电脑尚未连接");
+                traceSend("queue", base, sendStarted);
+                OutboxStore.Item stored = outbox.get(base);
+                uncertain = stored != null && stored.submissionUncertain;
+                if (stored == null) {
+                    ArrayList<OutboxStore.Selection> choices = new ArrayList<>();
+                    for (Map<String, String> metadata : selectedMetadata) {
+                        if (metadata.containsKey("codexSelectedFile")) {
+                            String path = metadata.get("codexSelectedFile");
+                            choices.add(new OutboxStore.Selection(path == null || path.isEmpty() ? null : path,
+                                    metadata.get("codexSelectedName"), metadata.get("codexSelectedKind"), metadata.get("codexSelectedMime")));
+                        } else if (metadata.containsKey("codexPendingFile")) {
+                            DesktopAttachment.Pending value = DesktopAttachment.Pending.read(
+                                    com.google.gson.JsonParser.parseString(metadata.get("codexPendingFile")).getAsJsonObject());
+                            choices.add(new OutboxStore.Selection(value.localPath, value.name, value.kind, value.mimeType));
+                        }
+                    }
+                    MessageObject first = messages.get(0);
+                    stored = OutboxStore.Item.selected(base, remote, first.messageOwner.message, first.getId(), first.messageOwner.date, choices);
+                    // 任何附件读取之前先记录完整选择；首写本身失败时只能保留内存气泡。
+                    outbox.put(stored);
+                }
+                traceSend("persisted", base, sendStarted);
+                if (!isAccountCurrent(epoch)) return;
+                // 原请求可能已派发；即使用户点击重试也等待回显，不重复进入桌面发送。
+                if (stored.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true); return; }
+                ArrayList<DesktopAttachment.Pending> staged = new ArrayList<>(stored.attachments);
+                for (int i = staged.size(); i < stored.selections.size(); i++) {
+                    if (!isAccountCurrent(epoch)) return;
+                    OutboxStore.Selection choice = stored.selections.get(i);
+                    String localId = TranscriptText.attachmentIdentity(base, i);
+                    DesktopAttachment.Pending original = AttachmentFiles.stage(
+                            choice.localPath == null ? null : new File(choice.localPath), choice.name, choice.kind, choice.mimeType,
+                            directory, "send\n" + localId);
+                    staged.add(original);
+                    outbox.rememberStaged(base, staged);
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (!isAccountCurrent(epoch)) return;
+                        MessageObject pending = pendingMessages.get(localId);
+                        if (pending == null || pending.getDialogId() != dialogId) return;
+                        AttachmentMessages.applyPending((TLRPC.TL_message) pending.messageOwner, original);
+                        pending.attachPathExists = pending.mediaExists = true;
+                        pending.generateThumbs(false);
+                    });
+                }
+                stored = outbox.get(base);
+                if (stored == null || !stored.isPrepared()) throw new IOException("附件尚未全部暂存");
+                connection = dialogConnection(dialogId);
+                if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话所属电脑尚未连接");
                 String linked = linkedSessions.get(dialogId);
                 if (linked == null) {
                     linked = connection.openConversation(remote).get("sessionId").getAsString();
+                    if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话连接已变化");
                     linkedSessions.put(dialogId, linked);
                 }
-                // 发送接口独立核对原会话与原生接受结果；不等待展示状态的额外查询。
-                // native-auto-v1 由桌面选择继续当前轮或开启下一轮，拒绝和未知均保留原待发身份。
-                if (!isAccountCurrent(accountEpoch)) return;
-                if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge",
-                        "send_phase=linked key=" + sendTrace + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - sendStarted));
-                connection.send(linked, pending.messageOwner.message, pending.messageOwner.params.get("codexLocalId"));
-                if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge",
-                        "send_phase=ack key=" + sendTrace + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - sendStarted));
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (!isAccountCurrent(accountEpoch)) return;
-                    pending.messageOwner.send_state = org.telegram.messenger.MessageObject.MESSAGE_SEND_STATE_SENT;
-                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByServer,
-                            pending.getId(), pending.getId(), pending.messageOwner, dialogId, 0L, 0, false);
-                });
+                traceSend("linked", base, sendStarted);
+                final DesktopConnection transferConnection = connection;
+                ArrayList<DesktopAttachment> uploaded = new ArrayList<>(stored.uploaded);
+                if (!stored.attachments.isEmpty() && (cwd == null || cwd.isEmpty())) throw new IOException("原会话工作目录暂不可用");
+                for (int i = uploaded.size(); i < stored.attachments.size(); i++) {
+                    final DesktopAttachment.Pending original = stored.attachments.get(i);
+                    final String localId = TranscriptText.attachmentIdentity(base, i);
+                    final String key = epoch + ":" + dialogId + ":" + localId;
+                    AttachmentTransfer.Result result = transfer(epoch, dialogId, remote, transferConnection,
+                            (done, total) -> attachmentProgress(account, epoch, dialogId, remote, transferConnection, key, true, done, total))
+                            .upload(new File(original.localPath), original.kind, localId, cwd);
+                    uploaded.add(original.uploaded(result.path, result.sizeBytes, result.sha256));
+                    outbox.rememberUploaded(base, uploaded);
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (isAccountCurrent(epoch)) attachmentStates.put(key,
+                                new AttachmentState(false, true, false, original.sizeBytes, original.sizeBytes));
+                    });
+                }
+                if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话连接已变化");
+                outbox.markSubmissionUncertain(base, true);
+                uncertain = true;
+                try { connection.send(linked, stored.text, stored.localId, uploaded); }
+                catch (DesktopConnection.RpcNotDispatchedException | DesktopConnection.SendRejectedException notAccepted) {
+                    outbox.markSubmissionUncertain(base, false);
+                    uncertain = false;
+                    throw notAccepted;
+                }
+                traceSend("ack", base, sendStarted);
+                finishSend(account, epoch, base, messages, remote, connection, true, true);
             } catch (Exception error) {
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (!isAccountCurrent(accountEpoch)) return;
-                    pending.messageOwner.send_state = org.telegram.messenger.MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
-                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageSendError, pending.getId());
-                });
+                finishSend(account, epoch, base, messages, remote, connection, false, uncertain);
             }
+        });
+    }
+
+    /** 保留原收发分段计时，仅记录阶段与随机消息身份摘要，不记录正文或文件路径。 */
+    private static void traceSend(String phase, String localId, long started) {
+        if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge",
+                "send_phase=" + phase + " key=" + localId.hashCode()
+                        + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - started));
+    }
+
+    /** 回显可能先于发送回执到达；只更新仍归属于原负编号的待发气泡。 */
+    private static void finishSend(int account, long epoch, String base, ArrayList<MessageObject> messages,
+            String remote, DesktopConnection connection, boolean success, boolean uncertain) {
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!isAccountCurrent(epoch)) return;
+            boolean accepted = success && attachmentCurrent(epoch, messages.get(0).getDialogId(), remote, connection);
+            sendingBatches.remove(base);
+            for (MessageObject pending : messages) {
+                String localId = pending.messageOwner.params.get("codexLocalId");
+                if (pendingMessages.get(localId) != pending) continue;
+                if (uncertain) pending.messageOwner.params.put("codexSendUncertain", "true");
+                else pending.messageOwner.params.remove("codexSendUncertain");
+                pending.messageOwner.send_state = accepted ? MessageObject.MESSAGE_SEND_STATE_SENT : MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
+                if (isAttachmentMessage(pending)) {
+                    String key = attachmentKey(pending);
+                    AttachmentState previous = attachmentStates.get(key);
+                    attachmentStates.put(key, new AttachmentState(false, true, !accepted,
+                            previous == null ? 0 : previous.transferredBytes, previous == null ? 0 : previous.totalBytes));
+                }
+                if (accepted) NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByServer,
+                        pending.getId(), pending.getId(), pending.messageOwner, pending.getDialogId(), 0L, 0, false);
+                else NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageSendError, pending.getId());
+            }
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
         });
     }
 
@@ -637,6 +992,158 @@ public final class CodexRuntime {
         });
     }
 
+    /** 当前问题弹窗持有一次读取的来源，迟到结果不会进入另一个账号或页面。 */
+    public static final class QuestionReview {
+        public final ArrayList<DesktopQuestion> requests;
+        private final long epoch, generation, dialogId;
+        private final DesktopConnection connection;
+        private final String linked;
+        private final android.content.SharedPreferences issued;
+
+        /** 固定原题所属连接与页面，提交意图只保存无正文的身份。 */
+        private QuestionReview(long epoch, long generation, long dialogId, DesktopConnection connection,
+                String linked, ArrayList<DesktopQuestion> requests, android.content.SharedPreferences issued) {
+            this.epoch = epoch; this.generation = generation; this.dialogId = dialogId;
+            this.connection = connection; this.linked = linked; this.requests = requests; this.issued = issued;
+        }
+
+        /** 同账号、电脑、会话和题目修订共享一个提交标识。 */
+        private String key(DesktopQuestion request) {
+            return TranscriptStore.digest(connection.machineId + "\n" + linked + "\n" + request.identity());
+        }
+
+        /** 请求结果未知时不让重新打开弹窗触发重复提交。 */
+        public boolean alreadyIssued(DesktopQuestion request) { return issued.contains(key(request)); }
+
+        /** 连接变化后原页仍能收到结束提示，退出页面则忽略迟到结果。 */
+        private boolean pageCurrent() {
+            return isAccountCurrent(epoch) && generation == watchGeneration && dialogId == watchedDialog;
+        }
+
+        /** 用户回答只能交给显示原题时的同一连接。 */
+        private boolean current() { return pageCurrent() && dialogConnection(dialogId) == connection; }
+    }
+
+    /** 沿已有控制队列按需读题，不把题目或保密回答写入普通历史缓存。 */
+    public static void readQuestions(long dialogId, java.util.function.BiConsumer<QuestionReview, String> callback) {
+        final long epoch = accountGeneration, generation = watchGeneration;
+        if (!isAccountCurrent(epoch) || watchedDialog != dialogId) {
+            callback.accept(null, "当前会话已变化，请重新打开问题。"); return;
+        }
+        final String remote = remoteIds.get(dialogId);
+        final android.content.SharedPreferences issued = ApplicationLoader.applicationContext.getSharedPreferences(
+                "codex-question-" + TranscriptStore.digest(session.server + "\n" + session.accountId), 0);
+        approvalQueue.postRunnable(() -> {
+            QuestionReview review = null; String failure = null;
+            try {
+                if (!isAccountCurrent(epoch) || generation != watchGeneration || watchedDialog != dialogId) return;
+                DesktopConnection connection = dialogConnection(dialogId);
+                if (connection == null) throw new java.io.IOException();
+                String linked = linkedSessions.get(dialogId);
+                if (linked == null) {
+                    linked = connection.openConversation(remote).get("sessionId").getAsString();
+                    if (!isAccountCurrent(epoch) || generation != watchGeneration) return;
+                    linkedSessions.put(dialogId, linked);
+                }
+                review = new QuestionReview(epoch, generation, dialogId, connection, linked,
+                        connection.readQuestions(linked), issued);
+            } catch (Exception error) { failure = "暂时无法读取问题，请稍后重试。"; }
+            final QuestionReview loaded = review; final String message = failure;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (isAccountCurrent(epoch) && generation == watchGeneration && watchedDialog == dialogId)
+                    callback.accept(loaded, message);
+            });
+        });
+    }
+
+    /** 原题答案一次提交；明确拒绝可重新读题，未知保留意图与页面中的回答。 */
+    public static void answerQuestions(QuestionReview review, DesktopQuestion request,
+            java.util.Map<String, String> answers, java.util.function.BiConsumer<String, String> callback) {
+        final java.util.Map<String, String> submitted = new java.util.LinkedHashMap<>(answers);
+        approvalQueue.postRunnable(() -> {
+            String status = "rejected", message;
+            String operation = null;
+            try {
+                if (!review.current()) throw new IllegalStateException("电脑连接已变化，请重新查看问题。");
+                if (!review.requests.contains(request) || !request.canAnswer)
+                    throw new IllegalStateException("此问题已不能回答，请查看最新进展。");
+                if (review.alreadyIssued(request)) {
+                    status = "unknown"; message = "回答已提交，结果尚需核对，请查看最新进展。";
+                } else {
+                    operation = java.util.UUID.randomUUID().toString();
+                    request.action(review.connection.machineId, review.linked, operation, submitted);
+                    if (!review.issued.edit().putString(review.key(request), operation).commit())
+                        throw new java.io.IOException();
+                    // 写入期间发生切换时尚未外发，可以撤去本次意图；网络调用后的未知则保留。
+                    if (!review.current()) {
+                        review.issued.edit().remove(review.key(request)).commit();
+                        throw new IllegalStateException("电脑连接已变化，请重新查看问题。");
+                    }
+                    status = "unknown";
+                    JsonObject result = review.connection.answerQuestions(review.linked, request, operation, submitted);
+                    String outcome = result.get("status").getAsString();
+                    if ("rejected".equals(outcome)) {
+                        status = "rejected"; review.issued.edit().remove(review.key(request)).commit();
+                        message = "电脑未接受回答，问题可能已处理或更新。请重新查看；本次回答已保留。";
+                    } else if ("accepted".equals(outcome)) {
+                        status = "accepted"; message = "回答已收到。";
+                    } else if ("recorded".equals(outcome)) {
+                        status = "recorded"; message = "电脑已记录回答，请查看任务后续进展。";
+                    } else { message = "暂时无法确认回答结果，本次回答已保留，请查看最新进展。"; }
+                }
+            } catch (DesktopConnection.RpcNotDispatchedException error) {
+                // 只撤去本次且明确未外发的意图，其他提交身份与未知投递结果保持不变。
+                if (operation != null && operation.equals(review.issued.getString(review.key(request), null)))
+                    review.issued.edit().remove(review.key(request)).commit();
+                status = "rejected";
+                message = "电脑连接已中断，回答未发送；本次回答已保留，请连接恢复后重新查看。";
+            } catch (IllegalStateException error) { message = error.getMessage(); }
+            catch (Exception error) { message = "暂时无法确认回答结果，本次回答已保留，请稍后查看。"; }
+            final String outcome = status, notice = message;
+            AndroidUtilities.runOnUIThread(() -> { if (review.pageCurrent()) callback.accept(outcome, notice); });
+        });
+    }
+
+    /** 已加载的额度页先显示同账号、同电脑的原采集值；不将它标为实时余额。 */
+    public static AccountUsage cachedAccountUsage(String machineId) {
+        return loggedIn() && machineId != null ? accountUsageSnapshots.get(machineId) : null;
+    }
+
+    /** 只在打开或手动刷新额度时读取；沿现有队列执行，不增加轮询或阻塞消息发送。 */
+    public static void readAccountUsage(String machineId,
+            java.util.function.BiConsumer<AccountUsage, String> callback) {
+        final long epoch = accountGeneration;
+        if (!isAccountCurrent(epoch) || machineId == null || machineId.isEmpty()) {
+            callback.accept(null, "请先选择已连接的电脑。"); return;
+        }
+        approvalQueue.postRunnable(() -> {
+            AccountUsage result = null; String failure = null;
+            DesktopConnection connection = null;
+            try {
+                if (!isAccountCurrent(epoch)) return;
+                connection = openDesktop(machineId);
+                result = connection.readAccountUsage();
+                if (!isAccountCurrent(epoch)) return;
+                if (desktopConnections.get(machineId) != connection) {
+                    result = null; failure = "电脑连接已变化，请刷新额度。";
+                }
+            } catch (Exception error) { failure = "暂时无法读取该电脑的额度，请检查连接后刷新。"; }
+            final AccountUsage loaded = result; final String message = failure;
+            final DesktopConnection owner = connection;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!isAccountCurrent(epoch)) return;
+                if (owner != null && desktopConnections.get(machineId) != owner) {
+                    accountUsageSnapshots.remove(machineId);
+                    callback.accept(null, "电脑连接已变化，请刷新额度。"); return;
+                }
+                // 本次失败或来源不可读时清除主余额，不能把旧账号余额当作本次读取结果。
+                if (loaded != null) accountUsageSnapshots.put(machineId, loaded);
+                else accountUsageSnapshots.remove(machineId);
+                callback.accept(loaded, message);
+            });
+        });
+    }
+
     /** 原失败气泡的删除只清理手机待发记录，不操作桌面消息。 */
     public static boolean deletePendingMessages(int account, long dialogId, ArrayList<Integer> messageIds) {
         final long accountEpoch = accountGeneration;
@@ -651,7 +1158,13 @@ public final class CodexRuntime {
             if (!isAccountCurrent(accountEpoch)) return;
             try {
                 for (OutboxStore.Item item : outbox.list(remote)) {
-                    if (selected.contains(item.messageId)) outbox.remove(item.localId);
+                    int count = Math.max(1, item.attachmentCount());
+                    boolean remove = false;
+                    for (int i = 0; i < count; i++) if (selected.contains(item.messageId - i)) remove = true;
+                    if (remove) {
+                        outbox.remove(item.localId);
+                        for (int i = 0; i < count; i++) if (!selected.contains(item.messageId - i)) selected.add(item.messageId - i);
+                    }
                 }
                 AndroidUtilities.runOnUIThread(() -> {
                     if (!isAccountCurrent(accountEpoch)) return;
@@ -746,7 +1259,7 @@ public final class CodexRuntime {
                                                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByServer,
                                                             pending.getId(), message.id, message, dialogId, 0L, 0, false);
                                                 } else {
-                                                    incoming.add(new org.telegram.messenger.MessageObject(account, message, true, false));
+                                                    incoming.add(historyObject(account, message));
                                                 }
                                             }
                                             if (!incoming.isEmpty()) NotificationCenter.getInstance(account).postNotificationName(
@@ -942,7 +1455,20 @@ public final class CodexRuntime {
         message.from_id.user_id = message.out ? 0 : dialogId;
         message.flags |= 256;
         message.media = new TLRPC.TL_messageMediaEmpty();
+        message.params = new HashMap<>();
+        if (row.message.localId != null) message.params.put("codexLocalId", row.message.localId);
+        if (!row.message.attachments.isEmpty()) {
+            DesktopAttachment value = row.message.attachments.get(0);
+            AttachmentMessages.apply(message, value, cachedAttachment(attachmentDirectory(dialogId), row.message.localId, value));
+        }
         return message;
+    }
+
+    /** 恢复已下载附件的原消息就绪位，不让原版再根据虚拟媒体编号查找 Telegram 缓存。 */
+    private static MessageObject historyObject(int account, TLRPC.TL_message message) {
+        MessageObject object = new MessageObject(account, message, true, false);
+        if (isAttachmentMessage(object)) object.attachPathExists = object.mediaExists = attachmentFile(object) != null;
+        return object;
     }
 
     /** 待发消息始终写入对话所属电脑目录。 */
@@ -951,30 +1477,41 @@ public final class CodexRuntime {
                 session.server, session.accountId, dialogMachine(dialogId));
     }
 
-    private static org.telegram.messenger.MessageObject restoredPending(int account, long dialogId, OutboxStore.Item item) {
-        org.telegram.messenger.MessageObject existing = pendingMessages.get(item.localId);
-        if (existing != null) return existing;
+    /** 恢复同一批次的独立原气泡；已回显的成员不重复展示，也不自动重发。 */
+    private static ArrayList<MessageObject> restoredPending(int account, long dialogId, OutboxStore.Item item,
+            java.util.Set<String> echoed) {
+        ArrayList<MessageObject> restored = new ArrayList<>();
+        int count = Math.max(1, item.attachmentCount());
         org.telegram.messenger.UserConfig config = org.telegram.messenger.UserConfig.getInstance(account);
-        config.lastSendMessageId = Math.min(config.lastSendMessageId, item.messageId - 1);
+        config.lastSendMessageId = Math.min(config.lastSendMessageId, item.messageId - count);
         config.saveConfig(false);
-        TLRPC.TL_message message = new TLRPC.TL_message();
-        message.local_id = message.id = item.messageId;
-        message.dialog_id = dialogId;
-        message.date = item.date;
-        message.message = item.text;
-        message.out = true;
-        message.peer_id = new TLRPC.TL_peerUser();
-        message.peer_id.user_id = dialogId;
-        message.from_id = new TLRPC.TL_peerUser();
-        message.flags |= 256;
-        message.media = new TLRPC.TL_messageMediaEmpty();
-        message.params = new HashMap<>();
-        message.params.put("codexLocalId", item.localId);
-        // 未取得回显不能声明已送达，也不能在恢复进程时自动执行指令。
-        message.send_state = org.telegram.messenger.MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
-        org.telegram.messenger.MessageObject result = new org.telegram.messenger.MessageObject(account, message, true, false);
-        pendingMessages.put(item.localId, result);
-        return result;
+        for (int i = 0; i < count; i++) {
+            String localId = TranscriptText.attachmentIdentity(item.localId, i);
+            if (echoed.contains(localId)) continue;
+            MessageObject existing = pendingMessages.get(localId);
+            if (existing != null) { restored.add(existing); continue; }
+            TLRPC.TL_message message = pendingMessage(dialogId, item.messageId - i, item.date,
+                    i == 0 ? item.text : "", item.localId, i);
+            if (i < item.attachments.size()) AttachmentMessages.applyPending(message, item.attachments.get(i));
+            else if (i < item.selections.size()) AttachmentMessages.applySelected(message, item.selections.get(i));
+            if (item.submissionUncertain) message.params.put("codexSendUncertain", "true");
+            // 未取得回显不能声明已送达，也不能在恢复进程时自动执行指令。
+            message.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
+            MessageObject result = new MessageObject(account, message, true, false);
+            result.attachPathExists = result.mediaExists = attachmentFile(result) != null;
+            pendingMessages.put(localId, result);
+            restored.add(result);
+        }
+        return restored;
+    }
+
+    /** 多附件只有全部原身份已写入历史后才可删除唯一待发记录。 */
+    private static boolean batchEchoed(OutboxStore.Item item, java.util.Set<String> echoed) {
+        if (!item.isPrepared()) return false;
+        for (int i = 0; i < Math.max(1, item.attachmentCount()); i++) {
+            if (!echoed.contains(TranscriptText.attachmentIdentity(item.localId, i))) return false;
+        }
+        return true;
     }
 
     /** 历史目录按对话归属定位，切换列表来源不改变原缓存位置。 */
@@ -1001,7 +1538,7 @@ public final class CodexRuntime {
                 for (TranscriptWindow.Entry row : history.before(0, Integer.MAX_VALUE)) {
                     if (row.message.localId != null && row.message.outgoing) echoed.add(row.message.localId);
                 }
-                for (OutboxStore.Item item : queued) if (echoed.contains(item.localId)) outbox.remove(item.localId);
+                for (OutboxStore.Item item : queued) if (batchEchoed(item, echoed)) outbox.remove(item.localId);
             }
         }
         catch (java.io.IOException error) {
@@ -1072,14 +1609,14 @@ public final class CodexRuntime {
                     for (TranscriptWindow.Entry row : history.before(0, Integer.MAX_VALUE)) {
                         if (row.message.localId != null && row.message.outgoing) echoed.add(row.message.localId);
                     }
-                    restored.removeIf(item -> echoed.contains(item.localId));
+                    restored.removeIf(item -> batchEchoed(item, echoed));
                     AndroidUtilities.runOnUIThread(() -> {
                         if (!isAccountCurrent(accountEpoch)) return;
                         ArrayList<org.telegram.messenger.MessageObject> objects = new ArrayList<>();
                         for (int i = 0; i < Math.min(count, rows.size()); i++) {
                             TranscriptWindow.Entry row = rows.get(i);
                             TLRPC.TL_message message = historyMessage(dialogId, row);
-                            objects.add(new org.telegram.messenger.MessageObject(account, message, true, false));
+                            objects.add(historyObject(account, message));
                         }
                         if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge", "history type=" + loadType + " max=" + maxId + " count=" + objects.size());
                         // 原页以数量不足判断结束；只有来源明确完整时才允许进入结束分支。
@@ -1089,7 +1626,7 @@ public final class CodexRuntime {
                                 loadType, end, classGuid, loadIndex, loadedAnchor, 0, mode);
                         if (!restored.isEmpty()) {
                             ArrayList<org.telegram.messenger.MessageObject> pending = new ArrayList<>();
-                            for (OutboxStore.Item item : restored) pending.add(restoredPending(account, dialogId, item));
+                            for (OutboxStore.Item item : restored) pending.addAll(restoredPending(account, dialogId, item, echoed));
                             NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages,
                                     dialogId, pending, false, 0);
                         }

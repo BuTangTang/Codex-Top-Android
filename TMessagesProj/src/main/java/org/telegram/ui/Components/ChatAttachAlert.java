@@ -6019,6 +6019,7 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
         emojiViewDelegate = delegate;
     }
 
+    /** 复用原版选择器；电脑对话只开放图片与文件，不展示尚未接入的媒体类型。 */
     public void init() {
         writeButton.setEffect(effectId = 0);
         botButtonWasVisible = false;
@@ -6071,6 +6072,11 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
 
         if (!(baseFragment instanceof ChatActivity && avatarPicker != 2)) {
             commentTextView.setVisibility(allowEnterCaption ? View.VISIBLE : View.INVISIBLE);
+        }
+        if (com.butang.codextop.CodexRuntime.ownsConversation(getDialogId())) {
+            photosEnabled = documentsEnabled = true;
+            videosEnabled = musicEnabled = pollsEnabled = todoEnabled = false;
+            allowLivePhotos = false;
         }
         photoLayout.onInit(videosEnabled, photosEnabled, documentsEnabled);
         commentTextView.hidePopup(true);
@@ -6643,15 +6649,18 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
             return false;
         }
 
+        /** 电脑附件入口不混入 Telegram 内联机器人。 */
         @Override
         public int getItemCount() {
             int count = buttonsCount;
-            if (editingMessageObject == null && baseFragment instanceof ChatActivity && !isPollAttach) {
+            if (editingMessageObject == null && baseFragment instanceof ChatActivity && !isPollAttach
+                    && !com.butang.codextop.CodexRuntime.ownsConversation(getDialogId())) {
                 count += MediaDataController.getInstance(currentAccount).inlineBots.size();
             }
             return count;
         }
 
+        /** 电脑会话保留原图库和文件按钮，其余会话沿原版入口集合。 */
         @Override
         public void notifyDataSetChanged() {
             buttonsCount = 0;
@@ -6670,7 +6679,10 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
             attachBotsStartRow = -1;
             attachBotsEndRow = -1;
 
-            if (isPollAttach) {
+            if (com.butang.codextop.CodexRuntime.ownsConversation(getDialogId())) {
+                galleryButton = buttonsCount++;
+                documentButton = buttonsCount++;
+            } else if (isPollAttach) {
                 galleryButton = buttonsCount++;
                 if (pollAllowedLayouts == 0 || BitwiseUtils.hasFlag(pollAllowedLayouts, 1 << LAYOUT_TYPE_DOCUMENTS)) {
                     documentButton = buttonsCount++;
