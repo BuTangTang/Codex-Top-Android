@@ -340,7 +340,7 @@ public final class DesktopConnection implements AutoCloseable {
         private SendRejectedException(String reason) { super("电脑暂未接受此消息"); this.reason = reason; }
     }
 
-    /** 对现有机器 RPC 做一次认证加密调用；超时不自动重发，避免未来发送重复消息。 */
+    /** 沿原认证加密RPC调用一次；合法bulk拒绝交专用传输处理，超时不自动重发。 */
     private JsonObject rpc(String method, JsonObject params) throws Exception {
         if (closed || !socket.connected()) throw new RpcNotDispatchedException();
         JSONObject call = new JSONObject();
@@ -370,10 +370,17 @@ public final class DesktopConnection implements AutoCloseable {
                 if (!envelope.optBoolean("ok")) throw new IOException("电脑暂时无法响应，请稍后重试");
                 JsonObject response = JsonParser.parseString(crypto.decrypt(envelope.getString("result"))).getAsJsonObject();
                 // 原bulk handler返回success，其余机器会话handler返回ok，不能改变传输既有封套。
-                String success = method.startsWith("daemon.bulkTransfer.") ? "success" : "ok";
-                if (!response.has(success) || !response.get(success).isJsonPrimitive()
-                        || !response.get(success).getAsJsonPrimitive().isBoolean()
-                        || !response.get(success).getAsBoolean()) {
+                boolean bulk = method.startsWith("daemon.bulkTransfer.");
+                String success = bulk ? "success" : "ok";
+                boolean validSuccess = response.has(success) && response.get(success).isJsonPrimitive()
+                        && response.get(success).getAsJsonPrimitive().isBoolean();
+                if (!validSuccess || !response.get(success).getAsBoolean()) {
+                    // 只交回既有失败封套，通用RPC不拼接或抛出服务器错误正文。
+                    if (bulk && validSuccess && response.has("error") && response.get("error").isJsonPrimitive()
+                            && response.get("error").getAsJsonPrimitive().isString()) {
+                        result.complete(response);
+                        return;
+                    }
                     if ("daemon.directSessions.send".equals(method) && response.has("errorCode")
                             && response.get("errorCode").isJsonPrimitive()
                             && response.get("errorCode").getAsJsonPrimitive().isString()) {
