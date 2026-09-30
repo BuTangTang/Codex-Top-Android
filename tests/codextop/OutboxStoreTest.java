@@ -109,7 +109,65 @@ public final class OutboxStoreTest {
        throw new AssertionError("缺失原路径的选择消失或伪造路径");
    try{new OutboxStore.Selection("content://synthetic/file","file","file",null);throw new AssertionError("持久化内容URI");}
    catch(IllegalArgumentException expected){}
-   System.out.println("OutboxStore: 重启恢复、编号幂等、选择与暂存prefix恢复、原件冲突拒绝、未知派发保持、账号电脑对话隔离通过");
+   failureCodes(root);
+   System.out.println("OutboxStore: 重启恢复、编号幂等、选择与暂存prefix恢复、固定失败原因兼容、原子写失败、未知派发保持、账号电脑对话隔离通过");
   } finally {try(var paths=Files.walk(root)){for(var path:paths.sorted(java.util.Comparator.reverseOrder()).toArray(java.nio.file.Path[]::new))Files.delete(path);}}
+ }
+ /** 固定解释与原记录同存；旧值或坏值不能损坏批次，也不能参与发送身份比较。 */
+ private static void failureCodes(java.nio.file.Path root) throws Exception {
+  var store=new OutboxStore(root.toFile(),"failure-server","account","machine");
+  var reopened=new OutboxStore(root.toFile(),"failure-server","account","machine");
+  var path=root.resolve("failure.bin");Files.write(path,new byte[]{1,2,3});
+  var choice=new OutboxStore.Selection(path.toString(),"failure.bin","file",null);
+  var item=OutboxStore.Item.selected("failure-batch","thread","原说明",-70,1100,java.util.List.of(choice));
+  store.put(item);
+  if(reopened.get(item.localId).failureCode!=null)throw new AssertionError("旧v1缺失原因错误恢复");
+  store.markFailureCode(item.localId,OutboxStore.FAILURE_FILE_TOO_LARGE);
+  store.put(item);
+  var pending=AttachmentFiles.stage(path.toFile(),choice.name,choice.kind,choice.mimeType,root.resolve("failure-staged").toFile(),"failure-batch");
+  store.rememberStaged(item.localId,java.util.List.of(pending));
+  var uploaded=pending.uploaded("/synthetic/failure.bin",pending.sizeBytes,pending.sha256);
+  store.rememberUploaded(item.localId,java.util.List.of(uploaded));
+  var saved=reopened.get(item.localId);
+  if(!OutboxStore.FAILURE_FILE_TOO_LARGE.equals(saved.failureCode)||saved.uploaded.size()!=1||!saved.attachments.equals(java.util.List.of(pending))
+     ||!saved.selections.equals(item.selections)||!saved.text.equals(item.text)||saved.messageId!=item.messageId||saved.date!=item.date)
+      throw new AssertionError("原mutator或旧构造丢原因或改变原身份");
+  if(reopened.list("thread").size()!=1||!OutboxStore.FAILURE_FILE_TOO_LARGE.equals(reopened.list("thread").get(0).failureCode))
+      throw new AssertionError("固定原因不能通过原列表恢复");
+  for(var isolated:new OutboxStore[]{new OutboxStore(root.toFile(),"failure-other-server","account","machine"),
+      new OutboxStore(root.toFile(),"failure-server","other-account","machine"),new OutboxStore(root.toFile(),"failure-server","account","other-machine")})
+      if(isolated.get(item.localId)!=null)throw new AssertionError("失败原因跨账号电脑服务串用");
+  if(!store.list("other-thread").isEmpty())throw new AssertionError("失败原因跨对话串用");
+  try{store.markFailureCode(item.localId,"arbitrary server text");throw new AssertionError("任意原因可持久化");}
+  catch(IllegalArgumentException expected){}
+  if(!OutboxStore.FAILURE_FILE_TOO_LARGE.equals(reopened.get(item.localId).failureCode))throw new AssertionError("拒绝未知原因损坏原记录");
+  var fileMethod=OutboxStore.class.getDeclaredMethod("file",String.class);fileMethod.setAccessible(true);
+  var record=((java.io.File)fileMethod.invoke(store,item.localId)).toPath();
+  var raw=com.google.gson.JsonParser.parseString(Files.readString(record)).getAsJsonObject();
+  for(String malformed:new String[]{"null","{}","[]","42","true","\"unknown_code\""}){
+   var value=raw.deepCopy();value.add("failureCode",com.google.gson.JsonParser.parseString(malformed));Files.writeString(record,value.toString());
+   var restored=reopened.get(item.localId);
+   if(restored.failureCode!=null||!restored.selections.equals(item.selections)||restored.attachments.size()!=1||restored.uploaded.size()!=1)
+       throw new AssertionError("畸形可选原因损坏原批次");
+  }
+  Files.writeString(record,raw.toString());store.markSubmissionUncertain(item.localId,true);
+  store.markFailureCode(item.localId,OutboxStore.FAILURE_FILE_TOO_LARGE);store.rememberStaged(item.localId,java.util.List.of(pending));
+  store.rememberUploaded(item.localId,java.util.List.of(uploaded));
+  if(!reopened.get(item.localId).submissionUncertain||reopened.get(item.localId).failureCode!=null)throw new AssertionError("未知结果保留旧原因");
+  var uncertain=com.google.gson.JsonParser.parseString(Files.readString(record)).getAsJsonObject();
+  uncertain.addProperty("failureCode",OutboxStore.FAILURE_FILE_TOO_LARGE);Files.writeString(record,uncertain.toString());
+  if(reopened.get(item.localId).failureCode!=null)throw new AssertionError("旧记录矛盾字段误标未知结果");
+  store.markSubmissionUncertain(item.localId,false);
+  if(reopened.get(item.localId).failureCode!=null)throw new AssertionError("恢复可发送状态复活旧原因");
+  store.markFailureCode(item.localId,OutboxStore.FAILURE_FILE_TOO_LARGE);
+  var blocked=java.nio.file.Path.of(record+".tmp");Files.createDirectories(blocked);Files.write(blocked.resolve("block"),new byte[]{1});
+  try{store.markFailureCode(item.localId,null);throw new AssertionError("真实原子写阻挡未失败");}catch(java.io.IOException expected){}
+  if(!OutboxStore.FAILURE_FILE_TOO_LARGE.equals(reopened.get(item.localId).failureCode)||reopened.get(item.localId).uploaded.size()!=1)
+      throw new AssertionError("清原因写失败损坏有效原记录");
+  Files.delete(blocked.resolve("block"));Files.delete(blocked);store.markFailureCode(item.localId,null);
+  if(reopened.get(item.localId).failureCode!=null)throw new AssertionError("重试清除未持久化");
+  store.remove(item.localId);
+  try{store.markFailureCode(item.localId,OutboxStore.FAILURE_FILE_TOO_LARGE);throw new AssertionError("原因写入复活已删除记录");}catch(java.io.IOException expected){}
+  if(Files.exists(record)||!Files.exists(path))throw new AssertionError("解释字段复活记录或误删文件");
  }
 }

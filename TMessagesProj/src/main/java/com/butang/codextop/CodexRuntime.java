@@ -756,6 +756,7 @@ public final class CodexRuntime {
         sendingBatches.add(base);
         for (MessageObject pending : messages) {
             pending.messageOwner.send_state = MessageObject.MESSAGE_SEND_STATE_SENDING;
+            pending.messageOwner.params.remove("codexSendFailure");
             pendingMessages.put(pending.messageOwner.params.get("codexLocalId"), pending);
         }
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
@@ -766,6 +767,7 @@ public final class CodexRuntime {
         sendQueue.postRunnable(() -> {
             DesktopConnection connection = null;
             boolean uncertain = false;
+            String failureCode = null;
             try {
                 traceSend("queue", base, sendStarted);
                 OutboxStore.Item stored = outbox.get(base);
@@ -791,7 +793,9 @@ public final class CodexRuntime {
                 traceSend("persisted", base, sendStarted);
                 if (!isAccountCurrent(epoch)) return;
                 // 原请求可能已派发；即使用户点击重试也等待回显，不重复进入桌面发送。
-                if (stored.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true); return; }
+                if (stored.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true, null); return; }
+                // 清除旧解释必须先落盘；失败时停止本次远端工作，不能留下新失败的旧原因。
+                if (stored.failureCode != null) outbox.markFailureCode(base, null);
                 ArrayList<DesktopAttachment.Pending> staged = new ArrayList<>(stored.attachments);
                 for (int i = staged.size(); i < stored.selections.size(); i++) {
                     if (!isAccountCurrent(epoch)) return;
@@ -829,9 +833,16 @@ public final class CodexRuntime {
                     final DesktopAttachment.Pending original = stored.attachments.get(i);
                     final String localId = TranscriptText.attachmentIdentity(base, i);
                     final String key = epoch + ":" + dialogId + ":" + localId;
-                    AttachmentTransfer.Result result = transfer(epoch, dialogId, remote, transferConnection,
-                            (done, total) -> attachmentProgress(account, epoch, dialogId, remote, transferConnection, key, true, done, total))
-                            .upload(new File(original.localPath), original.kind, localId, cwd);
+                    AttachmentTransfer.Result result;
+                    try {
+                        result = transfer(epoch, dialogId, remote, transferConnection,
+                                (done, total) -> attachmentProgress(account, epoch, dialogId, remote, transferConnection, key, true, done, total))
+                                .upload(new File(original.localPath), original.kind, localId, cwd);
+                    } catch (IOException uploadFailure) {
+                        // 只有本次上传的明确拒绝可标大小，其他阶段错误继续原失败语义。
+                        failureCode = attachmentUploadFailureCode(uploadFailure);
+                        throw uploadFailure;
+                    }
                     uploaded.add(original.uploaded(result.path, result.sizeBytes, result.sha256));
                     outbox.rememberUploaded(base, uploaded);
                     AndroidUtilities.runOnUIThread(() -> {
@@ -849,11 +860,22 @@ public final class CodexRuntime {
                     throw notAccepted;
                 }
                 traceSend("ack", base, sendStarted);
-                finishSend(account, epoch, base, messages, remote, connection, true, true);
+                finishSend(account, epoch, base, messages, remote, connection, true, true, null);
             } catch (Exception error) {
-                finishSend(account, epoch, base, messages, remote, connection, false, uncertain);
+                if (failureCode != null && !uncertain && isAccountCurrent(epoch)) {
+                    try { outbox.markFailureCode(base, failureCode); }
+                    catch (IOException ignored) { /* 保留原待发记录；当前气泡仍可解释，重开只认已落盘事实。 */ }
+                }
+                finishSend(account, epoch, base, messages, remote, connection, false, uncertain, failureCode);
             }
         });
+    }
+
+    /** 仅匹配上传层已确认的两条大小拒绝，不递归原因或持久化任意服务器正文。 */
+    private static String attachmentUploadFailureCode(IOException error) {
+        return "File exceeds upload size limit".equals(error.getMessage())
+                || "File exceeds the server-routed transfer size limit".equals(error.getMessage())
+                ? OutboxStore.FAILURE_FILE_TOO_LARGE : null;
     }
 
     /** 保留原收发分段计时，仅记录阶段与随机消息身份摘要，不记录正文或文件路径。 */
@@ -863,9 +885,9 @@ public final class CodexRuntime {
                         + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - started));
     }
 
-    /** 回显可能先于发送回执到达；只更新仍归属于原负编号的待发气泡。 */
+    /** 只更新仍归属于原负编号的待发气泡；成功或结果未知均抑制此前的失败解释。 */
     private static void finishSend(int account, long epoch, String base, ArrayList<MessageObject> messages,
-            String remote, DesktopConnection connection, boolean success, boolean uncertain) {
+            String remote, DesktopConnection connection, boolean success, boolean uncertain, String failureCode) {
         AndroidUtilities.runOnUIThread(() -> {
             if (!isAccountCurrent(epoch)) return;
             boolean accepted = success && attachmentCurrent(epoch, messages.get(0).getDialogId(), remote, connection);
@@ -873,6 +895,9 @@ public final class CodexRuntime {
             for (MessageObject pending : messages) {
                 String localId = pending.messageOwner.params.get("codexLocalId");
                 if (pendingMessages.get(localId) != pending) continue;
+                if (!success && !uncertain && OutboxStore.FAILURE_FILE_TOO_LARGE.equals(failureCode))
+                    pending.messageOwner.params.put("codexSendFailure", OutboxStore.FAILURE_FILE_TOO_LARGE);
+                else pending.messageOwner.params.remove("codexSendFailure");
                 if (uncertain) pending.messageOwner.params.put("codexSendUncertain", "true");
                 else pending.messageOwner.params.remove("codexSendUncertain");
                 pending.messageOwner.send_state = accepted ? MessageObject.MESSAGE_SEND_STATE_SENT : MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
@@ -1508,6 +1533,8 @@ public final class CodexRuntime {
             if (i < item.attachments.size()) AttachmentMessages.applyPending(message, item.attachments.get(i));
             else if (i < item.selections.size()) AttachmentMessages.applySelected(message, item.selections.get(i));
             if (item.submissionUncertain) message.params.put("codexSendUncertain", "true");
+            if (!item.submissionUncertain && OutboxStore.FAILURE_FILE_TOO_LARGE.equals(item.failureCode))
+                message.params.put("codexSendFailure", OutboxStore.FAILURE_FILE_TOO_LARGE);
             // 未取得回显不能声明已送达，也不能在恢复进程时自动执行指令。
             message.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
             MessageObject result = new MessageObject(account, message, true, false);

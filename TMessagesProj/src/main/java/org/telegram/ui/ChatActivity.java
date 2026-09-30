@@ -32607,12 +32607,20 @@ public class ChatActivity extends BaseFragment implements
                     scrimPopupContainerLayout.applyViewBottom(fl);
                 }
 
-                if (message.isSendError() && message.messageOwner != null && message.messageOwner.errorNewPriceStars > 0) {
+                // 仅在原失败菜单说明明确的附件超限；投递结果未知时不推断失败原因。
+                final boolean codexAttachmentTooLarge = message.messageOwner != null
+                    && message.messageOwner.params != null
+                    && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)
+                    && com.butang.codextop.OutboxStore.FAILURE_FILE_TOO_LARGE.equals(message.messageOwner.params.get("codexSendFailure"))
+                    && !"true".equals(message.messageOwner.params.get("codexSendUncertain"));
+                if (message.messageOwner != null && message.isSendError() && (codexAttachmentTooLarge || message.messageOwner.errorNewPriceStars > 0)) {
                     popupLayout.measure(View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED), View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
                     TextView tv = new TextView(contentView.getContext());
                     tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
                     tv.setTextColor(getThemedColor(Theme.key_actionBarDefaultSubmenuItem));
-                    CharSequence text = TextUtils.concat(
+                    CharSequence text = codexAttachmentTooLarge
+                        ? "本次发送中有附件超过当前传输大小限制，请改用较小文件"
+                        : TextUtils.concat(
                         StarsIntroActivity.replaceStars(LocaleController.formatPluralString("PaidMessagesSendErrorState1", (int) message.messageOwner.errorAllowedPriceStars)),
                         " ",
                         StarsIntroActivity.replaceStars(LocaleController.formatPluralString("PaidMessagesSendErrorState2", (int) message.messageOwner.errorNewPriceStars))

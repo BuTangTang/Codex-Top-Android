@@ -1,0 +1,223 @@
+package com.butang.codextop;
+
+import com.github.javaparser.ParserConfiguration;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Set;
+import javax.tools.ToolProvider;
+
+/** 提取真实发送、失败与恢复方法，使用真实Outbox和附件传输，仅替代Android及远端边界。 */
+public final class RuntimeSendFailureTest {
+    /** 所有消息、文件、账号和RPC均为合成样例；调用方提供现成Gson、JavaParser及NaCl依赖。 */
+    public static void main(String[] args) throws Exception {
+        Path source = Path.of("TMessagesProj/src/main/java/com/butang/codextop");
+        StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
+        var unit = StaticJavaParser.parse(source.resolve("CodexRuntime.java"));
+        var names = Set.of("sendBatch", "finishSend", "restoredPending", "pendingMessage", "canRetryMessage",
+                "isAccountCurrent", "attachmentCurrent", "transfer", "isAttachmentMessage", "attachmentUploadFailureCode");
+        StringBuilder methods = new StringBuilder();
+        int extracted = 0;
+        for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
+            if (names.contains(method.getNameAsString())) { methods.append(method).append('\n'); extracted++; }
+        }
+        for (ClassOrInterfaceDeclaration type : unit.findAll(ClassOrInterfaceDeclaration.class)) {
+            if (type.getNameAsString().equals("AttachmentState")) methods.append(type).append('\n');
+        }
+        if (extracted < 9) throw new AssertionError("真实发送入口发生变化，请核对夹具边界");
+        Path temporary = Files.createTempDirectory("codex-send-failure");
+        try {
+            Path probe = temporary.resolve("RuntimeSendFailureProbe.java");
+            Files.writeString(probe, FIXTURE + methods + SCENARIOS + "\n}");
+            var compile = new ArrayList<String>();
+            compile.addAll(java.util.List.of("-cp", System.getProperty("java.class.path"), "-d", temporary.toString(), probe.toString()));
+            for (String model : new String[]{"DesktopAttachment", "TranscriptText", "TranscriptStore", "AttachmentFiles",
+                    "OutboxStore", "BulkTransferCrypto", "AttachmentTransfer", "TranscriptWindow"})
+                compile.add(source.resolve(model + ".java").toString());
+            String[] stubs = {
+                "package org.telegram.messenger; public class UserConfig {public int lastSendMessageId=-1; private static final UserConfig INSTANCE=new UserConfig(); /** 只返回合成账号。 */ public static UserConfig getInstance(int a){return INSTANCE;} /** 分配合成负编号。 */ public int getNewMessageId(){return --lastSendMessageId;} /** 不写真实账号。 */ public void saveConfig(boolean b){} }",
+                "package org.telegram.messenger; public class MediaDataController {/** 只返回平台替身。 */ public static MediaDataController getInstance(int a){return new MediaDataController();} /** 不接触真实草稿。 */ public void cleanDraft(long d,int m,boolean b){} }",
+                "package org.telegram.messenger; public class FileLoader {/** 读取合成文件名。 */ public static String getDocumentFileName(com.butang.codextop.RuntimeSendFailureProbe.Doc d){return d.name;} }",
+                "package android.os; public class SystemClock {/** 使用本机单调时钟替代Android计时。 */ public static long elapsedRealtime(){return System.nanoTime()/1000000;} }"
+            };
+            String[] files = {"UserConfig", "MediaDataController", "FileLoader", "SystemClock"};
+            for (int i = 0; i < files.length; i++) {
+                Path file = temporary.resolve(files[i] + ".java"); Files.writeString(file, stubs[i]); compile.add(file.toString());
+            }
+            if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(String[]::new)) != 0)
+                throw new AssertionError("真实发送夹具编译失败");
+            try (var loader = new URLClassLoader(new java.net.URL[]{temporary.toUri().toURL()}, RuntimeSendFailureTest.class.getClassLoader())) {
+                try { loader.loadClass("com.butang.codextop.RuntimeSendFailureProbe").getMethod("main", String[].class)
+                        .invoke(null, (Object) new String[]{temporary.toString()}); }
+                catch (java.lang.reflect.InvocationTargetException error) { throw new AssertionError("真实发送失败回归失败", error.getCause()); }
+            }
+        } finally {
+            try (var paths = Files.walk(temporary)) {
+                for (Path path : paths.sorted(Comparator.reverseOrder()).toArray(Path[]::new)) Files.delete(path);
+            }
+        }
+    }
+
+    // 夹具只提供平台模型、队列及合成远端；发送与落盘算法来自当前生产代码。
+    private static final String FIXTURE = """
+        package com.butang.codextop;
+        import com.google.gson.*;import java.io.*;import java.nio.file.*;import java.util.*;
+        public final class RuntimeSendFailureProbe {
+            static final class Queue {
+                final ArrayDeque<Runnable> tasks=new ArrayDeque<>();
+                /** 保留异步顺序以插入晚回执与账号切换。 */
+                void postRunnable(Runnable r){tasks.add(r);}
+                /** 执行已排队的本地回调，不使用真实主线程。 */
+                void all(){while(!tasks.isEmpty())tasks.remove().run();}
+            }
+            static final Queue sendQueue=new Queue(),ui=new Queue();static Runnable onUiEnqueue;
+            static final class AndroidUtilities {/** 只排入合成界面队列，可在原异步边界注入写失败。 */static void runOnUIThread(Runnable r){if(onUiEnqueue!=null)onUiEnqueue.run();ui.postRunnable(r);}}
+            static final class NotificationCenter {
+                static final int didReceiveNewMessages=1,updateInterfaces=2,messageReceivedByServer=3,messageSendError=4;
+                static int notices;
+                /** 合成通知不接触真实账号或界面。 */static NotificationCenter getInstance(int a){return new NotificationCenter();}
+                /** 只记录可观察的通知次数。 */void postNotificationName(int event,Object...args){notices++;}
+            }
+            static final class MessagesController {static final int UPDATE_MASK_SEND_STATE=1;}
+            static final class TLRPC {
+                static class TL_peerUser {long user_id;}
+                static class TL_messageMediaEmpty {}
+                static class TL_message {int id,local_id,date,flags,send_state;long dialog_id;String message;boolean out,unread;TL_peerUser peer_id,from_id;Object media;HashMap<String,String> params;}
+            }
+            static final class MessageObject {
+                static final int MESSAGE_SEND_STATE_SENDING=1,MESSAGE_SEND_STATE_SENT=0,MESSAGE_SEND_STATE_SEND_ERROR=2;
+                final TLRPC.TL_message messageOwner;boolean wasJustSent,attachPathExists,mediaExists;
+                /** 保留同一原消息对象以验证晚回执身份守卫。 */MessageObject(int a,TLRPC.TL_message m,boolean x,boolean y){messageOwner=m;}
+                /** 返回合成原消息编号。 */int getId(){return messageOwner.id;}
+                /** 返回合成原对话编号。 */long getDialogId(){return messageOwner.dialog_id;}
+                /** 不处理真实图片，仅满足平台边界。 */void generateThumbs(boolean b){}
+            }
+            public static final class Doc {public String name,mime_type;}
+            static final class SendMessageParams {long peer=1;String path,caption,message;Object photo;Doc document;MessageObject retryMessageObject,replyToTopMsg;}
+            static final class AttachmentMessages {
+                /** 平台投影只保留真实Pending描述，不改变失败判断。 */static void applyPending(TLRPC.TL_message m,DesktopAttachment.Pending p){m.params.put("codexPendingFile",p.toJson().toString());}
+                /** 合成原选择保留附件标识。 */static void applySelected(TLRPC.TL_message m,File f,String n,String k){m.params.put("codexSelectedFile",f==null?"":f.getPath());}
+                /** 恢复原选择仅设置附件标识。 */static void applySelected(TLRPC.TL_message m,OutboxStore.Selection s){m.params.put("codexSelectedFile",s.localPath==null?"":s.localPath);}
+            }
+            static final class DesktopConnection {
+                int initCalls,sendCalls;int rejectAt=1;String error="File exceeds upload size limit",failStage;
+                String activeName,publicKey;Runnable onReject,onSend;
+                /** 合成原会话关联，允许验证同字错误不能误标上传失败。 */JsonObject openConversation(String remote)throws IOException{
+                    if("open".equals(failStage))throw new IOException(error);JsonObject r=new JsonObject();r.addProperty("sessionId","synthetic-linked");return r;
+                }
+                /** 合成远端只提供既有bulk响应，实际AttachmentTransfer负责上传与拒绝。 */JsonObject transfer(String method,JsonObject p)throws Exception{
+                    JsonObject r=new JsonObject();r.addProperty("success",true);
+                    if(method.endsWith("upload.init")){
+                        initCalls++;activeName=p.get("fileName").getAsString();
+                        if("upload".equals(failStage)&&initCalls==rejectAt){if(onReject!=null)onReject.run();r.addProperty("success",false);r.addProperty("error",error);return r;}
+                        r.addProperty("uploadId","synthetic-upload-"+initCalls);r.addProperty("chunkSizeBytes",65536);r.addProperty("recipientPublicKeyBase64",publicKey);
+                    }else if(method.endsWith("upload.finalize")){
+                        byte[] bytes=Files.readAllBytes(files.get(activeName));r.addProperty("path","/synthetic/uploaded/"+activeName);r.addProperty("sizeBytes",bytes.length);
+                        r.addProperty("sha256",HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes)));
+                    }
+                    return r;
+                }
+                /** 本次桌面提交只计次数，未知与明确拒绝保持原异常分支。 */void send(String linked,String text,String localId,List<DesktopAttachment> uploaded)throws Exception{
+                    sendCalls++;if(onSend!=null)onSend.run();if("send".equals(failStage))throw new IOException(error);
+                    if("reject-send".equals(failStage))throw new SendRejectedException(error);
+                }
+                static final class RpcNotDispatchedException extends IOException {}
+                static final class SendRejectedException extends IOException {/** 合成同字拒绝检查阶段隔离。 */SendRejectedException(String s){super(s);}}
+            }
+            static long accountGeneration;static Object session;static boolean loggingOut;
+            static Path scenarioRoot;static OutboxStore store;static DesktopConnection connection;
+            static final Map<String,Path> files=new HashMap<>();
+            static final Map<Long,String> remoteIds=new HashMap<>(),dialogDirectories=new HashMap<>(),linkedSessions=new HashMap<>();
+            static final Map<String,MessageObject> pendingMessages=new HashMap<>();
+            static final Set<String> sendingBatches=new HashSet<>();static final Map<String,AttachmentState> attachmentStates=new HashMap<>();
+            /** 只为已有合成会话开放归属。 */static boolean ownsConversation(long d){return remoteIds.containsKey(d);}
+            /** 合成电脑连接可在场景中替换或移除。 */static DesktopConnection dialogConnection(long d){return connection;}
+            /** 真实附件暂存使用独立目录。 */static File attachmentDirectory(long d){return scenarioRoot.resolve("attachments").toFile();}
+            /** 返回真实同账号电脑Outbox，避免镜像持久化算法。 */static OutboxStore outboxStore(long d){return store;}
+            /** 选择边界提供合成文件，不读取真实手机数据。 */static File selectedAttachment(int a,SendMessageParams p){return p.path==null?null:new File(p.path);}
+            /** 此片不测试平台预览，原件存在性由真实暂存模型测试。 */static File attachmentFile(MessageObject m){return null;}
+            /** 合成进度不改变失败判定。 */static void attachmentProgress(int a,long e,long d,String r,DesktopConnection c,String k,boolean u,long done,long total){}
+            /** 只提供本批气泡的进度关联键。 */static String attachmentKey(MessageObject m){return m.messageOwner.params.get("codexLocalId");}
+            /** 不输出正文、路径或服务器错误。 */static void traceSend(String p,String id,long started){}
+            /** 每组真实状态使用独立目录及合成账号。 */static void reset(Path root)throws Exception{
+                scenarioRoot=Files.createTempDirectory(root,"case-");accountGeneration++;session=new Object();loggingOut=false;onUiEnqueue=null;
+                files.clear();pendingMessages.clear();sendingBatches.clear();attachmentStates.clear();remoteIds.clear();dialogDirectories.clear();linkedSessions.clear();ui.tasks.clear();sendQueue.tasks.clear();
+                remoteIds.put(1L,"synthetic-thread");dialogDirectories.put(1L,"/synthetic/workspace");store=new OutboxStore(scenarioRoot.resolve("outbox").toFile(),"server","account","machine");connection=new DesktopConnection();
+                try(var recipient=BulkTransferCrypto.createRecipient()){connection.publicKey=recipient.publicKeyBase64;}
+            }
+            /** 从原选择回调准备两件真实小文件。 */static void start()throws Exception{
+                ArrayList<SendMessageParams> selected=new ArrayList<>();for(String name:new String[]{"first.bin","second.bin"}){
+                    Path path=scenarioRoot.resolve(name);Files.write(path,new byte[]{1,2,3});files.put(name,path);
+                    SendMessageParams p=new SendMessageParams();p.path=path.toString();p.document=new Doc();p.document.name=name;p.document.mime_type="application/octet-stream";selected.add(p);
+                }sendBatch(0,selected.get(0),selected);
+            }
+            /** 取原批次身份，不生成第二个发送编号。 */static String base(){return pendingMessages.values().iterator().next().messageOwner.params.get("codexBatchLocalId");}
+            /** 使用实际私有文件定位方法注入写入失败，不仿写Outbox格式。 */static Path record(String id)throws Exception{
+                var m=OutboxStore.class.getDeclaredMethod("file",String.class);m.setAccessible(true);return ((File)m.invoke(store,id)).toPath();
+            }
+            /** 非空临时目录使真实原子write失败，原有效JSON仍保留。 */static void blockWrite(String id)throws Exception{Path block=Path.of(record(id)+".tmp");Files.createDirectories(block);Files.write(block.resolve("block"),new byte[]{1});}
+            /** 场景清理写入阻挡后可继续原身份重试。 */static void unblock(String id)throws Exception{Path block=Path.of(record(id)+".tmp");Files.deleteIfExists(block.resolve("block"));Files.deleteIfExists(block);}
+            /** 允许修复前读取缺失字段为null，以真实行为断言保存RED。 */static String code(OutboxStore.Item item)throws Exception{
+                try{return (String)OutboxStore.Item.class.getField("failureCode").get(item);}catch(NoSuchFieldException absent){return null;}
+            }
+            /** 只判断结果，不打印任意错误正文。 */static void check(boolean c,String m){if(!c)throw new AssertionError(m);}
+            /** 原批次全部失败气泡必须得到同一固定内部code。 */static void expectCode(String expected){for(MessageObject m:pendingMessages.values())check(Objects.equals(expected,m.messageOwner.params.get("codexSendFailure")),"原失败气泡丢失或误标固定原因");}
+            /** 只触发原手动重试入口。 */static void retry(){SendMessageParams p=new SendMessageParams();p.retryMessageObject=pendingMessages.values().iterator().next();sendBatch(0,p,new ArrayList<>());}
+        """;
+
+    private static final String SCENARIOS = """
+            /** 覆盖实际发送、落盘和迟到回调，不重写产品阶段判断。 */
+            public static void main(String[] args)throws Exception{
+                Path root=Path.of(args[0]);String expected="file_too_large";
+                for(String reason:new String[]{"File exceeds upload size limit","File exceeds the server-routed transfer size limit"}){
+                    reset(root);connection.failStage="upload";connection.error=reason;connection.rejectAt=2;start();String id=base();sendQueue.all();ui.all();expectCode(expected);
+                    OutboxStore.Item saved=store.get(id);check(expected.equals(code(saved))&&saved.uploaded.size()==1&&!saved.submissionUncertain&&connection.sendCalls==0,"第二件超限丢失原因、上传前缀或进入桌面发送");
+                    pendingMessages.clear();ArrayList<MessageObject> restored=restoredPending(0,1,saved,Set.of());check(restored.size()==2,"重开丢附件气泡");expectCode(expected);
+                    MessageObject active=restored.get(0);active.messageOwner.params.remove("codexSendFailure");active.messageOwner.send_state=MessageObject.MESSAGE_SEND_STATE_SENDING;
+                    restoredPending(0,1,saved,Set.of());check(!active.messageOwner.params.containsKey("codexSendFailure"),"磁盘旧原因覆盖活跃气泡");
+                    pendingMessages.clear();check(restoredPending(0,1,saved,Set.of(TranscriptText.attachmentIdentity(id,0),TranscriptText.attachmentIdentity(id,1))).isEmpty(),"已回显批次被恢复");
+                }
+                for(String stage:new String[]{"upload","open","send","reject-send"}){
+                    reset(root);connection.failStage=stage;connection.error=stage.equals("upload")?"synthetic generic error":"File exceeds upload size limit";start();String id=base();sendQueue.all();ui.all();expectCode(null);
+                    check(code(store.get(id))==null,"泛错或非上传阶段错误误记大小原因");
+                }
+                reset(root);connection.failStage="upload";start();String id=base();sendQueue.all();ui.all();expectCode(expected);
+                connection.failStage=null;int earlier=connection.initCalls;retry();expectCode(null);sendQueue.all();ui.all();expectCode(null);
+                check(connection.initCalls==earlier+2&&connection.sendCalls==1&&code(store.get(id))==null&&store.get(id).submissionUncertain,"原身份重试未清旧原因或错误提交次数");
+                pendingMessages.clear();restoredPending(0,1,store.get(id),Set.of());expectCode(null);int calls=connection.sendCalls;retry();sendQueue.all();ui.all();check(connection.sendCalls==calls,"未知结果重开后被再次投递");
+
+                reset(root);connection.failStage="upload";start();id=base();sendQueue.all();ui.all();final String clearing=id;blockWrite(id);retry();int before=connection.initCalls;sendQueue.all();ui.all();expectCode(null);
+                check(connection.initCalls==before&&connection.sendCalls==0&&expected.equals(code(store.get(id))),"清旧原因写失败仍远端工作或损坏原记录");unblock(clearing);
+                reset(root);connection.failStage="upload";start();id=base();final String persisting=id;
+                connection.onReject=()->{try{blockWrite(persisting);}catch(Exception e){throw new RuntimeException(e);}};sendQueue.all();ui.all();expectCode(expected);
+                check(code(store.get(id))==null&&store.get(id).attachments.size()==2&&connection.sendCalls==0,"记原因写失败损坏原批次或伪装已持久化");unblock(id);
+
+                reset(root);start();id=base();final String beforeSubmit=id;
+                onUiEnqueue=()->{try{if(store.get(beforeSubmit).uploaded.size()==2){onUiEnqueue=null;blockWrite(beforeSubmit);}}catch(Exception e){throw new RuntimeException(e);}};
+                sendQueue.all();ui.all();expectCode(null);check(connection.sendCalls==0&&!store.get(id).submissionUncertain&&store.get(id).uploaded.size()==2,"未知状态首写失败仍桌面发送或丢上传前缀");unblock(id);
+                reset(root);connection.failStage="reject-send";start();id=base();final String rejected=id;
+                connection.onSend=()->{try{blockWrite(rejected);}catch(Exception e){throw new RuntimeException(e);}};sendQueue.all();ui.all();expectCode(null);
+                check(connection.sendCalls==1&&store.get(id).submissionUncertain,"可靠拒绝后落盘失败误允许重送");
+                for(MessageObject m:pendingMessages.values())check("true".equals(m.messageOwner.params.get("codexSendUncertain")),"未知持久化失败丢原界面语义");unblock(id);
+
+                reset(root);connection.failStage="upload";start();id=base();sendQueue.all();int notices=NotificationCenter.notices;accountGeneration++;ui.all();expectCode(null);check(NotificationCenter.notices==notices,"旧账号晚失败回调通知新账号");
+                for(boolean replace:new boolean[]{false,true}){
+                    reset(root);connection.failStage="upload";start();id=base();sendQueue.all();Map<String,MessageObject> old=new HashMap<>(pendingMessages);pendingMessages.clear();
+                    if(replace)for(var entry:old.entrySet())pendingMessages.put(entry.getKey(),new MessageObject(0,pendingMessage(1,-99,1000,"synthetic",id,0),true,false));
+                    ui.all();for(MessageObject m:old.values())check(!m.messageOwner.params.containsKey("codexSendFailure"),"晚失败回执改写已移除或替换的原对象");expectCode(null);
+                }
+                reset(root);connection.failStage="upload";start();id=base();final String late=id;connection.onReject=()->{try{store.remove(late);}catch(Exception e){throw new RuntimeException(e);}};sendQueue.all();ui.all();check(store.get(id)==null,"原因写入复活已回显清理的Outbox");
+                reset(root);connection.failStage="upload";start();id=base();connection.onReject=()->accountGeneration++;sendQueue.all();ui.all();expectCode(null);check(code(store.get(id))==null,"旧账号上传结果持久化失败原因");
+                var mapper=RuntimeSendFailureProbe.class.getDeclaredMethod("attachmentUploadFailureCode",IOException.class);mapper.setAccessible(true);
+                for(IOException error:new IOException[]{new IOException(),new IOException("prefix File exceeds upload size limit"),new IOException("File exceeds upload size limit "),
+                        new IOException("synthetic generic error",new IOException("File exceeds upload size limit"))})
+                    check(mapper.invoke(null,error)==null,"映射扩大为模糊匹配或递归异常原因");
+                System.out.println("RuntimeSendFailure: 真实发送/恢复方法两大小错误、泛错、第二件、重试未知、写盘失败及晚回执账号守卫通过");
+            }
+        """;
+}

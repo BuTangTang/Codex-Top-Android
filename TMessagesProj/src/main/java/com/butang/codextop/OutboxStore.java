@@ -11,6 +11,8 @@ import java.util.ArrayList;
 
 /** 私有目录保存尚未收到桌面回显的文字与附件描述；恢复只展示，不自动投递。 */
 public final class OutboxStore {
+    /** 仅保存已确认的附件大小拒绝，不持久化服务器错误正文。 */
+    public static final String FAILURE_FILE_TOO_LARGE = "file_too_large";
     private static final Object LOCK = new Object();
     private final File directory;
     /** 原选择描述没有字节校验含义；路径丢失也保留条目，不伪造暂存摘要。 */
@@ -54,6 +56,8 @@ public final class OutboxStore {
         public final java.util.List<DesktopAttachment.Pending> attachments;
         public final java.util.List<DesktopAttachment> uploaded;
         public final boolean submissionUncertain;
+        /** 可选失败解释与原待发记录同存，不能用来改变消息身份。 */
+        public final String failureCode;
         /** 旧文字调用保持原构造方式与版本1记录兼容。 */
         public Item(String localId, String remote, String text, int messageId, int date) {
             this(localId, remote, text, messageId, date, java.util.Collections.emptyList());
@@ -72,12 +76,12 @@ public final class OutboxStore {
         public Item(String localId, String remote, String text, int messageId, int date,
                 java.util.List<DesktopAttachment.Pending> attachments, java.util.List<DesktopAttachment> uploaded,
                 boolean submissionUncertain) {
-            this(localId, remote, text, messageId, date, attachments, uploaded, submissionUncertain, java.util.Collections.emptyList());
+            this(localId, remote, text, messageId, date, attachments, uploaded, submissionUncertain, java.util.Collections.emptyList(), null);
         }
         /** 一条待发记录同时持有原选择与已校验暂存前缀，网络阶段不得早于全部暂存。 */
         private Item(String localId, String remote, String text, int messageId, int date,
                 java.util.List<DesktopAttachment.Pending> attachments, java.util.List<DesktopAttachment> uploaded,
-                boolean submissionUncertain, java.util.List<Selection> selections) {
+                boolean submissionUncertain, java.util.List<Selection> selections, String failureCode) {
             if (localId == null || localId.isEmpty() || remote == null || remote.isEmpty()
                     || attachments == null || attachments.stream().anyMatch(java.util.Objects::isNull)
                     || selections == null || selections.stream().anyMatch(java.util.Objects::isNull)
@@ -112,12 +116,16 @@ public final class OutboxStore {
                 throw new IllegalArgumentException("附件尚未全部暂存");
             this.uploaded = java.util.Collections.unmodifiableList(new ArrayList<>(uploaded));
             this.submissionUncertain = submissionUncertain;
+            if (failureCode != null && !FAILURE_FILE_TOO_LARGE.equals(failureCode))
+                throw new IllegalArgumentException("待发失败解释无效");
+            // 派发结果未知时，不能继续用此前的上传拒绝解释当前结果。
+            this.failureCode = submissionUncertain ? null : failureCode;
         }
         /** 首次暂存前就保存完整选择，文件稍后消失仍能恢复整批失败气泡。 */
         public static Item selected(String localId, String remote, String text, int messageId, int date,
                 java.util.List<Selection> selections) {
             return new Item(localId, remote, text, messageId, date, java.util.Collections.emptyList(),
-                    java.util.Collections.emptyList(), false, selections);
+                    java.util.Collections.emptyList(), false, selections, null);
         }
         /** 旧记录的附件已经全部暂存；新记录数量以不可变的完整选择为准。 */
         public int attachmentCount() { return selections.isEmpty() ? attachments.size() : selections.size(); }
@@ -158,7 +166,7 @@ public final class OutboxStore {
             for (int i = 0; i < prior.attachments.size(); i++)
                 if (!prior.attachments.get(i).equals(staged.get(i))) throw new IOException("暂存原件身份冲突");
             write(target, new Item(prior.localId, prior.remote, prior.text, prior.messageId, prior.date,
-                    staged, prior.uploaded, prior.submissionUncertain, prior.selections));
+                    staged, prior.uploaded, prior.submissionUncertain, prior.selections, prior.failureCode));
         }
     }
 
@@ -171,7 +179,7 @@ public final class OutboxStore {
             for (int i = 0; i < prior.uploaded.size(); i++)
                 if (!prior.uploaded.get(i).toJson().equals(uploaded.get(i).toJson())) throw new IOException("上传引用冲突");
             write(target, new Item(prior.localId, prior.remote, prior.text, prior.messageId, prior.date,
-                    prior.attachments, uploaded, prior.submissionUncertain, prior.selections));
+                    prior.attachments, uploaded, prior.submissionUncertain, prior.selections, prior.failureCode));
         }
     }
     /** 与附件原件和上传路径同记录原子发布，重启也不能把未知结果当作可再次发送。 */
@@ -180,7 +188,19 @@ public final class OutboxStore {
             File target = file(localId);
             Item prior = read(target);
             write(target, new Item(prior.localId, prior.remote, prior.text, prior.messageId, prior.date,
-                    prior.attachments, prior.uploaded, uncertain, prior.selections));
+                    prior.attachments, prior.uploaded, uncertain, prior.selections, prior.failureCode));
+        }
+    }
+
+    /** 只记入或清除固定解释，沿原记录原子写入；不存在的记录不得被复活。 */
+    public void markFailureCode(String localId, String failureCode) throws IOException {
+        if (failureCode != null && !FAILURE_FILE_TOO_LARGE.equals(failureCode))
+            throw new IllegalArgumentException("待发失败解释无效");
+        synchronized (LOCK) {
+            File target = file(localId);
+            Item prior = read(target);
+            write(target, new Item(prior.localId, prior.remote, prior.text, prior.messageId, prior.date,
+                    prior.attachments, prior.uploaded, prior.submissionUncertain, prior.selections, failureCode));
         }
     }
 
@@ -191,6 +211,7 @@ public final class OutboxStore {
             value.addProperty("remote", item.remote); value.addProperty("text", item.text);
             value.addProperty("messageId", item.messageId); value.addProperty("date", item.date);
             if (item.submissionUncertain) value.addProperty("submissionUncertain", true);
+            if (item.failureCode != null) value.addProperty("failureCode", item.failureCode);
             if (!item.selections.isEmpty()) {
                 com.google.gson.JsonArray selections = new com.google.gson.JsonArray();
                 for (Selection selection : item.selections) selections.add(selection.toJson());
@@ -249,9 +270,13 @@ public final class OutboxStore {
                 meta.add("happier", happier); raw.add("meta", meta);
                 uploaded = DesktopAttachment.readRaw(raw);
             }
+            // 可选解释缺失、未知或格式错误只退回泛失败，不能因此丢掉原待发批次。
+            String failureCode = value.has("failureCode") && value.get("failureCode").isJsonPrimitive()
+                    && value.get("failureCode").getAsJsonPrimitive().isString()
+                    && FAILURE_FILE_TOO_LARGE.equals(value.get("failureCode").getAsString()) ? FAILURE_FILE_TOO_LARGE : null;
             Item item = new Item(value.get("localId").getAsString(), value.get("remote").getAsString(),
                     value.get("text").getAsString(), value.get("messageId").getAsInt(), value.get("date").getAsInt(), attachments, uploaded,
-                    value.has("submissionUncertain") && value.get("submissionUncertain").getAsBoolean(), selections);
+                    value.has("submissionUncertain") && value.get("submissionUncertain").getAsBoolean(), selections, failureCode);
             if (!file.getName().equals(file(item.localId).getName())) throw new IllegalArgumentException();
             return item;
         } catch (RuntimeException error) { throw new IOException("待发消息无法读取", error); }
