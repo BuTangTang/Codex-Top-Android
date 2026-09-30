@@ -33,6 +33,8 @@ public final class CodexRuntime {
     private static final Map<String, JsonObject> browseSnapshots = new java.util.concurrent.ConcurrentHashMap<>();
     // 只保留本次账号内各电脑用户来源的最近采集值；页面始终展示原采集时间。
     private static final Map<String, AccountUsage> accountUsageSnapshots = new java.util.concurrent.ConcurrentHashMap<>();
+    // 仅界面线程合并当前在途回调；不等待openDesktop的类锁，也不保存另一份额度。
+    private static final Map<String, AccountUsageRead> accountUsageReads = new HashMap<>();
     private static final org.telegram.messenger.DispatchQueue dialogQueue = new org.telegram.messenger.DispatchQueue("codex-dialogs");
     private static final ArrayList<TLRPC.Dialog> dialogs = new ArrayList<>();
     private static final Map<Long, String> remoteIds = new java.util.concurrent.ConcurrentHashMap<>();
@@ -176,6 +178,7 @@ public final class CodexRuntime {
                         desktop = null;
                         desktopConnections.clear();
                         accountUsageSnapshots.clear();
+                        accountUsageReads.clear();
                         preferredMachine = null;
                         cachedDialogsRead = false;
                         // 与冷盘恢复共用小锁；旧账号绑定不能越过清理写入下一账号。
@@ -1218,37 +1221,69 @@ public final class CodexRuntime {
         return loggedIn() && machineId != null ? accountUsageSnapshots.get(machineId) : null;
     }
 
-    /** 只在打开或手动刷新额度时读取；沿现有队列执行，不增加轮询或阻塞消息发送。 */
+    /** 原额度入口的一次在途读取；完成后移除，只保留各页面等待中的回调。 */
+    private static final class AccountUsageRead {
+        final long epoch;
+        volatile DesktopConnection connection;
+        volatile boolean completed;
+        final ArrayList<java.util.function.BiConsumer<AccountUsage, String>> callbacks = new ArrayList<>();
+
+        /** 固定账号代次和已知连接；首次建立连接由原后台入口补齐。 */
+        AccountUsageRead(long epoch, DesktopConnection connection) {
+            this.epoch = epoch;
+            this.connection = connection;
+        }
+    }
+
+    /** 界面入口按同账号、电脑和连接合并在途读取，仍沿原队列执行且不增加轮询。 */
     public static void readAccountUsage(String machineId,
             java.util.function.BiConsumer<AccountUsage, String> callback) {
         final long epoch = accountGeneration;
         if (!isAccountCurrent(epoch) || machineId == null || machineId.isEmpty()) {
             callback.accept(null, "请先选择已连接的电脑。"); return;
         }
+        AccountUsageRead pending = accountUsageReads.get(machineId);
+        // 建连发布到返回的间隙仍可合并；后台已结束的首连失败不能吞掉新连接读取。
+        if (pending != null && pending.epoch == epoch && ((!pending.completed && pending.connection == null)
+                || pending.connection == desktopConnections.get(machineId))) {
+            pending.callbacks.add(callback);
+            return;
+        }
+        DesktopConnection current = desktopConnections.get(machineId);
+        final AccountUsageRead read = new AccountUsageRead(epoch, current);
+        read.callbacks.add(callback);
+        accountUsageReads.put(machineId, read);
         approvalQueue.postRunnable(() -> {
             AccountUsage result = null; String failure = null;
-            DesktopConnection connection = null;
             try {
-                if (!isAccountCurrent(epoch)) return;
-                connection = openDesktop(machineId);
-                result = connection.readAccountUsage();
-                if (!isAccountCurrent(epoch)) return;
-                if (desktopConnections.get(machineId) != connection) {
-                    result = null; failure = "电脑连接已变化，请刷新额度。";
+                if (isAccountCurrent(epoch)) {
+                    DesktopConnection expected = read.connection;
+                    if (expected != null && desktopConnections.get(machineId) != expected) throw new java.io.IOException();
+                    // 网络建连仍在原队列；不能把旧连接上排队的读取迁给后来替换的连接。
+                    DesktopConnection connection = openDesktop(machineId);
+                    if (expected != null && connection != expected) throw new java.io.IOException();
+                    read.connection = connection;
+                    if (isAccountCurrent(epoch) && desktopConnections.get(machineId) == connection)
+                        result = connection.readAccountUsage();
                 }
             } catch (Exception error) { failure = "暂时无法读取该电脑的额度，请检查连接后刷新。"; }
+            finally { read.completed = true; }
             final AccountUsage loaded = result; final String message = failure;
-            final DesktopConnection owner = connection;
             AndroidUtilities.runOnUIThread(() -> {
+                boolean ownsRead = accountUsageReads.get(machineId) == read;
+                if (ownsRead) accountUsageReads.remove(machineId);
                 if (!isAccountCurrent(epoch)) return;
-                if (owner != null && desktopConnections.get(machineId) != owner) {
-                    accountUsageSnapshots.remove(machineId);
-                    callback.accept(null, "电脑连接已变化，请刷新额度。"); return;
+                if (!ownsRead || read.connection != desktopConnections.get(machineId)) {
+                    // 旧来源只结束自己的回调，不清除新连接的在途记录或已发布额度。
+                    for (java.util.function.BiConsumer<AccountUsage, String> waiting : read.callbacks)
+                        waiting.accept(null, "电脑连接已变化，请刷新额度。");
+                    return;
                 }
-                // 本次失败或来源不可读时清除主余额，不能把旧账号余额当作本次读取结果。
+                // 先解除本次合并，再发布原快照；回调中主动刷新仍会发起下一次真实读取。
                 if (loaded != null) accountUsageSnapshots.put(machineId, loaded);
                 else accountUsageSnapshots.remove(machineId);
-                callback.accept(loaded, message);
+                for (java.util.function.BiConsumer<AccountUsage, String> waiting : read.callbacks)
+                    waiting.accept(loaded, message);
             });
         });
     }
