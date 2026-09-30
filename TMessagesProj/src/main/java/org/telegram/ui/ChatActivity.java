@@ -825,6 +825,11 @@ public class ChatActivity extends BaseFragment implements
     private Runnable codexDraftSaveRunnable;
     private boolean codexApprovalBusy;
     private boolean codexQuestionBusy;
+    private AlertDialog codexQuestionDialog;
+    private com.butang.codextop.CodexRuntime.QuestionReview codexQuestionReview;
+    private com.butang.codextop.DesktopQuestion codexQuestionRequest;
+    private int codexQuestionIndex;
+    private boolean codexQuestionUsable;
     private long codexQuestionUiGeneration;
     private final HashMap<String, java.util.LinkedHashMap<String, String>> codexQuestionDrafts = new HashMap<>();
     private final HashMap<String, String> codexQuestionCustomDrafts = new HashMap<>();
@@ -1050,30 +1055,109 @@ public class ChatActivity extends BaseFragment implements
         dialog.setOnShowListener(ignored -> {
             // 原弹窗按钮只推进当前原题，不把局部答案提前发送。
             dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(view -> {
-                if (generation != codexQuestionUiGeneration || paused || codexQuestionBusy) return;
+                if (generation != codexQuestionUiGeneration || paused || codexQuestionBusy || refreshCodexQuestion()) return;
                 if (!question.accepts(answers.get(question.id))) {
                     AndroidUtilities.shakeView(field != null && field.getVisibility() == View.VISIBLE ? field : content);
                     return;
                 }
+                // 状态读回后使用同身份的最新修订，已答题不再编辑或重复发送。
+                com.butang.codextop.CodexRuntime.QuestionReview currentReview = codexQuestionReview;
+                com.butang.codextop.DesktopQuestion currentRequest = codexQuestionRequest;
+                int next = codexUnansweredQuestionIndex(currentRequest, questionIndex + 1, 1);
+                // 最终提交先解除旧表单关联，迟到关闭监听不能清除提交中的忙碌标记。
+                if (next < 0) codexQuestionDialog = null;
                 dialog.dismiss();
-                if (nextIndex >= 0) showCodexQuestion(review, request, nextIndex);
-                else submitCodexQuestions(review, request, answers);
+                if (next >= 0) showCodexQuestion(currentReview, currentRequest, next);
+                else submitCodexQuestions(currentReview, currentRequest, answers);
             });
             dialog.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener(view -> dialog.dismiss());
             if (previousIndex >= 0) dialog.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                if (generation != codexQuestionUiGeneration || paused || codexQuestionBusy || refreshCodexQuestion()) return;
+                com.butang.codextop.CodexRuntime.QuestionReview currentReview = codexQuestionReview;
+                com.butang.codextop.DesktopQuestion currentRequest = codexQuestionRequest;
+                int previous = codexUnansweredQuestionIndex(currentRequest, questionIndex - 1, -1);
+                if (previous < 0) return;
                 dialog.dismiss();
-                if (generation == codexQuestionUiGeneration && !paused) showCodexQuestion(review, request, previousIndex);
+                showCodexQuestion(currentReview, currentRequest, previous);
             });
             if (field != null && field.getVisibility() == View.VISIBLE) {
                 field.requestFocus();
                 AndroidUtilities.showKeyboard(field);
             }
         });
+        codexQuestionDialog = dialog;
+        codexQuestionReview = review;
+        codexQuestionRequest = request;
+        codexQuestionIndex = questionIndex;
+        codexQuestionUsable = true;
         // 由 BaseFragment 接管关闭监听，保留它自己的可见弹窗清理。
         showDialog(dialog, ignored -> {
             // 切换到下一题后，上一题的迟到关闭事件不能收起新题键盘。
             if (field != null && visibleDialog == dialog) AndroidUtilities.hideKeyboard(field);
+            if (codexQuestionDialog == dialog) {
+                codexQuestionDialog = null;
+                codexQuestionReview = null;
+                codexQuestionRequest = null;
+                codexQuestionBusy = false;
+            }
         });
+        refreshCodexQuestion();
+    }
+
+    /** 只为仍打开的原表单核对相关状态；不变的通知与点击不会发起网络读取。 */
+    private boolean refreshCodexQuestion() {
+        AlertDialog dialog = codexQuestionDialog;
+        if (dialog == null || !dialog.isShowing() || paused) return false;
+        if (codexQuestionBusy) return true;
+        final long generation = codexQuestionUiGeneration;
+        com.butang.codextop.CodexRuntime.QuestionReview review = codexQuestionReview;
+        codexQuestionBusy = true;
+        boolean changed = com.butang.codextop.CodexRuntime.refreshQuestions(review, codexQuestionRequest, (loaded, error) -> {
+            if (generation != codexQuestionUiGeneration || paused || codexQuestionDialog != dialog) return;
+            codexQuestionBusy = false;
+            applyCodexQuestionRefresh(dialog, review, loaded, error);
+        });
+        if (!changed) codexQuestionBusy = false;
+        else if (codexQuestionBusy) {
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setEnabled(false);
+            View previous = dialog.getButton(DialogInterface.BUTTON_NEUTRAL);
+            if (previous != null) previous.setEnabled(false);
+        }
+        return changed || !codexQuestionUsable;
+    }
+
+    /** 桌面先答或失效时收起旧表单；同题未答草稿继续使用原控件，未知仅停提交。 */
+    private void applyCodexQuestionRefresh(AlertDialog dialog, com.butang.codextop.CodexRuntime.QuestionReview previous,
+            com.butang.codextop.CodexRuntime.QuestionReview loaded, String error) {
+        if (!previous.current()) { dialog.dismiss(); return; }
+        com.butang.codextop.DesktopQuestion request = codexQuestionRequest;
+        com.butang.codextop.DesktopQuestion.Question question = request.questions.get(codexQuestionIndex);
+        if (loaded == null || error != null) {
+            codexQuestionUsable = false;
+            dialog.setMessage(question.question + "\n\n" + (error != null ? error : "暂时无法核对问题状态，回答已保留。"));
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setEnabled(false);
+            View previousButton = dialog.getButton(DialogInterface.BUTTON_NEUTRAL);
+            if (previousButton != null) previousButton.setEnabled(false);
+            return;
+        }
+        com.butang.codextop.DesktopQuestion fresh = null;
+        for (com.butang.codextop.DesktopQuestion candidate : loaded.requests) {
+            if (candidate.identity().equals(request.identity())) { fresh = candidate; break; }
+        }
+        if (fresh != null) codexQuestionDrafts.get(request.identity()).putAll(fresh.answers);
+        if (fresh == null || !fresh.canAnswer || loaded.alreadyIssued(fresh) || fresh.answers.containsKey(question.id)) {
+            dialog.dismiss();
+            return;
+        }
+        codexQuestionReview = loaded;
+        codexQuestionRequest = fresh;
+        codexQuestionUsable = true;
+        dialog.setMessage(question.question);
+        TextView next = (TextView) dialog.getButton(DialogInterface.BUTTON_POSITIVE);
+        next.setEnabled(true);
+        next.setText(codexUnansweredQuestionIndex(fresh, codexQuestionIndex + 1, 1) < 0 ? "提交回答" : "下一题");
+        View previousButton = dialog.getButton(DialogInterface.BUTTON_NEUTRAL);
+        if (previousButton != null) previousButton.setEnabled(codexUnansweredQuestionIndex(fresh, codexQuestionIndex - 1, -1) >= 0);
     }
 
     /** 按原顺序跳过桌面已经确认的题目，前后导航不会重新编辑或展示其保密答案。 */
@@ -22254,6 +22338,8 @@ public class ChatActivity extends BaseFragment implements
             }
         } else if (id == NotificationCenter.updateInterfaces) {
             int updateMask = (Integer) args[0];
+            // 原状态通知同步已经打开的提问表单，普通聊天与关闭的表单不额外读题。
+            if ((updateMask & MessagesController.UPDATE_MASK_STATUS) != 0) refreshCodexQuestion();
             // 字节进度沿原通知只更新可见附件，不重建消息列表或触发网络刷新。
             if ((updateMask & MessagesController.UPDATE_MASK_SEND_STATE) != 0
                     && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) && chatListView != null) {
@@ -30344,6 +30430,7 @@ public class ChatActivity extends BaseFragment implements
     /** 保留原页面暂停流程，撤销旧提问弹窗回调并停止离开后的电脑消息轮询。 */
     public void onPause() {
         codexQuestionUiGeneration++;
+        if (codexQuestionDialog != null) codexQuestionDialog.dismiss();
         codexQuestionBusy = false;
         if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexRuntime.stopWatching(dialog_id);
         super.onPause();
@@ -41804,7 +41891,7 @@ public class ChatActivity extends BaseFragment implements
                     String reason = attachment.reason;
                     String explanation = "电脑未提供可下载的文件。";
                     if ("file_too_large".equals(reason)) explanation = "附件超过当前传输大小上限。";
-                    else if ("unsupported_reference".equals(reason)) explanation = "这张图片的引用暂不支持下载。";
+                    else if ("unsupported_reference".equals(reason)) explanation = "这个附件的引用暂不支持下载。";
                     else if ("materialization_failed".equals(reason)) explanation = "电脑未能保存生成图片。";
                     else if ("materialization_required".equals(reason)) explanation = "电脑尚未提供生成图片的文件。";
                     else if (!TextUtils.isEmpty(reason)) explanation = "暂时无法下载该附件：" + reason;

@@ -34,10 +34,28 @@ public final class SessionStatusTest {
         check("{\"updatedAtMs\":999999,\"activity\":\"running\",\"details\":{\"codexLifecycle\":{\"v\":1,\"state\":\"completed\",\"eventAtMs\":1000,\"checkedAtMs\":2000}}}", "已完成");
         check("{\"details\":{\"codexLifecycle\":{\"v\":1,\"state\":\"running\",\"eventAtMs\":3000,\"checkedAtMs\":2000}}}", "状态未知");
         check(base + "{\"v\":1,\"source\":\"desktop\",\"turnId\":\"t\",\"state\":\"needs_input\",\"requests\":[{\"requestId\":\"q\",\"kind\":\"user_action_request\"}]}}", "待你回复");
+        pendingQuestionIdentities();
         listAndConversationShareFacts();
         expirationAndRecovery();
         listFailureDoesNotDisconnectNewerObservations();
         System.out.println("SessionStatus: 生命周期事实、缺失身份、未知协议和连接状态区分通过");
+    }
+
+    /** 原待答身份只来自实际提问请求，快照不可变且失效不能沿用为当前事实。 */
+    private static void pendingQuestionIdentities() {
+        SessionStatus.Store store = new SessionStatus.Store();
+        var response = JsonParser.parseString("{\"ok\":true,\"machineOnline\":true,\"observation\":{\"v\":1,\"source\":\"desktop\",\"turnId\":\"t\",\"state\":\"needs_input\",\"requests\":[{\"requestId\":\"a\",\"kind\":\"user_action_request\"},{\"requestId\":\"b\",\"kind\":\"user_action_request\"},{\"requestId\":\"approval\",\"kind\":\"permission_request\"}]}}").getAsJsonObject();
+        store.observation(1, "machine", response, 100, 110);
+        var first = store.get(1, 111);
+        if (!first.questionIds.equals(java.util.Set.of("a", "b"))) throw new AssertionError("待答身份丢失或混入审批");
+        try { first.questionIds.add("bad"); throw new AssertionError("外部可改写状态身份"); }
+        catch (UnsupportedOperationException expected) { }
+        response.getAsJsonObject("observation").getAsJsonArray("requests").remove(0);
+        store.observation(1, "machine", response, 120, 130);
+        if (!store.get(1, 131).questionIds.equals(java.util.Set.of("b")) || first.questionIds.size() != 2)
+            throw new AssertionError("部分已答未更新或污染原快照");
+        store.unavailable("machine", 140);
+        if ("current".equals(store.get(1, 141).validity)) throw new AssertionError("失效身份仍作为当前待答");
     }
 
     /** LIST 迟到失败不能抹去更新的 STATUS，也不能阻断已经发出的下一条有效观察。 */

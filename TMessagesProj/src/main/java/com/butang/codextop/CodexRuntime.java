@@ -1059,12 +1059,16 @@ public final class CodexRuntime {
         private final DesktopConnection connection;
         private final String linked;
         private final android.content.SharedPreferences issued;
+        private SessionStatus.Snapshot observation;
+        private boolean refreshing;
 
         /** 固定原题所属连接与页面，提交意图只保存无正文的身份。 */
         private QuestionReview(long epoch, long generation, long dialogId, DesktopConnection connection,
-                String linked, ArrayList<DesktopQuestion> requests, android.content.SharedPreferences issued) {
+                String linked, ArrayList<DesktopQuestion> requests, android.content.SharedPreferences issued,
+                SessionStatus.Snapshot observation) {
             this.epoch = epoch; this.generation = generation; this.dialogId = dialogId;
             this.connection = connection; this.linked = linked; this.requests = requests; this.issued = issued;
+            this.observation = observation;
         }
 
         /** 同账号、电脑、会话和题目修订共享一个提交标识。 */
@@ -1081,7 +1085,47 @@ public final class CodexRuntime {
         }
 
         /** 用户回答只能交给显示原题时的同一连接。 */
-        private boolean current() { return pageCurrent() && dialogConnection(dialogId) == connection; }
+        public boolean current() { return pageCurrent() && dialogConnection(dialogId) == connection; }
+
+        /** 只比较本题组在原STATUS中的待答身份，不因采集时间或其它审批变化重复读题。 */
+        private String observationKey(SessionStatus.Snapshot snapshot, DesktopQuestion request) {
+            StringBuilder key = new StringBuilder(snapshot.validity).append('\n').append(snapshot.source)
+                    .append('\n').append(snapshot.turnId).append('\n').append(snapshot.state);
+            if ("async_questions".equals(request.kind)) {
+                for (DesktopQuestion.Question question : request.questions)
+                    key.append('\n').append(snapshot.questionIds.contains(question.id));
+            } else key.append('\n').append(snapshot.questionIds.contains(request.requestId.getAsString()));
+            return key.toString();
+        }
+    }
+
+    /** 仅已打开的原表单调用；相关STATUS变化才合并一次读题，未知只停止编辑而不伪报已答。 */
+    public static boolean refreshQuestions(QuestionReview review, DesktopQuestion request,
+            java.util.function.BiConsumer<QuestionReview, String> callback) {
+        if (!review.current()) {
+            callback.accept(null, "电脑连接或当前会话已变化。");
+            return true;
+        }
+        SessionStatus.Snapshot observed = status(review.dialogId);
+        if (review.refreshing || review.observationKey(observed, request).equals(review.observationKey(review.observation, request)))
+            return false;
+        review.observation = observed;
+        if (!"current".equals(observed.validity)) {
+            callback.accept(null, "暂时无法核对问题状态，回答已保留。");
+            return true;
+        }
+        review.refreshing = true;
+        readQuestions(review.dialogId, (loaded, error) -> {
+            review.refreshing = false;
+            if (!review.pageCurrent()) return;
+            if (!review.current()) callback.accept(null, "电脑连接已变化。");
+            else if (loaded != null && error == null) {
+                // 忙碌期间STATUS仍会前进；旧读回不得重新启用已失效的原表单。
+                review.observation = loaded.observation;
+                if (!refreshQuestions(review, request, callback)) callback.accept(loaded, null);
+            } else callback.accept(loaded, error);
+        });
+        return true;
     }
 
     /** 沿已有控制队列按需读题，不把题目或保密回答写入普通历史缓存。 */
@@ -1091,27 +1135,32 @@ public final class CodexRuntime {
             callback.accept(null, "当前会话已变化，请重新打开问题。"); return;
         }
         final String remote = remoteIds.get(dialogId);
+        final DesktopConnection connection = dialogConnection(dialogId);
+        final SessionStatus.Snapshot observation = status(dialogId);
         final android.content.SharedPreferences issued = ApplicationLoader.applicationContext.getSharedPreferences(
                 "codex-question-" + TranscriptStore.digest(session.server + "\n" + session.accountId), 0);
         approvalQueue.postRunnable(() -> {
             QuestionReview review = null; String failure = null;
             try {
                 if (!isAccountCurrent(epoch) || generation != watchGeneration || watchedDialog != dialogId) return;
-                DesktopConnection connection = dialogConnection(dialogId);
-                if (connection == null) throw new java.io.IOException();
+                if (connection == null || dialogConnection(dialogId) != connection) throw new java.io.IOException();
                 String linked = linkedSessions.get(dialogId);
                 if (linked == null) {
                     linked = connection.openConversation(remote).get("sessionId").getAsString();
                     if (!isAccountCurrent(epoch) || generation != watchGeneration) return;
+                    if (dialogConnection(dialogId) != connection) throw new java.io.IOException();
                     linkedSessions.put(dialogId, linked);
                 }
                 review = new QuestionReview(epoch, generation, dialogId, connection, linked,
-                        connection.readQuestions(linked), issued);
+                        connection.readQuestions(linked), issued, observation);
             } catch (Exception error) { failure = "暂时无法读取问题，请稍后重试。"; }
             final QuestionReview loaded = review; final String message = failure;
             AndroidUtilities.runOnUIThread(() -> {
-                if (isAccountCurrent(epoch) && generation == watchGeneration && watchedDialog == dialogId)
-                    callback.accept(loaded, message);
+                if (isAccountCurrent(epoch) && generation == watchGeneration && watchedDialog == dialogId) {
+                    // 同页换连接时结束旧读取，但旧题快照不能进入新连接的表单。
+                    if (dialogConnection(dialogId) != connection) callback.accept(null, "电脑连接已变化，请重新查看问题。");
+                    else callback.accept(loaded, message);
+                }
             });
         });
     }

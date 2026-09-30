@@ -14,19 +14,21 @@ public final class SessionStatus {
     public static final class Snapshot {
         public final String state, pendingKind, validity, source, turnId, label;
         public final long eventAtMs, checkedAtMs, observedAtElapsedMs;
+        public final java.util.Set<String> questionIds;
 
         /** 保留来源事实与本机接收时刻，来源时钟不与手机墙钟比较。 */
         private Snapshot(String state, String pendingKind, String validity, String source, String turnId,
-                long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label) {
+                long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label, java.util.Set<String> questionIds) {
             this.state = state; this.pendingKind = pendingKind; this.validity = validity;
             this.source = source; this.turnId = turnId; this.label = label;
             this.eventAtMs = eventAtMs; this.checkedAtMs = checkedAtMs;
             this.observedAtElapsedMs = observedAtElapsedMs;
+            this.questionIds = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(questionIds));
         }
 
         /** 失效保留上次事实供说明，但禁止将其继续显示为实时运行或完成。 */
         private Snapshot invalid(String validity, String label) {
-            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, label);
+            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, label, questionIds);
         }
     }
 
@@ -113,7 +115,7 @@ public final class SessionStatus {
 
     /** 创建无可用事实的明确状态，不从活动时间、未读或连接成功猜测生命周期。 */
     private static Snapshot unknown(String validity, String label, long observedAt) {
-        return new Snapshot("unknown", "unknown", validity, "", "", -1, -1, observedAt, label);
+        return new Snapshot("unknown", "unknown", validity, "", "", -1, -1, observedAt, label, java.util.Collections.emptySet());
     }
 
     /** 安全收窄可选 JSON 对象，格式错误由对应事实入口降级。 */
@@ -146,6 +148,7 @@ public final class SessionStatus {
         if ((!"desktop".equals(source) && !"rollout".equals(source)) || turnId.trim().isEmpty())
             return unknown("unknown", "状态未知", receivedAt);
         String pending = "none";
+        java.util.Set<String> questionIds = new java.util.HashSet<>();
         if ("needs_input".equals(state)) {
             JsonElement requests = observation.get("requests");
             if (requests == null || !requests.isJsonArray() || requests.getAsJsonArray().size() == 0)
@@ -157,12 +160,16 @@ public final class SessionStatus {
                 if (text(request, "requestId").trim().isEmpty()) return unknown("unknown", "状态未知", receivedAt);
                 String kind = text(request, "kind");
                 if ("permission_request".equals(kind)) approval = true;
-                else if ("user_action_request".equals(kind)) question = true;
+                else if ("user_action_request".equals(kind)) {
+                    question = true;
+                    // 原STATUS已有未答题身份；只供打开的表单判断变化，不授予提交能力。
+                    questionIds.add(text(request, "requestId"));
+                }
                 else return unknown("unknown", "状态未知", receivedAt);
             }
             pending = question && approval ? "mixed" : question ? "question" : "approval";
         }
-        return known(state, pending, source, turnId, -1, -1, receivedAt);
+        return known(state, pending, source, turnId, -1, -1, receivedAt, questionIds);
     }
 
     /** STATUS 的在线和错误信息优先；runnerActive/activity 都不进入生命周期判断。 */
@@ -183,17 +190,19 @@ public final class SessionStatus {
         if ("unknown".equals(state) || eventAt < 0 || eventAt > checkedAt) return unknown("unknown", "状态未知", receivedAt);
         String pending = "needs_input".equals(state) ? "unknown" : "none";
         String source = "rollout", turnId = "";
+        java.util.Set<String> questionIds = java.util.Collections.emptySet();
         if (details.has("codexObservation")) {
             Snapshot observation = observationSnapshot(object(details, "codexObservation"), receivedAt);
             if (!"current".equals(observation.validity) || !state.equals(observation.state)) return unknown("unknown", "状态未知", receivedAt);
             pending = observation.pendingKind; source = observation.source; turnId = observation.turnId;
+            questionIds = observation.questionIds;
         }
-        return known(state, pending, source, turnId, eventAt, checkedAt, receivedAt);
+        return known(state, pending, source, turnId, eventAt, checkedAt, receivedAt, questionIds);
     }
 
     /** 两种来源只在此处将已校验事实映射为可读标签；UI 不反向解析标签。 */
     private static Snapshot known(String state, String pending, String source, String turnId,
-            long eventAt, long checkedAt, long receivedAt) {
+            long eventAt, long checkedAt, long receivedAt, java.util.Set<String> questionIds) {
         String label;
         switch (state) {
             case "running": label = "运行中"; break;
@@ -204,6 +213,6 @@ public final class SessionStatus {
                     ? "待批准" : "mixed".equals(pending) ? "待你回复／批准" : "待处理"; break;
             default: return unknown("unknown", "状态未知", receivedAt);
         }
-        return new Snapshot(state, pending, "current", source, turnId, eventAt, checkedAt, receivedAt, label);
+        return new Snapshot(state, pending, "current", source, turnId, eventAt, checkedAt, receivedAt, label, questionIds);
     }
 }
