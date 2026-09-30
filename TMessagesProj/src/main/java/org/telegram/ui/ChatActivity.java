@@ -824,6 +824,25 @@ public class ChatActivity extends BaseFragment implements
     private Runnable codexDraftSaveRunnable;
     private boolean codexApprovalBusy;
 
+    /** 顶栏用原弹窗展示完整来源，仅真实且有效的审批待办提供操作入口。 */
+    public void showCodexConversationInfo() {
+        if (getParentActivity() == null) return;
+        com.butang.codextop.CodexRuntime.ConversationInfo source = com.butang.codextop.CodexRuntime.conversationInfo(dialog_id);
+        com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(dialog_id);
+        String title = TextUtils.isEmpty(source.title) ? "未命名对话" : source.title;
+        String computer = TextUtils.isEmpty(source.machineName) ? "电脑名称暂不可用" : source.machineName;
+        String directory = TextUtils.isEmpty(source.workingDirectory) ? "项目路径暂不可用" : source.workingDirectory;
+        AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle("会话信息")
+                .setMessage("会话：" + title + "\n\n电脑：" + computer + "\n\n项目路径：" + directory + "\n\n状态：" + status.label)
+                .setPositiveButton("关闭", null);
+        if ("current".equals(status.validity) && "needs_input".equals(status.state)
+                && ("approval".equals(status.pendingKind) || "mixed".equals(status.pendingKind))) {
+            builder.setNeutralButton("查看待批准操作", (dialog, which) -> showCodexApprovals());
+        }
+        showDialog(builder.create());
+    }
+
     /** 复用原对话框按需展示当前桌面审批，不把历史工具记录当作待办。 */
     public void showCodexApprovals() {
         if (codexApprovalBusy || getParentActivity() == null) return;
@@ -1883,6 +1902,7 @@ public class ChatActivity extends BaseFragment implements
     }
 
     RecyclerListView.OnItemClickListenerExtended onItemClickListener = new RecyclerListView.OnItemClickListenerExtended() {
+        /** 普通正文单击不弹复制菜单，多选、失败重试及控件语义点击沿用原版。 */
         @Override
         public void onItemClick(View view, int position, float x, float y) {
             if (inPreviewMode) {
@@ -1937,6 +1957,10 @@ public class ChatActivity extends BaseFragment implements
                     }
                     return;
                 }
+            }
+            if (com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) && view instanceof ChatMessageCell) {
+                MessageObject message = ((ChatMessageCell) view).getMessageObject();
+                if (message != null && (message.type == MessageObject.TYPE_TEXT || message.type == MessageObject.TYPE_EMOJIS) && !message.isSendError()) return;
             }
             createMenu(view, true, false, x, y, false);
         }

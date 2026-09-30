@@ -17,7 +17,7 @@ public final class CodexRuntime {
     private static volatile PasswordLogin.Session session;
     private static volatile long accountGeneration;
     private static volatile boolean loggingOut;
-    private static boolean sessionRestored;
+    private static volatile boolean sessionRestored;
     private static boolean draftOwnerSaved;
     private static volatile DesktopConnection desktop;
     private static String preferredMachine;
@@ -37,8 +37,10 @@ public final class CodexRuntime {
     private static final Map<Long, String> linkedSessions = new java.util.concurrent.ConcurrentHashMap<>();
     private static final Map<String, org.telegram.messenger.MessageObject> pendingMessages = new HashMap<>();
     private static final org.telegram.messenger.DispatchQueue statusQueue = new org.telegram.messenger.DispatchQueue("codex-status");
-    private static final Map<Long, String> statusLabels = new HashMap<>();
-    private static final Map<Long, Long> statusTimes = new HashMap<>();
+    private static final SessionStatus.Store statuses = new SessionStatus.Store();
+    private static final Map<Long, String> dialogTitles = new HashMap<>();
+    private static final Map<Long, String> dialogDirectories = new HashMap<>();
+    private static final Map<String, String> machineNames = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile long watchGeneration;
     private static volatile long watchedDialog;
     // 仅 statusQueue 访问；返回列表的短暂间隔复用一个观察租约，不缓存多份桌面历史。
@@ -88,10 +90,15 @@ public final class CodexRuntime {
         sessionRestored = true;
     }
 
-    /** 判断当前进程是否已获得有效的 Codex 账号，不能当作 Telegram 授权状态。 */
-    public static synchronized boolean loggedIn() {
+    /** 已恢复会话只读内存，UI 不等待后台连接的类锁；首次调用仍沿原冷恢复入口。 */
+    public static boolean loggedIn() {
+        if (!sessionRestored) restoreSession();
+        return session != null && !loggingOut;
+    }
+
+    /** 冷恢复和草稿归属保存仍串行执行；全部完成后才向无锁读取者发布恢复标记。 */
+    private static synchronized void restoreSession() {
         if (!sessionRestored && ApplicationLoader.applicationContext != null) {
-            sessionRestored = true;
             try {
                 session = new SessionStore(ApplicationLoader.applicationContext).read();
             } catch (Exception error) {
@@ -104,8 +111,8 @@ public final class CodexRuntime {
             draftOwnerSaved = preferences.contains("legacyDraftOwner");
             if (!draftOwnerSaved) draftOwnerSaved = preferences.edit().putString("legacyDraftOwner",
                     session == null ? "" : TranscriptStore.digest(session.server + "\n" + session.accountId)).commit();
+            sessionRestored = true;
         }
-        return session != null && !loggingOut;
     }
 
     /** 每个异步入口保存账号代次，旧账号迟到响应不能更新下一账号的缓存或页面。 */
@@ -156,7 +163,7 @@ public final class CodexRuntime {
                         dialogIdentities = null;
                         dialogs.clear(); remoteIds.clear(); dialogMachines.clear();
                         histories.clear(); linkedSessions.clear(); pendingMessages.clear();
-                        statusLabels.clear(); statusTimes.clear();
+                        statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
                         loading = false; listRefreshScheduled = false; loadError = null;
                         loggingOut = false;
@@ -190,14 +197,21 @@ public final class CodexRuntime {
             connection = DesktopConnection.open(session, machine);
             if (loggingOut) { connection.close(); throw new IllegalStateException("正在退出账号"); }
             desktopConnections.put(connection.machineId, connection);
+            machineNames.put(connection.machineId, connection.machineName);
             onDesktopConnected(connection);
         }
         return connection;
     }
 
-    /** 新建或重连成功后唤醒同一连接所属的当前页；原队列取消定时项，保持单观察。 */
+    /** 新建或重连成功后唤醒原列表与同电脑的当前聊天，沿原门禁保持单次读取和单观察。 */
     static void onDesktopConnected(DesktopConnection connection) {
         final long accountEpoch = accountGeneration;
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection) return;
+            // 复用原列表单飞门禁，重连不为每个会话增加 STATUS 或历史请求。
+            if (connection == desktop && !ApplicationLoader.mainInterfacePaused)
+                refreshDialogs(org.telegram.messenger.UserConfig.selectedAccount);
+        });
         statusQueue.postRunnable(() -> {
             // 旧账号、已替换连接及其他电脑的迟到事件不能唤醒当前页。
             if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection
@@ -205,6 +219,18 @@ public final class CodexRuntime {
                     || !connection.machineId.equals(dialogMachines.get(watchedDialog))) return;
             statusQueue.cancelRunnable(statusPoll);
             statusQueue.postRunnable(statusPoll);
+        });
+    }
+
+    /** 连接事件只让所属电脑展示失效；旧连接或旧账号不能影响新来源。 */
+    static void onDesktopDisconnected(DesktopConnection connection) {
+        final long accountEpoch = accountGeneration;
+        final long disconnectedAt = android.os.SystemClock.elapsedRealtime();
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection) return;
+            statuses.unavailable(connection.machineId, disconnectedAt);
+            NotificationCenter.getInstance(org.telegram.messenger.UserConfig.selectedAccount)
+                    .postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
         });
     }
 
@@ -247,6 +273,7 @@ public final class CodexRuntime {
         dialogQueue.postRunnable(() -> {
             if (!isAccountCurrent(accountEpoch)) return;
             JsonObject page = null;
+            long observationStartedAt = android.os.SystemClock.elapsedRealtime();
             String failure = null;
             try {
                 JsonObject response = openDesktop(machine).candidates(100, cursor);
@@ -282,6 +309,7 @@ public final class CodexRuntime {
                 page.add("candidates", rows);
             } catch (Exception error) { failure = "对话暂时无法读取，请重试"; }
             final JsonObject result = page;
+            final long observedAt = android.os.SystemClock.elapsedRealtime();
             final String message = failure;
             AndroidUtilities.runOnUIThread(() -> {
                 if (!isAccountCurrent(accountEpoch)) return;
@@ -289,6 +317,8 @@ public final class CodexRuntime {
                     // 只注册聊天模型，不替换首页列表，返回仍留在原项目页。
                     for (com.google.gson.JsonElement value : result.getAsJsonArray("candidates")) {
                         JsonObject row = value.getAsJsonObject();
+                        long local = row.get("localDialogId").getAsLong();
+                        publishDialogFacts(local, machine, row, observationStartedAt, observedAt, false);
                         TLRPC.TL_user user = new TLRPC.TL_user();
                         user.id = row.get("localDialogId").getAsLong();
                         user.first_name = row.has("title") && !row.get("title").isJsonNull()
@@ -680,12 +710,49 @@ public final class CodexRuntime {
         });
     }
 
-    /** 原顶栏读取展示状态；过期事实不继续显示运行或完成。 */
+    /** 原顶栏和列表读取同一事实，不从展示文字反推状态或待办种类。 */
     public static String statusText(long dialogId) {
-        Long at = statusTimes.get(dialogId);
-        if (at == null) return "同步中";
-        if (android.os.SystemClock.elapsedRealtime() - at > 15000) return "状态已过期";
-        return statusLabels.get(dialogId);
+        return status(dialogId).label;
+    }
+
+    /** 界面线程只读入口；没有事实、过期、断连与当前事实保持类型区分。 */
+    public static SessionStatus.Snapshot status(long dialogId) {
+        return statuses.get(dialogId, android.os.SystemClock.elapsedRealtime());
+    }
+
+    /** 现有会话元数据的只读投影；工作目录不是另行推测的项目身份。 */
+    public static final class ConversationInfo {
+        public final String title, machineId, machineName, workingDirectory;
+        /** 返回完整真值，标题与电脑名的省略交原版控件处理。 */
+        private ConversationInfo(String title, String machineId, String machineName, String workingDirectory) {
+            this.title = title; this.machineId = machineId; this.machineName = machineName;
+            this.workingDirectory = workingDirectory;
+        }
+    }
+
+    /** 只读当前已发现对话，不因点开标题增加网络或文件读取。 */
+    public static ConversationInfo conversationInfo(long dialogId) {
+        String machine = dialogMachines.getOrDefault(dialogId, "");
+        return new ConversationInfo(dialogTitles.getOrDefault(dialogId, "未命名对话"), machine,
+                machineNames.getOrDefault(machine, ""), dialogDirectories.getOrDefault(dialogId, ""));
+    }
+
+    /** 供“我的”使用的最小账号概况，不包含认证材料或内部账号标识。 */
+    public static final class AccountInfo {
+        public final String loginName, server, connectionLabel;
+        /** 仅封装已有登录显示值及当前传输状态。 */
+        private AccountInfo(String loginName, String server, String connectionLabel) {
+            this.loginName = loginName; this.server = server; this.connectionLabel = connectionLabel;
+        }
+    }
+
+    /** 只读 volatile 账号快照，不等待后台连接所持的类锁；服务器连接不等于电脑在线。 */
+    public static AccountInfo accountInfo() {
+        PasswordLogin.Session currentSession = session;
+        if (currentSession == null || loggingOut) return new AccountInfo("", SERVER, "未登录");
+        DesktopConnection connection = desktop;
+        return new AccountInfo(currentSession.loginName, currentSession.server, connection == null ? "尚未连接"
+                : connection.isConnected() ? "服务器已连接" : "连接已中断");
     }
 
     /** 按对话所属电脑观察状态，不能复用其他电脑的实时状态。 */
@@ -698,6 +765,8 @@ public final class CodexRuntime {
                 if (generation != watchGeneration) return;
                 long nextDelay = 5000;
                 String label = "连接暂不可用";
+                JsonObject statusResponse = null;
+                long observationStartedAt = android.os.SystemClock.elapsedRealtime();
                 try {
                     DesktopConnection connection = dialogConnection(dialogId);
                     if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
@@ -721,7 +790,9 @@ public final class CodexRuntime {
                             observationRenewAt = android.os.SystemClock.elapsedRealtime() + 30000;
                         }
                         if (generation != watchGeneration) return;
+                        observationStartedAt = android.os.SystemClock.elapsedRealtime();
                         JsonObject response = connection.status(remoteIds.get(dialogId), linked);
+                        statusResponse = response;
                         label = SessionStatus.label(response);
                         // 仅已验证协议和在线状态的同步等待可以加快，未知或离线仍按原频率。
                         // attach 返回时基线可能尚未到达；最多额外追踪三次，不能无限高频轮询。
@@ -743,11 +814,12 @@ public final class CodexRuntime {
                         }
                     }
                 } catch (Exception error) { observationRenewAt = 0; /* 请求失败明确展示，并在恢复后重新续租。 */ }
-                final String observed = label;
+                final JsonObject observed = statusResponse;
+                final long startedAt = observationStartedAt;
+                final long receivedAt = android.os.SystemClock.elapsedRealtime();
                 AndroidUtilities.runOnUIThread(() -> {
                     if (generation != watchGeneration) return;
-                    statusLabels.put(dialogId, observed);
-                    statusTimes.put(dialogId, android.os.SystemClock.elapsedRealtime());
+                    statuses.observation(dialogId, dialogMachine(dialogId), observed, startedAt, receivedAt);
                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
                 });
                 if (generation == watchGeneration) statusQueue.postRunnable(this, nextDelay);
@@ -1047,9 +1119,13 @@ public final class CodexRuntime {
         if (listRefreshScheduled) return;
         listRefreshScheduled = true;
         AndroidUtilities.runOnUIThread(new Runnable() {
+            /** 原列表周期也发布失效重绘；即使请求尚未返回，旧事实仍按15秒到期。 */
             @Override public void run() {
                 if (!isAccountCurrent(accountEpoch)) return;
-                if (!ApplicationLoader.mainInterfacePaused) refreshDialogs(account);
+                if (!ApplicationLoader.mainInterfacePaused) {
+                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
+                    refreshDialogs(account);
+                }
                 AndroidUtilities.runOnUIThread(this, 15000);
             }
         }, 15000);
@@ -1058,6 +1134,24 @@ public final class CodexRuntime {
     private static DialogStore dialogStore() {
         return new DialogStore(new java.io.File(ApplicationLoader.applicationContext.getNoBackupFilesDir(), "codex-dialogs"),
                 session.server, session.accountId);
+    }
+
+    /** 列表和电脑子页共用候选消费点，既发布状态也保留原始标题和工作目录。 */
+    private static void publishDialogFacts(long dialogId, String machine, JsonObject candidate,
+            long startedAt, long receivedAt, boolean cached) {
+        statuses.candidate(dialogId, machine, candidate, startedAt, receivedAt, cached);
+        dialogTitles.put(dialogId, candidate.has("title") && candidate.get("title").isJsonPrimitive()
+                ? candidate.get("title").getAsString() : "未命名对话");
+        String directory = "";
+        JsonObject details = candidate.has("details") && candidate.get("details").isJsonObject() ? candidate.getAsJsonObject("details") : null;
+        if (details != null) for (String field : new String[]{"cwd", "path"}) {
+            if (details.has(field) && details.get(field).isJsonPrimitive() && details.get(field).getAsJsonPrimitive().isString()
+                    && !details.get(field).getAsString().trim().isEmpty()) {
+                directory = details.get(field).getAsString();
+                break;
+            }
+        }
+        dialogDirectories.put(dialogId, directory);
     }
 
     /** 最近列表上限只影响列表与预取，不删除历史和待发记录。 */
@@ -1078,7 +1172,8 @@ public final class CodexRuntime {
     }
 
     /** 后台预先保存编号，再把列表投递到原界面；界面线程不执行磁盘写入。 */
-    private static void publishDialogs(int account, String machine, com.google.gson.JsonArray candidates) {
+    private static void publishDialogs(int account, String machine, com.google.gson.JsonArray candidates,
+            long startedAt, long receivedAt, boolean cached) {
         final long accountEpoch = accountGeneration;
         if (!isAccountCurrent(accountEpoch)) return;
                 final Map<String, Long> publishedIds = new HashMap<>();
@@ -1096,6 +1191,7 @@ public final class CodexRuntime {
                         // 只作为本地原版列表的模型标识，不冒充 Telegram 用户认证或远端账号。
                         long local = publishedIds.get(remote);
                         if (local == 0) continue;
+                        publishDialogFacts(local, machine, candidate, startedAt, receivedAt, cached);
                         TLRPC.TL_user user = new TLRPC.TL_user();
                         user.id = local;
                         user.first_name = candidate.has("title") ? candidate.get("title").getAsString() : "未命名对话";
@@ -1124,7 +1220,7 @@ public final class CodexRuntime {
                 });
     }
 
-    /** 从真实电脑获取会话后适配到原 DialogsActivity 的模型，不创建新的列表页面。 */
+    /** 从真实电脑获取原列表；请求失败按原请求顺序失效状态，不冒充连接断开事件。 */
     public static void refreshDialogs(int account) {
         if (loading || !loggedIn()) return;
         final long accountEpoch = accountGeneration;
@@ -1140,16 +1236,24 @@ public final class CodexRuntime {
                     JsonObject cached = dialogStore().read();
                     if (cached != null) {
                         preferredMachine = cached.get("machineId").getAsString();
-                        publishDialogs(account, preferredMachine, cached.getAsJsonArray("candidates"));
+                        if (cached.has("machineName") && cached.get("machineName").isJsonPrimitive()
+                                && cached.get("machineName").getAsJsonPrimitive().isString())
+                            machineNames.put(preferredMachine, cached.get("machineName").getAsString());
+                        publishDialogs(account, preferredMachine, cached.getAsJsonArray("candidates"), -1, -1, true);
                     }
                 } catch (java.io.IOException error) { /* 损坏列表不影响重新联网取得。 */ }
             }
             String stage = "connect";
+            String requestedMachine = preferredMachine;
+            long observationStartedAt = android.os.SystemClock.elapsedRealtime();
             try {
                 if (desktop == null) desktop = openDesktop();
                 preferredMachine = desktop.machineId;
+                requestedMachine = desktop.machineId;
                 stage = "candidates";
+                observationStartedAt = android.os.SystemClock.elapsedRealtime();
                 JsonObject response = desktop.candidates(recentDialogLimit());
+                long observedAt = android.os.SystemClock.elapsedRealtime();
                 stage = "decode";
                 if (!response.has("candidates") || !response.get("candidates").isJsonArray())
                     throw new java.io.IOException("电脑会话列表格式无效");
@@ -1162,20 +1266,25 @@ public final class CodexRuntime {
                     if (candidate.has("title")) candidate.get("title").getAsString();
                 }
                 response.addProperty("machineId", desktop.machineId);
+                response.addProperty("machineName", desktop.machineName);
                 try { dialogStore().write(response); }
                 catch (java.io.IOException error) { /* 写缓存失败不丢弃已取得的列表。 */ }
-                publishDialogs(account, desktop.machineId, candidates);
+                publishDialogs(account, desktop.machineId, candidates, observationStartedAt, observedAt, false);
                 prefetchDialogs(candidates, desktop);
                 AndroidUtilities.runOnUIThread(() -> { if (isAccountCurrent(accountEpoch)) loading = false; });
             } catch (Exception error) {
                 // 仅记录阶段和异常类型，不输出响应正文、账号、密钥或电脑路径。
                 if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
                     android.util.Log.w("CodexBridge", "dialogs_failed stage=" + stage + " type=" + error.getClass().getSimpleName());
+                final String failedMachine = requestedMachine;
+                final long failedRequestStartedAt = observationStartedAt;
                 AndroidUtilities.runOnUIThread(() -> {
                     if (!isAccountCurrent(accountEpoch)) return;
+                    if (failedMachine != null) statuses.listFailed(failedMachine, failedRequestStartedAt);
                     loading = false;
                     loadError = "电脑会话暂时无法读取";
                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
+                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
                 });
             }
         });

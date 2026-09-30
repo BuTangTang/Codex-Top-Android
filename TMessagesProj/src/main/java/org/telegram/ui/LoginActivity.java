@@ -5607,7 +5607,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public void onNextPressed(String code) {
-            // 仅替换认证请求；复用原有加载动画、错误弹窗和会话页面切换。
+            // 复用原认证反馈；登录完成进入同一个三栏首页，与冷启动保持一致。
             if (com.butang.codextop.CodexRuntime.enabled()) {
                 if (nextPressed) return;
                 String password = codeField.getText().toString();
@@ -5624,7 +5624,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                             if (getParentActivity() != null && currentViewNum == VIEW_PASSWORD) {
                                 // 页面出现前切换原草稿文件，不能沿用登录页期间恢复的其他账号草稿。
                                 MediaDataController.getInstance(currentAccount).reloadCodexDrafts();
-                                presentFragment(new DialogsActivity(null), true);
+                                presentFragment(new MainTabsActivity(), true);
                             }
                         });
                     } catch (Exception error) {

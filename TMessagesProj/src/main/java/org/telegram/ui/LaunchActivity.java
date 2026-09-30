@@ -1088,7 +1088,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     /** Codex 直接进入原有账号页，跳过 Telegram 产品介绍和手机号注册入口。 */
     private BaseFragment getClientNotActivatedFragment() {
         if (com.butang.codextop.CodexRuntime.enabled()) {
-            return com.butang.codextop.CodexRuntime.loggedIn() ? new DialogsActivity(null) : new LoginActivity();
+            return com.butang.codextop.CodexRuntime.loggedIn() ? new MainTabsActivity() : new LoginActivity();
         }
         if (LoginActivity.loadCurrentState(false, currentAccount).getInt("currentViewNum", 0) != 0) {
             return new LoginActivity();

@@ -278,7 +278,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         showAccountChangeHint();
     }
 
+    /** Codex 电脑栏不申请通讯录权限，也不启用联系人同步。 */
     private void checkContactsTabBadge() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         if (tabsView != null && tabs[INDEX_CONTACTS] != null) {
             final boolean hasPermission = Build.VERSION.SDK_INT >= 23 && ContactsController.hasContactsPermission();
             if (hasPermission) {
@@ -300,6 +302,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         }
     }
 
+    /** 沿用原玻璃底栏，Codex 只提供会话、电脑和我的三个固定入口。 */
     @Override
     public View createView(Context context) {
         super.createView(context);
@@ -310,21 +313,28 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         tabsView.setPadding(dp(DialogsActivity.MAIN_TABS_MARGIN + 4), dp(DialogsActivity.MAIN_TABS_MARGIN + 4), dp(DialogsActivity.MAIN_TABS_MARGIN + 4), dp(DialogsActivity.MAIN_TABS_MARGIN + 4));
         tabsView.setMaxWidth(dp(328 + DialogsActivity.MAIN_TABS_MARGIN * 2));
 
-        tabs = new GlassTabView[5];
+        final boolean codex = com.butang.codextop.CodexRuntime.enabled();
+        tabs = new GlassTabView[codex ? 3 : 5];
         tabs[INDEX_CHATS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.CHATS, R.string.MainTabsChats);
-        tabs[INDEX_CONTACTS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.CONTACTS, R.string.MainTabsContacts);
+        tabs[INDEX_CONTACTS] = GlassTabView.createMainTab(context, resourceProvider,
+                codex ? GlassTabView.TabAnimation.DEVICE : GlassTabView.TabAnimation.CONTACTS, R.string.MainTabsContacts);
         tabs[INDEX_SETTINGS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.SETTINGS, R.string.Settings);
-        tabs[INDEX_CALLS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.CALLS, R.string.MainTabsCalls);
-        tabs[INDEX_PROFILE] = GlassTabView.createAvatar(context, resourceProvider, currentAccount, R.string.MainTabsProfile);
-        tabs[INDEX_CHATS].setOnLongClickListener(this::openFoldersSelector);
-        tabs[INDEX_CONTACTS].setOnLongClickListener(this::openContactsSelector);
-        tabs[INDEX_CALLS].setOnLongClickListener(this::openCallsSelector);
-        tabs[INDEX_PROFILE].setOnLongClickListener(this::openAccountSelector);
-
-        tabsView.addTabToIgnoreClick(tabs[INDEX_CHATS]);
-        tabsView.addTabToIgnoreClick(tabs[INDEX_CONTACTS]);
-        tabsView.addTabToIgnoreClick(tabs[INDEX_PROFILE]);
-        tabsView.addTabToIgnoreClick(tabs[INDEX_CALLS]);
+        if (codex) {
+            tabs[INDEX_CHATS].setText("会话");
+            tabs[INDEX_CONTACTS].setText("电脑");
+            tabs[INDEX_SETTINGS].setText("我的");
+        } else {
+            tabs[INDEX_CALLS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.CALLS, R.string.MainTabsCalls);
+            tabs[INDEX_PROFILE] = GlassTabView.createAvatar(context, resourceProvider, currentAccount, R.string.MainTabsProfile);
+            tabs[INDEX_CHATS].setOnLongClickListener(this::openFoldersSelector);
+            tabs[INDEX_CONTACTS].setOnLongClickListener(this::openContactsSelector);
+            tabs[INDEX_CALLS].setOnLongClickListener(this::openCallsSelector);
+            tabs[INDEX_PROFILE].setOnLongClickListener(this::openAccountSelector);
+            tabsView.addTabToIgnoreClick(tabs[INDEX_CHATS]);
+            tabsView.addTabToIgnoreClick(tabs[INDEX_CONTACTS]);
+            tabsView.addTabToIgnoreClick(tabs[INDEX_PROFILE]);
+            tabsView.addTabToIgnoreClick(tabs[INDEX_CALLS]);
+        }
 
         for (int index = 0; index < tabs.length; index++) {
             final GlassTabView view = tabs[index];
@@ -386,7 +396,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         updateLayoutWrapper = new UpdateLayoutWrapper(context);
         contentView.addView(updateLayoutWrapper, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.BOTTOM));
 
-        updateLayout = ApplicationLoader.applicationLoaderInstance.takeUpdateLayout(getParentActivity(), updateLayoutWrapper);
+        updateLayout = codex ? null : ApplicationLoader.applicationLoaderInstance.takeUpdateLayout(getParentActivity(), updateLayoutWrapper);
         if (updateLayout != null) {
             updateLayout.updateAppUpdateViews(currentAccount, false);
         }
@@ -765,9 +775,10 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
     }
 
 
+    /** 原版保留四页，Codex 的底栏和分页保持同样的三页数量。 */
     @Override
     protected int getFragmentsCount() {
-        return TABS_COUNT;
+        return com.butang.codextop.CodexRuntime.enabled() ? 3 : TABS_COUNT;
     }
 
     @Override
@@ -804,8 +815,15 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         return dialogsActivity;
     }
 
+    /** 电脑和我的复用原设置页；项目及聊天由该页继续压入原导航栈。 */
     @Override
     protected BaseFragment createBaseFragmentAt(int position) {
+        if (com.butang.codextop.CodexRuntime.enabled() && position != POSITION_CHATS) {
+            Bundle args = new Bundle();
+            args.putBoolean("hasMainTabs", true);
+            args.putBoolean("codexComputerBrowser", position == POSITION_CONTACTS);
+            return new SettingsActivity(args);
+        }
         if (position == POSITION_CONTACTS) {
             Bundle args = new Bundle();
             args.putBoolean("needPhonebook", true);
@@ -955,6 +973,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         return super.onApplyWindowInsets(v, consumed);
     }
 
+    /** 接收原导航通知，Codex 固定三栏不响应 Telegram 通话布局切换。 */
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.notificationsCountUpdated || id == NotificationCenter.updateInterfaces) {
@@ -991,6 +1010,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         } else if (id == NotificationCenter.needSetDayNightTheme) {
             clearAllHiddenFragments();
         } else if (id == NotificationCenter.callTabsVisibleToggled) {
+            if (com.butang.codextop.CodexRuntime.enabled()) return;
             final boolean callTabsVisible = getUserConfig().showCallsTab;
             checkUi_callTabVisible(callTabsVisible, true);
             if (viewPager != null && viewPager.getCurrentPosition() == POSITION_CALLS_OR_SETTINGS) {
@@ -1001,7 +1021,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
                 dropFragmentAtPosition(POSITION_CALLS_OR_SETTINGS);
             }
         } else if (id == NotificationCenter.mainUserInfoChanged) {
-            if (tabs != null && tabs[INDEX_PROFILE] != null) {
+            if (tabs != null && tabs.length > INDEX_PROFILE && tabs[INDEX_PROFILE] != null) {
                 tabs[INDEX_PROFILE].updateUserAvatar(currentAccount);
             }
         } else if (id == NotificationCenter.contactsPermissionBadgeCheck) {
@@ -1085,7 +1105,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         tabsView.setVisibility(factor > 0 ? View.VISIBLE : View.GONE);
     }
 
+    /** Codex 的第三栏固定为我的，不受原通话偏好影响。 */
     private void checkUi_callTabVisible(boolean callTabsVisible, boolean animated) {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         if (tabsView != null) {
             tabsView.setViewVisible(tabs[INDEX_SETTINGS], !callTabsVisible, animated);
             tabsView.setViewVisible(tabs[INDEX_CALLS], callTabsVisible, animated);
@@ -1156,7 +1178,9 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
     private HintView2 accountSwitchHint;
     private boolean accountSwitchHintShown;
 
+    /** Codex 不展示指向不存在的 Telegram 个人资料栏的提示。 */
     private void showAccountChangeHint() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         if (accountSwitchHintShown) return;
 
         if (accountSwitchHint == null && HintsController.Hint.AccountSwitchHint.show()) {

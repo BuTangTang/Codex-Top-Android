@@ -282,6 +282,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         super.clearViews();
     }
 
+    /** 原设置列表承载我的及电脑子栈，保留原版间距和返回动作。 */
     @Override
     public View createView(Context context) {
         contentView = new SizeNotifierFrameLayout(context) {
@@ -345,7 +346,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         };
 
-        actionBar.setBackButtonImage(R.drawable.ic_ab_back);
+        actionBar.setBackButtonImage(hasMainTabs && com.butang.codextop.CodexRuntime.enabled() ? 0 : R.drawable.ic_ab_back);
         actionBar.setAllowOverlayTitle(true);
         actionBar.setUseContainerForTitles();
         actionBar.setTitle(getString(R.string.Settings));
@@ -404,7 +405,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         };
         if (com.butang.codextop.CodexRuntime.enabled()) {
-            actionBar.setTitle(codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "设置");
+            actionBar.setTitle(codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "我的");
             searchItem.setVisibility(View.GONE);
             otherItem.setVisibility(codexBrowser() ? View.GONE : View.VISIBLE);
         } else {
@@ -412,7 +413,8 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         }
 
         listView = new UniversalRecyclerView(this, this::fillItems, this::onClick, this::onLongClick);
-        if (codexBrowser()) loadCodexBrowser();
+        // 常驻电脑栏由 onResume 每次进入刷新；子页仍只在创建时加载原分页。
+        if (codexBrowser() && !hasMainTabs) loadCodexBrowser();
         listView.adapter.setApplyBackground(false);
         listView.setSections();
         listView.setPadding(0, AndroidUtilities.statusBarHeight + dp(12), 0, AndroidUtilities.navigationBarHeight + additionNavigationBarHeight);
@@ -563,6 +565,17 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return fragmentView = contentView;
     }
 
+    /** 每次重新进入电脑栏只发起一次刷新，保留已有行及原列表滚动位置。 */
+    @Override
+    public void onResume() {
+        super.onResume();
+        if (codexBrowser() && hasMainTabs && listView != null) {
+            // 复用加载中的去重和失败保留数据逻辑；不清空列表、不重建布局管理器。
+            loadCodexBrowser();
+            listView.adapter.update(true);
+        }
+    }
+
     @Override
     public void onFragmentDestroy() {
         ++codexBrowseGeneration;
@@ -573,6 +586,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         getNotificationCenter().removeObserver(this, NotificationCenter.newSuggestionsAvailable);
     }
 
+    /** 我的资料随统一连接通知刷新，不在设置页新增网络查询。 */
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.starBalanceUpdated) {
@@ -582,6 +596,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         } else if (id == NotificationCenter.updateInterfaces) {
             setInfo();
+            if (com.butang.codextop.CodexRuntime.enabled() && !codexBrowser() && listView != null) {
+                listView.adapter.update(false);
+            }
         } else if (id == NotificationCenter.newSuggestionsAvailable) {
             if (listView != null) {
                 listView.adapter.update(true);
@@ -715,8 +732,21 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 items.add(UItem.asShadow(null));
                 return;
             }
+            com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
+            items.add(SettingCell.Factory.of(20, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.msg_info, "账号", TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName).setEnabled(false));
+            items.add(SettingCell.Factory.of(21, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.settings_devices, "连接状态", account.connectionLabel).setEnabled(false));
+            items.add(SettingCell.Factory.of(22, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.settings_data, "服务地址", account.server).setEnabled(false));
+            items.add(UItem.asShadow(null));
             items.add(SettingCell.Factory.of(6, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
                     R.drawable.settings_data, "最近会话条数", com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+            items.add(UItem.asShadow(null));
+            items.add(SettingCell.Factory.of(23, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.settings_data, "本地缓存", "已读取的聊天记录保存在本机，联网后自动更新").setEnabled(false));
+            items.add(SettingCell.Factory.of(24, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
+                    R.drawable.msg_info, "版本", getVersionName()).setEnabled(false));
             items.add(UItem.asShadow(null));
             return;
         }
@@ -880,6 +910,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         }
     }
 
+    /** 子页不继承主栏标记，返回时恢复原电脑页和列表位置。 */
     private void onClick(UItem item, View view, int position, float x, float y) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
             if (codexBrowser()) {
@@ -888,6 +919,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                     loadCodexBrowser();
                 } else if (item.id == 8) {
                     Bundle child = new Bundle(getArguments());
+                    child.remove("hasMainTabs");
                     child.putBoolean("codexConversations", true);
                     child.putString("codexTitle", "所有对话");
                     presentFragment(new SettingsActivity(child));
@@ -899,6 +931,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                         presentFragment(new ChatActivity(chat));
                     } else {
                         Bundle child = new Bundle(getArguments());
+                        child.remove("hasMainTabs");
                         if (getArguments().getString("codexMachine") == null) {
                             child.putString("codexMachine", row.get("id").getAsString());
                         } else {
@@ -1073,9 +1106,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return false;
     }
 
+    /** Codex 显示真实应用版本，不套用 Telegram 的渠道编号换算。 */
     public String getVersionName() {
         try {
             PackageInfo pInfo = ApplicationLoader.applicationContext.getPackageManager().getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0);
+            if (com.butang.codextop.CodexRuntime.enabled()) return pInfo.versionName + " (" + pInfo.versionCode + ")";
             int code = pInfo.versionCode / 10;
             String abi = "";
             switch (pInfo.versionCode % 10) {

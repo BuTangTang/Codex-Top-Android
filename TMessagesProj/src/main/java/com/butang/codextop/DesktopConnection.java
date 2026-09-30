@@ -85,7 +85,9 @@ public final class DesktopConnection implements AutoCloseable {
         Socket created = null;
         try {
             JsonObject metadata = JsonParser.parseString(crypto.decrypt(machine.get("metadata").getAsString())).getAsJsonObject();
-            machineName = metadata.has("host") ? metadata.get("host").getAsString() : "电脑";
+            // 缺失名称保持空值，由页面说明未知；不能把通用占位文案当作电脑真名。
+            machineName = metadata.has("host") && metadata.get("host").isJsonPrimitive()
+                    && metadata.get("host").getAsJsonPrimitive().isString() ? metadata.get("host").getAsString() : "";
             IO.Options options = new IO.Options();
             options.path = "/v1/updates/";
             options.forceNew = true;
@@ -110,7 +112,11 @@ public final class DesktopConnection implements AutoCloseable {
                 hasConnected = true;
             });
             socket.once(Socket.EVENT_CONNECT_ERROR, args -> connected.completeExceptionally(new IOException("实时连接失败")));
-            socket.on(Socket.EVENT_DISCONNECT, args -> failPending());
+            // 断连同时使列表事实失效，不能等用户重新打开聊天页才发现旧状态。
+            socket.on(Socket.EVENT_DISCONNECT, args -> {
+                failPending();
+                if (!closed) CodexRuntime.onDesktopDisconnected(this);
+            });
             watchNetwork();
             socket.connect();
             connected.get(20, TimeUnit.SECONDS);
@@ -165,6 +171,9 @@ public final class DesktopConnection implements AutoCloseable {
         for (CompletableFuture<JsonObject> result : pending)
             result.completeExceptionally(new IOException("连接已中断，发送结果需核对"));
     }
+
+    /** 当前传输的只读摘要；不能作为电脑在线、任务状态或执行权限的证明。 */
+    public boolean isConnected() { return !closed && socket.connected(); }
 
     /** 最近列表沿用单页请求，数量由用户设置。 */
     public JsonObject candidates(int limit) throws Exception {

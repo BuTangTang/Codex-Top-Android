@@ -3201,6 +3201,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
+    /** Codex 三栏首页沿用原会话列表，不再重复展示电脑和设置菜单入口。 */
     @Override
     public View createView(final Context context) {
         searching = false;
@@ -3443,6 +3444,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
         if (initialDialogsType == DIALOGS_TYPE_DEFAULT) {
             optionsItem = menu.addItem(4, R.drawable.ic_ab_other);
+            if (hasMainTabs && com.butang.codextop.CodexRuntime.enabled()) optionsItem.setVisibility(View.GONE);
             optionsItem.setContentDescription(LocaleController.getString(R.string.AccDescrMoreOptions));
             optionsItem.setOnClickListener(v -> {
                 getContactsController().loadGlobalPrivacySetting();
@@ -7021,6 +7023,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
+    /** 恢复原会话界面；Codex 不进入 Telegram 的权限及来电设置引导。 */
     @Override
     public void onResume() {
         super.onResume();
@@ -7055,7 +7058,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             tosAccepted = true;
         }
         final NotificationManager notificationManager = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
-        // Codex 当前只接文字会话，不请求上游通讯录、存储和通知权限。
+        // 三个并列权限分支都排除 Codex，避免第一段跳过后落入来电权限引导。
         if (!com.butang.codextop.CodexRuntime.enabled() && tosAccepted && folderId == 0 && communityId == 0 && checkPermission && !onlySelect && Build.VERSION.SDK_INT >= 23) {
             Activity activity = getParentActivity();
             if (activity != null) {
@@ -7101,7 +7104,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                     }
                 }, afterSignup && (hasNotContactsPermission || hasNotNotificationsPermission) ? 4000 : 0);
             }
-        } else if (!onlySelect && folderId == 0 && communityId == 0 && XiaomiUtilities.isMIUI() && !XiaomiUtilities.isCustomPermissionGranted(XiaomiUtilities.OP_SHOW_WHEN_LOCKED)) {
+        } else if (!com.butang.codextop.CodexRuntime.enabled() && !onlySelect && folderId == 0 && communityId == 0 && XiaomiUtilities.isMIUI() && !XiaomiUtilities.isCustomPermissionGranted(XiaomiUtilities.OP_SHOW_WHEN_LOCKED)) {
             if (getParentActivity() == null) {
                 return;
             }
@@ -7128,7 +7131,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                     .setNegativeButton(getString(R.string.ContactsPermissionAlertNotNow), (dialog, which) -> MessagesController.getGlobalNotificationsSettings().edit().putBoolean("askedAboutMiuiLockscreen", true).commit())
                     .create());
             }
-        } else if (folderId == 0 && communityId == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !notificationManager.canUseFullScreenIntent()) {
+        } else if (!com.butang.codextop.CodexRuntime.enabled() && folderId == 0 && communityId == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !notificationManager.canUseFullScreenIntent()) {
             if (getParentActivity() == null) {
                 return;
             }

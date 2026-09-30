@@ -552,11 +552,11 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
         openProfile(byAvatar, true, false);
     }
 
-    /** Codex 对话顶栏打开原审批弹窗，其余构建继续原资料页行为。 */
+    /** Codex 顶栏打开完整来源，审批入口只在来源页有真实待办时展示。 */
     public void openProfile(boolean byAvatar, boolean fromChatAnimation, boolean removeLast) {
         if (parentFragment != null && com.butang.codextop.CodexRuntime.enabled()
                 && com.butang.codextop.CodexRuntime.ownsConversation(parentFragment.getDialogId())) {
-            parentFragment.showCodexApprovals();
+            parentFragment.showCodexConversationInfo();
             return;
         }
         if (byAvatar && (AndroidUtilities.isTablet() || AndroidUtilities.displaySize.x > AndroidUtilities.displaySize.y || !avatarImageView.getImageReceiver().hasNotThumb())) {
@@ -1090,15 +1090,19 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
 
     private boolean showingSavedMessagesHint;
 
-    /** 更新原顶栏副标题；Codex 待处理状态提示可点击，其他状态仍使用真实观察值。 */
+    /** 原双行顶栏展示完整标题和状态/电脑，长名称沿原布局省略。 */
     public void updateSubtitle(boolean animated) {
         if (parentFragment == null) {
             return;
         }
         if (com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(parentFragment.getDialogId())) {
             lastSubtitle = null;
-            String state = com.butang.codextop.CodexRuntime.statusText(parentFragment.getDialogId());
-            setSubtitle("待处理".equals(state) ? "待处理 · 点击查看" : state);
+            long dialogId = parentFragment.getDialogId();
+            com.butang.codextop.CodexRuntime.ConversationInfo source = com.butang.codextop.CodexRuntime.conversationInfo(dialogId);
+            com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(dialogId);
+            setTitle(TextUtils.isEmpty(source.title) ? "未命名对话" : source.title);
+            setSubtitle(status.label + " · " + (TextUtils.isEmpty(source.machineName) ? "电脑未知" : source.machineName));
+            getSubtitleTextView().setVisibility(VISIBLE);
             return;
         }
         if (parentFragment.getChatMode() == ChatActivity.MODE_EDIT_BUSINESS_LINK) {

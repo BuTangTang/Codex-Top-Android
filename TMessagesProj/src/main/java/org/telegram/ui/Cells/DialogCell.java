@@ -3756,9 +3756,87 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         return drawArchive && (currentDialogFolderId != 0 || isTopic && forumTopic != null && forumTopic.id == 1) && translationX == 0 && archivedChatsDrawable != null;
     }
 
+    private org.telegram.ui.Components.RadialProgressView codexStatusProgress;
+    private Drawable codexStatusIcon;
+    private int codexStatusIconRes;
+    private final Paint codexStatusPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    /** 只替换真实 Codex 会话的头像内容，未读和原行尺寸保持独立。 */
+    private boolean hasCodexStatusAvatar() {
+        return currentDialogFolderId == 0 && com.butang.codextop.CodexRuntime.enabled()
+                && com.butang.codextop.CodexRuntime.ownsConversation(currentDialogId);
+    }
+
+    /** 使用统一快照和原进度/提示图形；过期、离屏、后台及减少动画时不驱动逐帧刷新。 */
+    private void drawCodexStatusAvatar(Canvas canvas) {
+        com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
+        boolean current = "current".equals(status.validity);
+        boolean running = current && "running".equals(status.state);
+        int colorKey = Theme.key_windowBackgroundWhiteGrayIcon;
+        int icon = R.drawable.msg_help;
+        if ("stale".equals(status.validity) || "syncing".equals(status.validity)) {
+            icon = R.drawable.msg_recent;
+        } else if ("unavailable".equals(status.validity)) {
+            icon = R.drawable.msg_warning;
+        } else if (current) {
+            switch (status.state) {
+                case "running":
+                    colorKey = Theme.key_windowBackgroundWhiteBlueText;
+                    icon = R.drawable.msg_recent;
+                    break;
+                case "completed":
+                    colorKey = Theme.key_windowBackgroundWhiteGreenText;
+                    icon = R.drawable.msg_text_check;
+                    break;
+                case "needs_input":
+                    colorKey = Theme.key_windowBackgroundWhiteBlueText;
+                    icon = R.drawable.msg_info;
+                    break;
+                case "failed":
+                    colorKey = Theme.key_text_RedRegular;
+                    icon = R.drawable.msg_warning;
+                    break;
+                case "cancelled":
+                    icon = R.drawable.msg_cancel;
+                    break;
+            }
+        }
+        int color = Theme.getColor(colorKey, resourcesProvider);
+        float cx = storyParams.originalAvatarRect.centerX();
+        float cy = storyParams.originalAvatarRect.centerY();
+        float radius = storyParams.originalAvatarRect.width() / 2f;
+        codexStatusPaint.setColor(ColorUtils.setAlphaComponent(color, 24));
+        canvas.drawCircle(cx, cy, radius, codexStatusPaint);
+        boolean animate = running && attachedToWindow && visibleOnScreen && isShown()
+                && getWindowVisibility() == VISIBLE && !ApplicationLoader.mainInterfacePaused
+                && (parentFragment == null || !parentFragment.isPaused())
+                && SharedConfig.animationsEnabled()
+                && (android.os.Build.VERSION.SDK_INT < 26 || android.animation.ValueAnimator.areAnimatorsEnabled());
+        if (animate) {
+            if (codexStatusProgress == null) {
+                codexStatusProgress = new org.telegram.ui.Components.RadialProgressView(getContext(), resourcesProvider);
+                codexStatusProgress.setSize(dp(26));
+                codexStatusProgress.setStrokeWidth(2);
+            }
+            codexStatusProgress.setProgressColor(color);
+            codexStatusProgress.draw(canvas, cx, cy);
+            postInvalidateOnAnimation();
+        } else {
+            if (codexStatusIcon == null || codexStatusIconRes != icon) {
+                codexStatusIconRes = icon;
+                codexStatusIcon = ContextCompat.getDrawable(getContext(), icon).mutate();
+            }
+            codexStatusIcon.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN));
+            int half = dp(14);
+            codexStatusIcon.setBounds((int) cx - half, (int) cy - half, (int) cx + half, (int) cy + half);
+            codexStatusIcon.draw(canvas);
+        }
+    }
+
     private GradientDrawable archiveFadeGradientDrawable;
     private int archiveFadeGradientDrawableColor;
 
+    /** 保持原列表绘制流程，仅在原头像槽绘制 Codex 任务状态。 */
     @SuppressLint("DrawAllocation")
     @Override
     protected void onDraw(Canvas canvas) {
@@ -4687,7 +4765,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
 
         if (drawAvatar && (!(isTopic && forumTopic != null && forumTopic.id == 1) || archivedChatsDrawable == null || !archivedChatsDrawable.isDraw())) {
-            if (drawMonoforumAvatar) {
+            if (hasCodexStatusAvatar()) {
+                drawCodexStatusAvatar(canvas);
+            } else if (drawMonoforumAvatar) {
                 if (bubbleClip == null) {
                     bubbleClip = new PhotoBubbleClip();
                 }
@@ -4739,7 +4819,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             canvas.restore();
         }
 
-        if (avatarImage.getVisible()) {
+        if (avatarImage.getVisible() && !hasCodexStatusAvatar()) {
             if (drawAvatarOverlays(canvas)) {
                 needInvalidate = true;
             }
@@ -5485,6 +5565,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
     }
 
+    /** 屏幕阅读器同时读出任务状态和未读数，图标颜色不作为唯一提示。 */
     @Override
     public void onPopulateAccessibilityEvent(AccessibilityEvent event) {
         super.onPopulateAccessibilityEvent(event);
@@ -5532,6 +5613,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 sb.append(chat.title);
                 sb.append(". ");
             }
+        }
+        if (hasCodexStatusAvatar()) {
+            sb.append(com.butang.codextop.CodexRuntime.status(currentDialogId).label).append(". ");
         }
         if (drawVerified) {
             sb.append(getString(R.string.AccDescrVerified));
@@ -6162,6 +6246,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         public long lastDrawnDialogId;
         public long lastDrawnMessageId;
         private int lastDrawnCodexDate;
+        private String lastDrawnCodexStatus;
         public boolean lastDrawnTranslated;
         public boolean lastDrawnDialogIsFolder;
         public long lastDrawnReadState;
@@ -6191,6 +6276,11 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 return false;
             }
             int codexDate = com.butang.codextop.CodexRuntime.enabled() ? dialog.last_message_date : 0;
+            String codexStatus = null;
+            if (hasCodexStatusAvatar()) {
+                com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
+                codexStatus = status.validity + ":" + status.state + ":" + status.pendingKind;
+            }
             int messageHash = message == null ? 0 : message.getId() + message.hashCode();
             Integer printingType = null;
             long readHash = dialog.read_inbox_max_id + ((long) dialog.read_outbox_max_id << 8) + ((long) (dialog.unread_count + (dialog.unread_mark ? -1 : 0)) << 16) +
@@ -6242,6 +6332,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             boolean translated = MessagesController.getInstance(currentAccount).getTranslateController().isTranslatingDialog(currentDialogId);
             if (lastDrawnSizeHash == sizeHash &&
                     lastDrawnCodexDate == codexDate &&
+                    TextUtils.equals(lastDrawnCodexStatus, codexStatus) &&
                     lastDrawnMessageId == messageHash &&
                     lastDrawnTranslated == translated &&
                     lastDrawnDialogId == currentDialogId &&
@@ -6280,6 +6371,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             lastDrawnDialogId = currentDialogId;
             lastDrawnMessageId = messageHash;
             lastDrawnCodexDate = codexDate;
+            lastDrawnCodexStatus = codexStatus;
             lastDrawnDialogIsFolder = dialog.isFolder;
             lastDrawnReadState = readHash;
             lastDrawnPrintingType = printingType;
