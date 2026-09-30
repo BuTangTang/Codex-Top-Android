@@ -693,8 +693,8 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             slideViewsContainer.addView(views[a], LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.CENTER, AndroidUtilities.isTablet() ? 26 : 18, needsTopMargin ? 30 : 0, AndroidUtilities.isTablet() ? 26 : 18, 0));
         }
 
-        // Codex 沿用原邮箱输入页与密码页，只替换账号业务；不恢复短信验证流程。
-        if (com.butang.codextop.CodexRuntime.enabled()) currentViewNum = VIEW_ADD_EMAIL;
+        // Codex 沿用原手机号页的布局输入账号，再进入原密码页。
+        if (com.butang.codextop.CodexRuntime.enabled()) currentViewNum = VIEW_PHONE_INPUT;
         Bundle savedInstanceState = activityMode == MODE_LOGIN && !com.butang.codextop.CodexRuntime.enabled() ? loadCurrentState(newAccount, currentAccount) : null;
         if (savedInstanceState != null) {
             int viewNum = savedInstanceState.getInt("currentViewNum", 0);
@@ -1097,7 +1097,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
     public boolean onBackPressed(boolean invoked) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
             if (currentViewNum == VIEW_PASSWORD) {
-                if (invoked) setPage(VIEW_ADD_EMAIL, true, null, true);
+                if (invoked) setPage(VIEW_PHONE_INPUT, true, null, true);
                 return false;
             }
             return true;
@@ -2023,6 +2023,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 .show();
         }
 
+        /** 沿用原手机号页，Codex 模式仅替换账号文字并删除电话专属入口。 */
         public PhoneView(Context context) {
             super(context);
 
@@ -2288,9 +2289,10 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
             phoneField = new AnimatedPhoneNumberEditText(context) {
 
+                // 清空账号后退格仍留在账号框，不跳入已隐藏的区号框。
                 @Override
                 public boolean onKeyDown(int keyCode, KeyEvent event) {
-                    if (keyCode == KeyEvent.KEYCODE_DEL && phoneField.length() == 0) {
+                    if (!com.butang.codextop.CodexRuntime.enabled() && keyCode == KeyEvent.KEYCODE_DEL && phoneField.length() == 0) {
                         codeField.requestFocus();
                         codeField.setSelection(codeField.length());
                         codeField.dispatchKeyEvent(event);
@@ -2348,7 +2350,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 private int actionPosition;
 
                 @Override
+                // 账号允许字母和符号，跳过电话号码的插入/删除格式化。
                 public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                    if (com.butang.codextop.CodexRuntime.enabled()) return;
                     if (count == 0 && after == 1) {
                         characterAction = 1;
                     } else if (count == 1 && after == 0) {
@@ -2364,7 +2368,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 }
 
                 @Override
+                // 粘贴账号时保留原文，不拆出国家区号。
                 public void onTextChanged(CharSequence s, int start, int before, int count) {
+                    if (com.butang.codextop.CodexRuntime.enabled()) return;
                     if (!ENABLE_PASTED_TEXT_PROCESSING || ignoreOnPhoneChange || ignoreOnPhoneChangePaste) {
                         return;
                     }
@@ -2405,7 +2411,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 }
 
                 @Override
+                // Codex 账号不应用数字过滤和手机号分组。
                 public void afterTextChanged(Editable s) {
+                    if (com.butang.codextop.CodexRuntime.enabled()) return;
                     if (ignoreOnPhoneChange) {
                         return;
                     }
@@ -2466,7 +2474,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             });
 
             int bottomMargin = 72;
-            if (newAccount && activityMode == MODE_LOGIN) {
+            if (!com.butang.codextop.CodexRuntime.enabled() && newAccount && activityMode == MODE_LOGIN) {
                 syncContactsBox = new CheckBoxCell(context, 2);
                 syncContactsBox.setText(getString("SyncContacts", R.string.SyncContacts), "", syncContacts, false);
                 addView(syncContactsBox, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.LEFT | Gravity.TOP, 16, 0, 16 + (LocaleController.isRTL && AndroidUtilities.isSmallScreen() ? 56 : 0), 0));
@@ -2487,7 +2495,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             }
 
             final boolean allowTestBackend = (BuildVars.DEBUG_VERSION || TEST_BACKEND_IN_STORE && !BuildConfig.BUNDLE) || getConnectionsManager().isTestBackend();
-            if (allowTestBackend && activityMode == MODE_LOGIN) {
+            if (!com.butang.codextop.CodexRuntime.enabled() && allowTestBackend && activityMode == MODE_LOGIN) {
                 testBackendCheckBox = new CheckBoxCell(context, 2);
                 testBackendCheckBox.setText(getString(R.string.DebugTestBackend), "", testBackend = getConnectionsManager().isTestBackend(), false);
                 addView(testBackendCheckBox, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.LEFT | Gravity.TOP, 16, 0, 16 + (LocaleController.isRTL && AndroidUtilities.isSmallScreen() ? 56 : 0), 0));
@@ -2512,6 +2520,22 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 Space bottomSpacer = new Space(context);
                 bottomSpacer.setMinimumHeight(AndroidUtilities.dp(bottomMargin));
                 addView(bottomSpacer, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
+            }
+
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                titleView.setText("登录 Codex Top");
+                subtitleView.setText("使用与电脑相同的账号");
+                countryOutlineView.setVisibility(GONE);
+                plusTextView.setVisibility(GONE);
+                codeField.setVisibility(GONE);
+                codeDividerView.setVisibility(GONE);
+                phoneOutlineView.setText("账号");
+                // 删除国家行后，账号框承接原首个输入框与说明之间的间距。
+                ((MarginLayoutParams) phoneOutlineView.getLayoutParams()).topMargin = dp(24);
+                phoneField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+                phoneField.setContentDescription("账号");
+                phoneField.requestFocus();
+                return;
             }
 
             HashMap<String, String> languageMap = new HashMap<>();
@@ -2718,8 +2742,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
 
         @Override
+        // 账号使用系统文本键盘；原手机号流程仍使用原数字键盘。
         public boolean hasCustomKeyboard() {
-            return true;
+            return !com.butang.codextop.CodexRuntime.enabled();
         }
 
         @Override
@@ -2867,8 +2892,20 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
 
         @Override
+        /** 账号使用原下一步与翻页动画，不进入电话确认或短信认证。 */
         public void onNextPressed(String code) {
             if (getParentActivity() == null || nextPressed || isRequestingFirebaseSms) {
+                return;
+            }
+
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                String account = phoneField.getText().toString().trim();
+                if (account.isEmpty() || account.length() > 128) {
+                    onFieldError(phoneOutlineView, false);
+                    return;
+                }
+                codexLoginName = account;
+                setPage(VIEW_PASSWORD, true, new Bundle(), false);
                 return;
             }
 
@@ -3259,8 +3296,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
 
         private boolean numberFilled;
+        /** Codex 账号不读取 SIM 或申请电话权限。 */
         public void fillNumber() {
-            if (numberFilled || activityMode != MODE_LOGIN) {
+            if (com.butang.codextop.CodexRuntime.enabled() || numberFilled || activityMode != MODE_LOGIN) {
                 return;
             }
             try {
@@ -3379,8 +3417,19 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
 
         @Override
+        /** 显示账号页时直接聚焦文本框，保留原延时唤起键盘的行为。 */
         public void onShow() {
             super.onShow();
+            if (com.butang.codextop.CodexRuntime.enabled()) {
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (currentViewNum == VIEW_PHONE_INPUT && phoneField != null) {
+                        phoneField.requestFocus();
+                        phoneField.setSelection(phoneField.length());
+                        showKeyboard(phoneField);
+                    }
+                }, SHOW_DELAY);
+                return;
+            }
             fillNumber();
             if (syncContactsBox != null) {
                 syncContactsBox.setChecked(syncContacts, false);
@@ -3487,12 +3536,15 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
 
         @Override
+        // 保持导航和无障碍标题与当前账号页一致。
         public String getHeaderName() {
-            return getString("YourPhone", R.string.YourPhone);
+            return com.butang.codextop.CodexRuntime.enabled() ? "登录 Codex Top" : getString("YourPhone", R.string.YourPhone);
         }
 
         @Override
+        // 账号不写入 Telegram 的手机号恢复状态。
         public void saveStateParams(Bundle bundle) {
+            if (com.butang.codextop.CodexRuntime.enabled()) return;
             String code = codeField.getText().toString();
             if (code.length() != 0) {
                 bundle.putString("phoneview_code", code);
@@ -3504,7 +3556,9 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
 
         @Override
+        // Codex 账号页不接受旧手机号状态预填。
         public void restoreStateParams(Bundle bundle) {
+            if (com.butang.codextop.CodexRuntime.enabled()) return;
             String code = bundle.getString("phoneview_code");
             if (code != null) {
                 codeField.setText(code);
@@ -6072,13 +6126,6 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                     getParentActivity().startActivityForResult(googleClient.getSignInIntent(), BasePermissionsActivity.REQUEST_CODE_SIGN_IN_WITH_GOOGLE);
                 });
             });
-            if (com.butang.codextop.CodexRuntime.enabled()) {
-                titleView.setText("登录 Codex Top");
-                subtitleView.setText("使用与电脑相同的账号");
-                emailOutlineView.setText("账号");
-                emailField.setInputType(InputType.TYPE_CLASS_TEXT);
-                bottomContainer.setVisibility(GONE);
-            }
         }
 
         @Override
@@ -6095,7 +6142,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public boolean needBackButton() {
-            return !com.butang.codextop.CodexRuntime.enabled() && !emailChangeIsSuggestion;
+            return !emailChangeIsSuggestion;
         }
 
         @Override
@@ -6141,14 +6188,6 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
         @Override
         public void onNextPressed(String code) {
-            // 保留原有下一步按钮及翻页动画，账号无需经过 Telegram 邮件验证码。
-            if (com.butang.codextop.CodexRuntime.enabled()) {
-                String account = emailField.getText().toString().trim();
-                if (account.isEmpty() || account.length() > 128) { onPasscodeError(false); return; }
-                codexLoginName = account;
-                setPage(VIEW_PASSWORD, true, new Bundle(), false);
-                return;
-            }
             if (nextPressed) {
                 return;
             }

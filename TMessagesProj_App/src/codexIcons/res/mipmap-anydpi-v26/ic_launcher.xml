@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/iconBackground"/>
-    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+    <foreground>
+        <!-- 透明品牌源经系统遮罩后，标志约占可见图标的 62%。 -->
+        <inset android:drawable="@mipmap/ic_launcher_foreground"
+            android:insetLeft="16%" android:insetTop="16%"
+            android:insetRight="16%" android:insetBottom="16%"/>
+    </foreground>
 </adaptive-icon>

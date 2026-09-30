@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 沿原系统启动动画入口，只替换品牌；无底板、不延长应用启动等待。 -->
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt">
+    <aapt:attr name="android:drawable">
+        <vector android:width="320dp" android:height="320dp"
+            android:viewportWidth="320" android:viewportHeight="320">
+            <group android:pivotX="160" android:pivotY="160" android:scaleX="0.65" android:scaleY="0.65">
+            <group android:name="mark" android:pivotX="160" android:pivotY="160">
+                <path android:name="arc" android:fillColor="#00000000"
+                    android:strokeColor="#0670FF" android:strokeWidth="32"
+                    android:strokeLineCap="round"
+                    android:pathData="M186.7177,83.9709 A82,82 0,1 0,230.3172,194.6547"/>
+                <group android:name="dotScale" android:pivotX="232.2942" android:pivotY="129.9469">
+                    <path android:name="dot" android:fillColor="#FFA51F"
+                        android:pathData="M247.7942,129.9469 A15.5,15.5 0,1 1,216.7942,129.9469 A15.5,15.5 0,1 1,247.7942,129.9469"/>
+                </group>
+            </group>
+            </group>
+        </vector>
+    </aapt:attr>
+    <target android:name="mark"><aapt:attr name="android:animation"><set>
+        <objectAnimator android:propertyName="scaleX" android:valueFrom="0.9" android:valueTo="1" android:duration="450" android:valueType="floatType" android:interpolator="@android:interpolator/fast_out_slow_in"/>
+        <objectAnimator android:propertyName="scaleY" android:valueFrom="0.9" android:valueTo="1" android:duration="450" android:valueType="floatType" android:interpolator="@android:interpolator/fast_out_slow_in"/>
+    </set></aapt:attr></target>
+    <target android:name="arc"><aapt:attr name="android:animation">
+        <objectAnimator android:propertyName="strokeAlpha" android:valueFrom="0" android:valueTo="1" android:duration="250" android:valueType="floatType"/>
+    </aapt:attr></target>
+    <target android:name="dotScale"><aapt:attr name="android:animation"><set>
+        <objectAnimator android:propertyName="scaleX" android:valueFrom="0.75" android:valueTo="1" android:startOffset="180" android:duration="270" android:valueType="floatType" android:interpolator="@android:anim/overshoot_interpolator"/>
+        <objectAnimator android:propertyName="scaleY" android:valueFrom="0.75" android:valueTo="1" android:startOffset="180" android:duration="270" android:valueType="floatType" android:interpolator="@android:anim/overshoot_interpolator"/>
+    </set></aapt:attr></target>
+    <target android:name="dot"><aapt:attr name="android:animation">
+        <objectAnimator android:propertyName="fillAlpha" android:valueFrom="0" android:valueTo="1" android:startOffset="180" android:duration="150" android:valueType="floatType"/>
+    </aapt:attr></target>
+</animated-vector>

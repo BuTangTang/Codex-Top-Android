@@ -567,6 +567,25 @@ public final class CodexRuntime {
         return true;
     }
 
+    /** 只记录失败阶段、异常类型及已知协议原因，不记录消息、游标、会话身份或异常正文。 */
+    private static void logTranscriptFailure(String stage, Exception error, JsonObject page) {
+        if (!org.telegram.messenger.BuildVars.DEBUG_VERSION) return;
+        Throwable cause = error;
+        for (int i = 0; i < 3 && (cause instanceof java.util.concurrent.ExecutionException
+                || cause instanceof java.util.concurrent.CompletionException); i++) {
+            if (cause.getCause() == null || cause.getCause() == cause) break;
+            cause = cause.getCause();
+        }
+        String reason = "none";
+        com.google.gson.JsonElement value = page == null ? null : page.get("truncationReason");
+        if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()) {
+            String candidate = value.getAsString();
+            if ("source_discontinuity".equals(candidate) || "page_limit".equals(candidate)) reason = candidate;
+        }
+        android.util.Log.w("CodexBridge", "transcript_failed stage=" + stage
+                + " type=" + cause.getClass().getSimpleName() + " reason=" + reason);
+    }
+
     /** 原聊天页进入前台时跟随尾部游标；停止后旧响应不再投递到页面。 */
     public static void watchConversation(int account, long dialogId) {
         if (loggingOut || !loggedIn() || !ownsConversation(dialogId)) return;
@@ -598,7 +617,10 @@ public final class CodexRuntime {
                             try {
                                 if (generation == watchGeneration && connection == dialogConnection(dialogId))
                                     page = connection.readAfter(remote, previousCursor);
-                            } catch (Exception error) { /* 保留原记录，按失败间隔重试。 */ }
+                            } catch (Exception error) {
+                                logTranscriptFailure("tail_request", error, null);
+                                /* 保留原记录，按失败间隔重试。 */
+                            }
                             final JsonObject received = page;
                             Utilities.globalQueue.postRunnable(() -> {
                                 if (generation != watchGeneration) return;
@@ -643,7 +665,10 @@ public final class CodexRuntime {
                                                     + " continue=" + TranscriptWindow.hasPendingTail(received, previousCursor)
                                                     + " delay=" + nextDelay);
                                     }
-                                } catch (Exception error) { consecutiveTailPages = 0; /* 无效增量不清空已有正文。 */ }
+                                } catch (Exception error) {
+                                    logTranscriptFailure("tail_merge", error, received);
+                                    consecutiveTailPages = 0; /* 无效增量不清空已有正文。 */
+                                }
                                 if (generation == watchGeneration) Utilities.globalQueue.postRunnable(next, nextDelay);
                             });
                         });
@@ -970,7 +995,10 @@ public final class CodexRuntime {
                     try {
                         if (connection == desktop && !ApplicationLoader.mainInterfacePaused)
                             page = initial ? connection.transcript(remote) : connection.readAfter(remote, cursor);
-                    } catch (Exception error) { /* 下一次列表刷新重试，不把失败记为已同步。 */ }
+                    } catch (Exception error) {
+                        logTranscriptFailure(initial ? "prefetch_initial_request" : "prefetch_tail_request", error, null);
+                        /* 下一次列表刷新重试，不把失败记为已同步。 */
+                    }
                     final JsonObject received = page;
                     Utilities.globalQueue.postRunnable(() -> {
                         if (!isAccountCurrent(accountEpoch)) return;
@@ -994,7 +1022,10 @@ public final class CodexRuntime {
                                 pending.add(candidate);
                                 prefetchDialogs(pending, connection, catchupPages + 1);
                             }
-                        } catch (Exception error) { /* 保留已有正文，下一轮仍可重试。 */ }
+                        } catch (Exception error) {
+                            logTranscriptFailure(initial ? "prefetch_initial_merge" : "prefetch_tail_merge", error, received);
+                            /* 保留已有正文，下一轮仍可重试。 */
+                        }
                     });
                 });
             }
