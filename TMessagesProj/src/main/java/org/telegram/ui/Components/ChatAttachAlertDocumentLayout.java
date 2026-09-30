@@ -770,6 +770,7 @@ public class ChatAttachAlertDocumentLayout extends ChatAttachAlert.AttachAlertLa
         });
     }
 
+    /** 保留原选择流程，仅Codex已知超限沿已有错误框解释。 */
     private boolean onItemClick(View view, Object object) {
         boolean add;
         if (object instanceof ListItem) {
@@ -791,7 +792,14 @@ public class ChatAttachAlertDocumentLayout extends ChatAttachAlert.AttachAlertLa
                     showErrorBox(LocaleController.formatString("PassportUploadNotImage", R.string.PassportUploadNotImage));
                     return false;
                 }
-                if ((item.file.length() > FileLoader.DEFAULT_MAX_FILE_SIZE && !UserConfig.getInstance(UserConfig.selectedAccount).isPremium()) || item.file.length() > FileLoader.DEFAULT_MAX_FILE_SIZE_PREMIUM) {
+                // Codex按原对话电脑的已知实际容量选择；未知交原上传确认，不触发Telegram升级提示。
+                if (com.butang.codextop.CodexRuntime.ownsConversation(parentAlert.getDialogId())) {
+                    Long maximum = com.butang.codextop.CodexRuntime.attachmentUploadMaxBytes(parentAlert.getDialogId());
+                    if (maximum != null && item.file.length() > maximum) {
+                        showErrorBox("文件大小超过该电脑的上传上限（" + AndroidUtilities.formatFileSize(maximum) + "）");
+                        return false;
+                    }
+                } else if ((item.file.length() > FileLoader.DEFAULT_MAX_FILE_SIZE && !UserConfig.getInstance(UserConfig.selectedAccount).isPremium()) || item.file.length() > FileLoader.DEFAULT_MAX_FILE_SIZE_PREMIUM) {
                     LimitReachedBottomSheet limitReachedBottomSheet = new LimitReachedBottomSheet(parentAlert.baseFragment, parentAlert.getContainer().getContext(), LimitReachedBottomSheet.TYPE_LARGE_FILE, UserConfig.selectedAccount, null);
                     limitReachedBottomSheet.setVeryLargeFile(true);
                     limitReachedBottomSheet.show();

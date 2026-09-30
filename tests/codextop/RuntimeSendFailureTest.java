@@ -20,7 +20,8 @@ public final class RuntimeSendFailureTest {
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
         var unit = StaticJavaParser.parse(source.resolve("CodexRuntime.java"));
         var names = Set.of("sendBatch", "finishSend", "restoredPending", "pendingMessage", "canRetryMessage",
-                "isAccountCurrent", "attachmentCurrent", "transfer", "isAttachmentMessage", "attachmentUploadFailureCode");
+                "isAccountCurrent", "attachmentCurrent", "transfer", "isAttachmentMessage", "attachmentUploadFailureCode",
+                "dialogConnection", "attachmentUploadMaxBytes", "attachmentTooLarge");
         StringBuilder methods = new StringBuilder();
         int extracted = 0;
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
@@ -105,11 +106,12 @@ public final class RuntimeSendFailureTest {
                 /** 恢复原选择仅设置附件标识。 */static void applySelected(TLRPC.TL_message m,OutboxStore.Selection s){m.params.put("codexSelectedFile",s.localPath==null?"":s.localPath);}
             }
             static final class DesktopConnection {
-                int initCalls,sendCalls;int rejectAt=1;String error="File exceeds upload size limit",failStage;
-                String activeName,publicKey;Runnable onReject,onSend;
+                int initCalls,sendCalls,openCalls;int rejectAt=1;String error="File exceeds upload size limit",failStage;Long uploadLimit;boolean connected=true;
+                String activeName,publicKey;Runnable onReject,onSend,onLimit;
                 /** 合成原会话关联，允许验证同字错误不能误标上传失败。 */JsonObject openConversation(String remote)throws IOException{
-                    if("open".equals(failStage))throw new IOException(error);JsonObject r=new JsonObject();r.addProperty("sessionId","synthetic-linked");return r;
+                    openCalls++;if("open".equals(failStage))throw new IOException(error);JsonObject r=new JsonObject();r.addProperty("sessionId","synthetic-linked");return r;
                 }
+                /** 只替代连接已读能力，不生成默认值或发出新请求。 */Long attachmentUploadMaxBytes(){if(onLimit!=null){Runnable r=onLimit;onLimit=null;r.run();}return connected?uploadLimit:null;}
                 /** 合成远端只提供既有bulk响应，实际AttachmentTransfer负责上传与拒绝。 */JsonObject transfer(String method,JsonObject p)throws Exception{
                     JsonObject r=new JsonObject();r.addProperty("success",true);
                     if(method.endsWith("upload.init")){
@@ -133,10 +135,10 @@ public final class RuntimeSendFailureTest {
             static Path scenarioRoot;static OutboxStore store;static DesktopConnection connection;
             static final Map<String,Path> files=new HashMap<>();
             static final Map<Long,String> remoteIds=new HashMap<>(),dialogDirectories=new HashMap<>(),linkedSessions=new HashMap<>();
+            static final Map<Long,String> dialogMachines=new HashMap<>();static final Map<String,DesktopConnection> desktopConnections=new HashMap<>();
             static final Map<String,MessageObject> pendingMessages=new HashMap<>();
             static final Set<String> sendingBatches=new HashSet<>();static final Map<String,AttachmentState> attachmentStates=new HashMap<>();
             /** 只为已有合成会话开放归属。 */static boolean ownsConversation(long d){return remoteIds.containsKey(d);}
-            /** 合成电脑连接可在场景中替换或移除。 */static DesktopConnection dialogConnection(long d){return connection;}
             /** 真实附件暂存使用独立目录。 */static File attachmentDirectory(long d){return scenarioRoot.resolve("attachments").toFile();}
             /** 返回真实同账号电脑Outbox，避免镜像持久化算法。 */static OutboxStore outboxStore(long d){return store;}
             /** 选择边界提供合成文件，不读取真实手机数据。 */static File selectedAttachment(int a,SendMessageParams p){return p.path==null?null:new File(p.path);}
@@ -146,8 +148,9 @@ public final class RuntimeSendFailureTest {
             /** 不输出正文、路径或服务器错误。 */static void traceSend(String p,String id,long started){}
             /** 每组真实状态使用独立目录及合成账号。 */static void reset(Path root)throws Exception{
                 scenarioRoot=Files.createTempDirectory(root,"case-");accountGeneration++;session=new Object();loggingOut=false;onUiEnqueue=null;
-                files.clear();pendingMessages.clear();sendingBatches.clear();attachmentStates.clear();remoteIds.clear();dialogDirectories.clear();linkedSessions.clear();ui.tasks.clear();sendQueue.tasks.clear();
+                files.clear();pendingMessages.clear();sendingBatches.clear();attachmentStates.clear();remoteIds.clear();dialogDirectories.clear();linkedSessions.clear();dialogMachines.clear();desktopConnections.clear();ui.tasks.clear();sendQueue.tasks.clear();
                 remoteIds.put(1L,"synthetic-thread");dialogDirectories.put(1L,"/synthetic/workspace");store=new OutboxStore(scenarioRoot.resolve("outbox").toFile(),"server","account","machine");connection=new DesktopConnection();
+                dialogMachines.put(1L,"synthetic-machine");desktopConnections.put("synthetic-machine",connection);
                 try(var recipient=BulkTransferCrypto.createRecipient()){connection.publicKey=recipient.publicKeyBase64;}
             }
             /** 从原选择回调准备两件真实小文件。 */static void start()throws Exception{
@@ -174,6 +177,13 @@ public final class RuntimeSendFailureTest {
             /** 覆盖实际发送、落盘和迟到回调，不重写产品阶段判断。 */
             public static void main(String[] args)throws Exception{
                 Path root=Path.of(args[0]);String expected="file_too_large";
+                reset(root);connection.uploadLimit=2L;start();String oversized=base();sendQueue.all();ui.all();expectCode(expected);
+                check(connection.openCalls==0&&connection.initCalls==0&&connection.sendCalls==0&&store.get(oversized).attachments.isEmpty()
+                        &&store.get(oversized).selections.size()==2&&expected.equals(code(store.get(oversized))),"已知超限仍暂存、联网或丢原选择");
+                for(Long limit:new Long[]{null,3L,4L}){
+                    reset(root);connection.uploadLimit=limit;DesktopConnection other=new DesktopConnection();other.uploadLimit=1L;desktopConnections.put("other-machine",other);
+                    start();sendQueue.all();ui.all();expectCode(null);check(connection.sendCalls==1&&connection.initCalls==2&&other.openCalls==0&&other.initCalls==0,"旧机未知、小文件或所属电脑绑定改变原发送");
+                }
                 for(String reason:new String[]{"File exceeds upload size limit","File exceeds the server-routed transfer size limit"}){
                     reset(root);connection.failStage="upload";connection.error=reason;connection.rejectAt=2;start();String id=base();sendQueue.all();ui.all();expectCode(expected);
                     OutboxStore.Item saved=store.get(id);check(expected.equals(code(saved))&&saved.uploaded.size()==1&&!saved.submissionUncertain&&connection.sendCalls==0,"第二件超限丢失原因、上传前缀或进入桌面发送");
@@ -182,6 +192,19 @@ public final class RuntimeSendFailureTest {
                     restoredPending(0,1,saved,Set.of());check(!active.messageOwner.params.containsKey("codexSendFailure"),"磁盘旧原因覆盖活跃气泡");
                     pendingMessages.clear();check(restoredPending(0,1,saved,Set.of(TranscriptText.attachmentIdentity(id,0),TranscriptText.attachmentIdentity(id,1))).isEmpty(),"已回显批次被恢复");
                 }
+                reset(root);connection.failStage="upload";connection.rejectAt=2;start();String prefixId=base();sendQueue.all();ui.all();
+                connection.uploadLimit=2L;int prefixInit=connection.initCalls;retry();sendQueue.all();ui.all();expectCode(expected);
+                check(connection.initCalls==prefixInit&&store.get(prefixId).uploaded.size()==1&&store.get(prefixId).attachments.size()==2,"新限额导致已上传前缀重传或丢失");
+                Files.write(Path.of(store.get(prefixId).attachments.get(1).localPath),new byte[]{1});connection.uploadLimit=1L;retry();sendQueue.all();ui.all();
+                check(connection.initCalls==prefixInit+1&&connection.sendCalls==0,"已上传超新限额的前缀未跳过或改变文件绕过原摘要校验");
+                reset(root);connection.failStage="upload";connection.rejectAt=2;start();Files.write(files.get("second.bin"),new byte[]{1});prefixId=base();sendQueue.all();ui.all();
+                String priorPath=store.get(prefixId).uploaded.get(0).path;connection.uploadLimit=1L;connection.failStage=null;prefixInit=connection.initCalls;retry();sendQueue.all();ui.all();expectCode(null);
+                check(connection.initCalls==prefixInit+1&&connection.sendCalls==1&&store.get(prefixId).uploaded.size()==2&&store.get(prefixId).uploaded.get(0).path.equals(priorPath),"新小限额拒绝已上传大前缀或替换其路径");
+                reset(root);connection.uploadLimit=3L;start();String changed=base();
+                onUiEnqueue=()->{onUiEnqueue=null;try{Files.write(files.get("second.bin"),new byte[10]);}catch(IOException e){throw new RuntimeException(e);}};
+                sendQueue.all();ui.all();expectCode(expected);check(connection.initCalls==1&&connection.sendCalls==0&&store.get(changed).uploaded.size()==1&&store.get(changed).attachments.get(1).sizeBytes==10,"选择后增长未按最终实际大小拒绝或丢前缀");
+                reset(root);connection.uploadLimit=2L;start();String stale=base();connection.onLimit=()->accountGeneration++;sendQueue.all();ui.all();expectCode(null);
+                check(code(store.get(stale))==null&&connection.initCalls==0&&connection.sendCalls==0,"旧账号预检写回原因或继续上传");
                 for(String stage:new String[]{"upload","open","send","reject-send"}){
                     reset(root);connection.failStage=stage;connection.error=stage.equals("upload")?"synthetic generic error":"File exceeds upload size limit";start();String id=base();sendQueue.all();ui.all();expectCode(null);
                     check(code(store.get(id))==null,"泛错或非上传阶段错误误记大小原因");

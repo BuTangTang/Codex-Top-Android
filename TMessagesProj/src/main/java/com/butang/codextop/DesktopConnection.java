@@ -27,6 +27,8 @@ public final class DesktopConnection implements AutoCloseable {
     private android.net.ConnectivityManager.NetworkCallback networkCallback;
     private android.net.Network currentNetwork;
     private volatile boolean closed;
+    private volatile Long attachmentUploadMaxBytes;
+    private long attachmentUploadGeneration;
     // 仅 Socket.IO 事件线程读写；首次连接由 openDesktop 完成登记后唤醒。
     private boolean hasConnected;
 
@@ -108,7 +110,11 @@ public final class DesktopConnection implements AutoCloseable {
                 if (closed) return;
                 if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
                     android.util.Log.i("CodexBridge", "transport=" + (hasConnected ? "reconnected" : "connected"));
-                if (hasConnected) CodexRuntime.onDesktopConnected(this);
+                // 新实例能力本为空；首次ready不能使同连接的第一份列表失效。
+                if (hasConnected) {
+                    clearAttachmentUploadLimit();
+                    CodexRuntime.onDesktopConnected(this);
+                }
                 hasConnected = true;
             });
             socket.once(Socket.EVENT_CONNECT_ERROR, args -> connected.completeExceptionally(new IOException("实时连接失败")));
@@ -167,7 +173,9 @@ public final class DesktopConnection implements AutoCloseable {
         }
     }
 
+    /** 原断连入口同时清容量与在途请求，不自动重发任何操作。 */
     private void failPending() {
+        clearAttachmentUploadLimit();
         for (CompletableFuture<JsonObject> result : pending)
             result.completeExceptionally(new IOException("连接已中断，发送结果需核对"));
     }
@@ -175,17 +183,42 @@ public final class DesktopConnection implements AutoCloseable {
     /** 当前传输的只读摘要；不能作为电脑在线、任务状态或执行权限的证明。 */
     public boolean isConnected() { return !closed && socket.connected(); }
 
+    /** 只返回本连接已读的实际单文件上限；断线及旧机器缺字段均为未知。 */
+    public Long attachmentUploadMaxBytes() { return isConnected() ? attachmentUploadMaxBytes : null; }
+
+    /** 沿原连接生命周期清除能力，并阻止已完成旧列表在重连后迟到回写。 */
+    private synchronized void clearAttachmentUploadLimit() {
+        attachmentUploadMaxBytes = null;
+        attachmentUploadGeneration++;
+    }
+
     /** 最近列表沿用单页请求，数量由用户设置。 */
     public JsonObject candidates(int limit) throws Exception {
         return candidates(limit, null);
     }
 
-    /** 电脑全部会话按来源游标继续读取，不受首页最近列表上限截断。 */
+    /** 沿原来源游标读列表与可选容量，不受首页数量截断，也不追加能力请求。 */
     public JsonObject candidates(int limit, String cursor) throws Exception {
+        final long generation;
+        synchronized (this) { generation = attachmentUploadGeneration; }
         JsonObject params = base(null);
         params.addProperty("limit", Math.max(1, Math.min(500, limit)));
         if (cursor != null && !cursor.isEmpty()) params.addProperty("cursor", cursor);
-        return rpc("daemon.directSessions.candidates.list", params);
+        JsonObject response = rpc("daemon.directSessions.candidates.list", params);
+        Long maximum = null;
+        if (response.has("capabilities") && response.get("capabilities").isJsonObject()) {
+            JsonElement value = response.getAsJsonObject("capabilities").get("attachmentUploadMaxBytes");
+            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber()) {
+                try {
+                    long bytes = value.getAsBigDecimal().longValueExact();
+                    if (bytes > 0 && bytes <= 9007199254740991L) maximum = bytes;
+                } catch (ArithmeticException | NumberFormatException ignored) { }
+            }
+        }
+        synchronized (this) {
+            if (generation == attachmentUploadGeneration && isConnected()) attachmentUploadMaxBytes = maximum;
+        }
+        return response;
     }
 
     /** 项目来自指定电脑的真实配置；不能用最近会话路径拼造项目。 */

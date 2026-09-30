@@ -465,6 +465,18 @@ public final class CodexRuntime {
         return machine == null ? null : desktopConnections.get(machine);
     }
 
+    /** 只读原对话所属电脑已公布的实际容量，旧连接未知时不补默认值。 */
+    public static Long attachmentUploadMaxBytes(long dialogId) {
+        DesktopConnection connection = ownsConversation(dialogId) ? dialogConnection(dialogId) : null;
+        return connection == null ? null : connection.attachmentUploadMaxBytes();
+    }
+
+    /** 只提前拒绝已知超限的真实文件；缺失原件仍由原暂存和校验流程解释。 */
+    private static boolean attachmentTooLarge(long dialogId, File file) {
+        Long maximum = attachmentUploadMaxBytes(dialogId);
+        return maximum != null && file != null && file.isFile() && file.length() > maximum;
+    }
+
     /** 传输只发布实际字节；没有取消契约时不把进度伪装成可取消操作。 */
     public static final class AttachmentState {
         public final boolean active, upload, failed;
@@ -796,6 +808,14 @@ public final class CodexRuntime {
                 if (stored.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true, null); return; }
                 // 清除旧解释必须先落盘；失败时停止本次远端工作，不能留下新失败的旧原因。
                 if (stored.failureCode != null) outbox.markFailureCode(base, null);
+                // 完整选择已保存再预检；已上传前缀不再受新的上传上限约束或被重传。
+                for (int i = stored.uploaded.size(); i < stored.attachmentCount(); i++) {
+                    String path = i < stored.attachments.size() ? stored.attachments.get(i).localPath : stored.selections.get(i).localPath;
+                    if (attachmentTooLarge(dialogId, path == null ? null : new File(path))) {
+                        failureCode = OutboxStore.FAILURE_FILE_TOO_LARGE;
+                        throw new IOException("附件超过该电脑的上传上限");
+                    }
+                }
                 ArrayList<DesktopAttachment.Pending> staged = new ArrayList<>(stored.attachments);
                 for (int i = staged.size(); i < stored.selections.size(); i++) {
                     if (!isAccountCurrent(epoch)) return;
@@ -834,6 +854,11 @@ public final class CodexRuntime {
                     final String localId = TranscriptText.attachmentIdentity(base, i);
                     final String key = epoch + ":" + dialogId + ":" + localId;
                     AttachmentTransfer.Result result;
+                    // 选择后的文件或限额可能变化，实际上传前再次读取本件字节数。
+                    if (attachmentTooLarge(dialogId, new File(original.localPath))) {
+                        failureCode = OutboxStore.FAILURE_FILE_TOO_LARGE;
+                        throw new IOException("附件超过该电脑的上传上限");
+                    }
                     try {
                         result = transfer(epoch, dialogId, remote, transferConnection,
                                 (done, total) -> attachmentProgress(account, epoch, dialogId, remote, transferConnection, key, true, done, total))

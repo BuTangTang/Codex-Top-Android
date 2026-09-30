@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Set;
 import javax.tools.ToolProvider;
 
 /** 提取真实RPC方法，替代Socket、事件线程及密文边界，不复制产品响应判断。 */
@@ -20,16 +21,26 @@ public final class DesktopConnectionRpcTest {
         var unit = StaticJavaParser.parse(source.resolve("DesktopConnection.java"));
         StringBuilder methods = new StringBuilder();
         int extracted = 0;
+        var names=Set.of("rpc","candidates","base","isConnected","failPending","close",
+                "attachmentUploadMaxBytes","clearAttachmentUploadLimit");
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
-            if (method.getNameAsString().equals("rpc")) { methods.append(method).append('\n'); extracted++; }
+            if (names.contains(method.getNameAsString())) { methods.append(method).append('\n'); extracted++; }
         }
+        for(var field:unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class))
+            if(field.getVariables().stream().anyMatch(v->v.getNameAsString().equals("attachmentUploadMaxBytes")
+                    ||v.getNameAsString().equals("attachmentUploadGeneration")))methods.append(field).append('\n');
+        var connected=unit.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class).stream()
+                .filter(m->m.getNameAsString().equals("on")&&m.getArguments().size()==2&&m.getArgument(0).toString().equals("Socket.EVENT_CONNECT"))
+                .findFirst().orElseThrow();
+        methods.append("/** 提取原重连事件体，不复制失效逻辑。 */ void connectEvent()")
+                .append(connected.getArgument(1).asLambdaExpr().getBody()).append('\n');
         for (ClassOrInterfaceDeclaration type : unit.findAll(ClassOrInterfaceDeclaration.class)) {
             if (type.getNameAsString().equals("RpcNotDispatchedException")
                     || type.getNameAsString().equals("SendRejectedException")) {
                 methods.append(type).append('\n'); extracted++;
             }
         }
-        if (extracted != 3) throw new AssertionError("真实RPC入口发生变化，请核对夹具边界");
+        if (extracted < 9) throw new AssertionError("真实RPC入口发生变化，请核对夹具边界");
         Path temporary = Files.createTempDirectory("codex-desktop-rpc");
         try {
             Path probe = temporary.resolve("DesktopRpcProbe.java");
@@ -38,6 +49,10 @@ public final class DesktopConnectionRpcTest {
             compile.addAll(java.util.List.of("-cp", System.getProperty("java.class.path"), "-d", temporary.toString(),
                     probe.toString(), source.resolve("AttachmentTransfer.java").toString(),
                     source.resolve("BulkTransferCrypto.java").toString()));
+            Path build=temporary.resolve("BuildVars.java"),log=temporary.resolve("Log.java");
+            Files.writeString(build,"package org.telegram.messenger; public class BuildVars {public static final boolean DEBUG_VERSION=false;}");
+            Files.writeString(log,"package android.util; public class Log {/** 不输出真实诊断。 */ public static int i(String a,String b){return 0;}}");
+            compile.add(build.toString());compile.add(log.toString());
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(String[]::new)) != 0)
                 throw new AssertionError("真实RPC夹具编译失败");
             try (var loader = new URLClassLoader(new java.net.URL[]{temporary.toUri().toURL()}, DesktopConnectionRpcTest.class.getClassLoader())) {
@@ -63,15 +78,17 @@ public final class DesktopConnectionRpcTest {
         import java.util.*;
         import java.util.concurrent.*;
         import org.json.JSONObject;
-        public final class DesktopRpcProbe {
+        public final class DesktopRpcProbe implements AutoCloseable {
             boolean closed;
-            final String machineId="synthetic-machine";
+            boolean hasConnected;
+            String machineId="synthetic-machine";
             final Set<CompletableFuture<JsonObject>> pending=new HashSet<>();
             final Crypto crypto=new Crypto();
             final Socket socket=new Socket();
             static final class Crypto {
                 static final String PREFIX="synthetic-cipher:";
                 int decryptCalls;
+                /** 密钥释放仅计合成边界，不处理真实密钥。 */void close(){}
                 /** 标识请求已进入合成加密边界，不调用真实凭据。 */
                 String encrypt(String plain){return PREFIX+plain;}
                 /** 模拟成功解密及解密拒绝，产品内的响应解析保持原代码。 */
@@ -99,6 +116,7 @@ public final class DesktopConnectionRpcTest {
                 int emitted;
                 Object[] reply;
                 Object[] lateReply;
+                Runnable afterReply;
                 JSONObject request;
                 /** 只读取合成连接状态。 */
                 boolean connected(){return connected;}
@@ -108,7 +126,15 @@ public final class DesktopConnectionRpcTest {
                     emitted++;request=(JSONObject)args[0];
                     if(timeout)ack.onTimeout();else ack.onSuccess(reply);
                     if(lateReply!=null)ack.onSuccess(lateReply);
+                    if(afterReply!=null)afterReply.run();
                 }
+                /** 不操作真实Socket，仅模拟断线。 */void disconnect(){connected=false;}
+                /** 不保存真实事件监听。 */void off(){}
+            }
+            static final class CodexRuntime {/** 不触发真实状态刷新。 */static void onDesktopConnected(Object c){}}
+            /** 平台网络监听释放不参与本片容量判断。 */void unwatchNetwork(){}
+            /** 修复前允许不存在的getter得到null，以实际候选行为断言RED。 */Long known()throws Exception{
+                try{return (Long)getClass().getDeclaredMethod("attachmentUploadMaxBytes").invoke(this);}catch(NoSuchMethodException absent){return null;}
             }
             /** 构造已成功通过外层确认的合成密文封套。 */
             static JSONObject envelope(String body){return new JSONObject().put("ok",true).put("result",Crypto.PREFIX+body);}
@@ -133,6 +159,29 @@ public final class DesktopConnectionRpcTest {
             public static void main(String[] args)throws Exception {
                 final String bulk="daemon.bulkTransfer.upload.init";
                 final String send="daemon.directSessions.send";
+                DesktopRpcProbe capacity=probe("{\\"ok\\":true,\\"candidates\\":[],\\"capabilities\\":{\\"attachmentUploadMaxBytes\\":4096}}");
+                // 原once先唤醒构造调用方，此时后续CONNECT监听可能尚未执行。
+                EventThread.beforeRun=capacity::connectEvent;
+                capacity.candidates(100);check(Long.valueOf(4096).equals(capacity.known())&&capacity.socket.emitted==1,"初连监听把当前首次列表上限当作迟到响应丢弃");
+                JsonObject sourceParams=JsonParser.parseString(capacity.socket.request.getString("params").substring(Crypto.PREFIX.length())).getAsJsonObject();
+                check("codex".equals(sourceParams.get("providerId").getAsString())&&"codexHome".equals(sourceParams.getAsJsonObject("source").get("kind").getAsString())
+                        &&capacity.machineId.equals(sourceParams.get("machineId").getAsString()),"限额读取绕过原来源或所属电脑");
+                for(long maximum:new long[]{1,2147483648L,9007199254740991L}){
+                    capacity.socket.reply=new Object[]{envelope("{\\"ok\\":true,\\"candidates\\":[],\\"capabilities\\":{\\"attachmentUploadMaxBytes\\":"+maximum+"}}")};
+                    capacity.candidates(100);check(Long.valueOf(maximum).equals(capacity.known()),"实际正安全上限被截断或省略");
+                }
+                for(String raw:new String[]{"null","0","-1","1.5","1e100","9007199254740992","\\"4096\\"","true","{}","[]"}){
+                    capacity.socket.reply=new Object[]{envelope("{\\"ok\\":true,\\"candidates\\":[],\\"capabilities\\":{\\"attachmentUploadMaxBytes\\":"+raw+"}}")};
+                    capacity.candidates(100);check(capacity.known()==null,"坏上限被接受或旧上限未清除");
+                }
+                capacity.socket.reply=new Object[]{envelope("{\\"ok\\":true,\\"candidates\\":[]}")};capacity.candidates(100);check(capacity.known()==null,"旧机缺字段补造默认值");
+                capacity.socket.reply=new Object[]{envelope("{\\"ok\\":true,\\"candidates\\":[],\\"capabilities\\":{\\"attachmentUploadMaxBytes\\":4096}}")};
+                capacity.candidates(100);capacity.failPending();check(capacity.known()==null,"断开没有清原限额");
+                capacity.candidates(100);capacity.connectEvent();check(capacity.known()==null,"重连没有清原限额");
+                final DesktopRpcProbe reconnect=capacity;capacity.socket.afterReply=()->{reconnect.socket.connected=false;reconnect.failPending();reconnect.socket.connected=true;reconnect.connectEvent();};
+                capacity.candidates(100);check(capacity.known()==null,"断开重连后迟到旧列表写回原限额");capacity.socket.afterReply=null;
+                capacity.candidates(100);DesktopRpcProbe otherMachine=probe("{\\"ok\\":true,\\"candidates\\":[]}");otherMachine.machineId="other-machine";otherMachine.candidates(100);
+                check(otherMachine.known()==null&&Long.valueOf(4096).equals(capacity.known()),"不同电脑限额串用");capacity.close();check(capacity.known()==null,"关闭后保留上限");
                 String rejected="{\\"success\\":false,\\"error\\":\\"File exceeds upload size limit\\",\\"detail\\":{\\"synthetic\\":true}}";
                 DesktopRpcProbe p=probe(rejected);
                 JsonObject returned=p.rpc(bulk,params());
@@ -203,7 +252,7 @@ public final class DesktopConnectionRpcTest {
                     EventThread.beforeRun=()->{if(close)beforeEmit.closed=true;else beforeEmit.socket.connected=false;};
                     check(fails(beforeEmit,bulk) instanceof RpcNotDispatchedException&&beforeEmit.socket.emitted==0,"事件队列第二门禁失效");
                 }
-                System.out.println("DesktopConnectionRpc: 真实方法bulk失败传递、专用超限原因、畸形封套、解密、超时、原send及未派发语义通过");
+                System.out.println("DesktopConnectionRpc: 真实列表限额、坏值与机器来源、断开重连迟到清理、bulk失败、超时、原send及未派发语义通过");
             }
         """;
 }

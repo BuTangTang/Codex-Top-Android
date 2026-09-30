@@ -9241,6 +9241,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
     private final static int ERROR_TYPE_UNSUPPORTED = 1;
     private final static int ERROR_TYPE_FILE_TOO_LARGE = 2;
 
+    /** 文档仍沿原准备流程；Codex大小拒绝由其原发送owner处理，普通Telegram门禁保持。 */
     private static int prepareSendingDocumentInternal(AccountInstance accountInstance, String path, String originalPath, Uri uri, String mime, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, final ArrayList<TLRPC.MessageEntity> entities, final MessageObject editingMessageObject, long[] groupId, boolean isGroupFinal, CharSequence caption, boolean notify, int scheduleDate, int scheduleRepeatPeriod, Integer[] docType, boolean forceDocument, SendMessageChatArguments sendMessageChatArguments, long effectId, boolean invertMedia, long payStars, long monoForumPeerId, MessageSuggestionParams suggestionParams, PollSendParams pollSendParams, int pollIndex) {
         final long forcedPollGroupId = pollSendParams != null ? pollSendParams.groupId : 0;
 
@@ -9257,7 +9258,8 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         TLRPC.TL_documentAttributeAudio attributeAudio = null;
         String extension = null;
         if (uri != null && path == null) {
-            if (checkFileSize(accountInstance, uri)) {
+            // Codex容量由原发送owner统一预检，不以Telegram会员上限拒绝原文件。
+            if (!com.butang.codextop.CodexRuntime.ownsConversation(dialogId) && checkFileSize(accountInstance, uri)) {
                 return ERROR_TYPE_FILE_TOO_LARGE;
             }
             boolean hasExt = false;
@@ -9282,7 +9284,8 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
             return ERROR_TYPE_UNSUPPORTED;
         }
 
-        if (!FileLoader.checkUploadFileSize(accountInstance.getCurrentAccount(), f.length())) {
+        // 系统文件入口同样沿Codex原失败气泡处理，普通Telegram保留原检查。
+        if (!com.butang.codextop.CodexRuntime.ownsConversation(dialogId) && !FileLoader.checkUploadFileSize(accountInstance.getCurrentAccount(), f.length())) {
             return ERROR_TYPE_FILE_TOO_LARGE;
         }
 
