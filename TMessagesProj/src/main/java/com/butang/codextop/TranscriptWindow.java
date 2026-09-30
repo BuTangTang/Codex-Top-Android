@@ -16,6 +16,7 @@ public final class TranscriptWindow {
     }
     private final TreeMap<Integer, Entry> entries = new TreeMap<>();
     private final HashMap<String, Integer> sourceIds = new HashMap<>();
+    private final HashMap<String, Integer> localIds = new HashMap<>();
     private int oldest = 1_000_000_000;
     public String cursor;
     public String tailCursor;
@@ -47,6 +48,7 @@ public final class TranscriptWindow {
             content.addProperty("type", "text");
             content.addProperty("text", entry.message.text);
             raw.add("content", content);
+            if (!entry.message.attachments.isEmpty()) raw.add("meta", DesktopAttachment.meta(entry.message.attachments));
             item.add("raw", raw);
             row.add("item", item);
             rows.add(row);
@@ -75,8 +77,9 @@ public final class TranscriptWindow {
                 if (number < window.oldest || parsed.size() != 1 || window.entries.containsKey(number)
                         || window.sourceIds.containsKey(parsed.get(0).id)) throw new IOException("缓存消息身份无效");
                 TranscriptText text = parsed.get(0);
+                if (window.containsMessage(text)) continue;
                 window.entries.put(number, new Entry(number, text));
-                window.sourceIds.put(text.id, number);
+                window.remember(text, number);
             }
             return window;
         } catch (RuntimeException error) { throw new IOException("缓存格式无效", error); }
@@ -93,15 +96,18 @@ public final class TranscriptWindow {
             throw new IOException("历史游标无法继续");
         ArrayList<TranscriptText> fresh = new ArrayList<>();
         java.util.HashSet<String> seen = new java.util.HashSet<>();
+        java.util.HashSet<String> seenLocal = new java.util.HashSet<>();
         for (TranscriptText text : TranscriptText.read(page.getAsJsonArray("items"))) {
-            if (!sourceIds.containsKey(text.id) && seen.add(text.id)) fresh.add(text);
+            if (containsMessage(text) || !seen.add(text.id)) continue;
+            if (hasLocalIdentity(text) && !seenLocal.add(text.localId)) continue;
+            fresh.add(text);
         }
         if (oldest <= fresh.size()) throw new IOException("本地消息编号已满");
         int first = oldest - fresh.size();
         for (int i = 0; i < fresh.size(); i++) {
             Entry entry = new Entry(first + i, fresh.get(i));
             entries.put(entry.id, entry);
-            sourceIds.put(entry.message.id, entry.id);
+            remember(entry.message, entry.id);
         }
         oldest = first;
         cursor = next;
@@ -122,15 +128,35 @@ public final class TranscriptWindow {
         ArrayList<Entry> added = new ArrayList<>();
         int latest = entries.isEmpty() ? 1_000_000_000 : entries.lastKey();
         for (TranscriptText text : TranscriptText.read(page.getAsJsonArray("items"))) {
-            if (sourceIds.containsKey(text.id)) continue;
+            if (containsMessage(text)) continue;
             if (latest == Integer.MAX_VALUE) throw new IOException("本地消息编号已满");
             Entry entry = new Entry(++latest, text);
             entries.put(entry.id, entry);
-            sourceIds.put(text.id, entry.id);
+            remember(text, entry.id);
             added.add(entry);
         }
         if (page.has("nextCursor") && !page.get("nextCursor").isJsonNull()) tailCursor = page.get("nextCursor").getAsString();
         return added;
+    }
+
+    /** 同一原发送的回显可有不同记录id，但不能生成第二条气泡或改掉稳定编号。 */
+    private boolean containsMessage(TranscriptText text) {
+        if (sourceIds.containsKey(text.id)) return true;
+        Integer number = hasLocalIdentity(text) ? localIds.get(text.localId) : null;
+        if (number == null) return false;
+        sourceIds.put(text.id, number);
+        return true;
+    }
+
+    /** 发送身份仅属于用户消息，助手即使携带同名字段也不能吞掉其回答。 */
+    private static boolean hasLocalIdentity(TranscriptText text) {
+        return text.outgoing && text.localId != null && !text.localId.isEmpty();
+    }
+
+    /** 正文和附件共享原消息编号与localId索引，不建立第二套消息缓存。 */
+    private void remember(TranscriptText text, int number) {
+        sourceIds.put(text.id, number);
+        if (hasLocalIdentity(text)) localIds.put(text.localId, number);
     }
 
     /** 仅明确分页截断且游标前进时立即追赶；空闲、来源断档及坏响应不加速。 */

@@ -63,8 +63,61 @@ public final class TranscriptWindowTest {
             new TranscriptWindow().prepend(JsonParser.parseString("{\"items\":[],\"hasMore\":true}").getAsJsonObject());
             throw new AssertionError("接受了缺失游标");
         } catch (IOException expected) { }
+        attachmentSnapshotsAndEchoes();
         System.out.println("TranscriptWindow: 重叠去重、旧页顺序、完整性与游标校验通过");
     }
+    /** 附件沿原正文缓存落盘，重复localId回声不增气泡也不改稳定消息编号。 */
+    private static void attachmentSnapshotsAndEchoes() throws Exception {
+        var root = java.nio.file.Files.createTempDirectory("codex-attachment-history");
+        try {
+            var page = JsonParser.parseString("{\"items\":[" + item("attachment-source")
+                    + "],\"hasMore\":false,\"historyAvailability\":\"available\"}").getAsJsonObject();
+            var original = page.getAsJsonArray("items").get(0).getAsJsonObject();
+            original.addProperty("localId", "same-upload");
+            original.getAsJsonObject("raw").getAsJsonObject("content").addProperty("text", "");
+            original.getAsJsonObject("raw").add("meta", JsonParser.parseString(
+                    "{\"happier\":{\"kind\":\"attachments.v1\",\"payload\":{\"attachments\":[{\"name\":\"sample.png\",\"kind\":\"image\",\"path\":\"/computer/sample.png\",\"sizeBytes\":99,\"mimeType\":\"image/png\"},{\"name\":\"reply.txt\",\"kind\":\"file\",\"availability\":\"unavailable\",\"reason\":\"missing\"}]}}}"));
+            TranscriptWindow window = new TranscriptWindow(); window.prepend(page);
+            int id = window.before(0, 2).get(1).id;
+            var store = new TranscriptStore(root.toFile(), "server", "account", "machine");
+            store.write("thread", window);
+            window = new TranscriptStore(root.toFile(), "server", "account", "machine").read("thread");
+            var rows = window.before(0, 10);
+            var restored = rows.get(1);
+            if (rows.size() != 2 || restored.id != id || !restored.message.text.isEmpty() || restored.message.attachments.size() != 1
+                    || !"/computer/sample.png".equals(restored.message.attachments.get(0).path)
+                    || restored.message.attachments.get(0).sizeBytes != 99 || rows.get(0).message.attachments.get(0).isAvailable()
+                    || !rows.get(0).message.id.equals("attachment-source:attachment:1")
+                    || !rows.get(0).message.localId.equals("same-upload:attachment:1"))
+                throw new AssertionError("附件元数据落盘重开丢失");
+            var echo = original.deepCopy(); echo.addProperty("id", "another-desktop-id");
+            var delta = new com.google.gson.JsonObject(); var echoes = new com.google.gson.JsonArray(); echoes.add(echo);
+            delta.add("items", echoes); delta.addProperty("nextCursor", "new-tail");
+            if (!window.append(delta).isEmpty() || window.before(0, 10).size() != 2 || window.before(0, 2).get(1).id != id)
+                throw new AssertionError("同一附件localId回显生成第二条消息");
+            store.write("thread", window); window = store.read("thread");
+            if (!window.append(delta).isEmpty() || window.before(0, 10).size() != 2)
+                throw new AssertionError("附件缓存重开后重复展开或重复回显");
+            var assistant = echo.deepCopy(); assistant.addProperty("id", "assistant-answer");
+            assistant.getAsJsonObject("raw").addProperty("role", "agent");
+            echoes.add(assistant);
+            if (window.append(delta).size() != 2) throw new AssertionError("助手附件被用户localId吞掉");
+            var saved = window.snapshot();
+            window = TranscriptWindow.restore(saved);
+            if (!window.snapshot().equals(saved) || !window.append(delta).isEmpty())
+                throw new AssertionError("多附件再次快照往返改变了身份或重复添加");
+            var overlapping = new TranscriptWindow();
+            page.getAsJsonArray("items").add(echo);
+            overlapping.prepend(page);
+            if (overlapping.before(0, 10).size() != 2) throw new AssertionError("同页重复localId没有合并");
+        } finally {
+            try (var paths = java.nio.file.Files.walk(root)) {
+                for (var path : paths.sorted(java.util.Comparator.reverseOrder()).toArray(java.nio.file.Path[]::new))
+                    java.nio.file.Files.delete(path);
+            }
+        }
+    }
+
     /** 创建不含真实对话内容的最小文字消息。 */
     private static String item(String id) {
         return "{\"id\":\"" + id + "\",\"createdAtMs\":1000,\"raw\":{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"sample\"}}}";

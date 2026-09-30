@@ -31,7 +31,55 @@ public final class TranscriptTextTest {
                 || !visible.get(2).text.equals("```xml\n" + metadata + "\n```")
                 || !visible.get(3).text.equals("正文\n<oai-mem-citation>"))
             throw new AssertionError("内部引用过滤损坏可见正文");
+        JsonArray attachedItems = new JsonArray();
+        JsonObject attachmentOnly = item("attachment-only", "user", "text", "", null);
+        attachmentOnly.getAsJsonObject("raw").add("meta", com.google.gson.JsonParser.parseString(
+                "{\"happier\":{\"kind\":\"attachments.v1\",\"payload\":{\"attachments\":[{\"name\":\"sample.png\",\"kind\":\"image\",\"path\":\"/tmp/sample.png\"}]}}}"));
+        attachedItems.add(attachmentOnly);
+        ArrayList<TranscriptText> attached = TranscriptText.read(attachedItems);
+        if (attached.size() != 1 || attached.get(0).attachments.size() != 1
+                || !attached.get(0).text.isEmpty() || !attached.get(0).attachments.get(0).path.equals("/tmp/sample.png"))
+            throw new AssertionError("纯附件无文字的原消息被过滤或丢失引用");
+        JsonObject hiddenTool = item("attached-tool", "agent", "tool-call", "", null);
+        hiddenTool.getAsJsonObject("raw").add("meta", attachmentOnly.getAsJsonObject("raw").get("meta").deepCopy());
+        JsonObject hiddenChild = item("attached-child", "agent", "message", "", "child-id");
+        hiddenChild.getAsJsonObject("raw").add("meta", attachmentOnly.getAsJsonObject("raw").get("meta").deepCopy());
+        attachedItems.add(hiddenTool); attachedItems.add(hiddenChild);
+        if (TranscriptText.read(attachedItems).size() != 1) throw new AssertionError("工具或侧链附件生成了主对话气泡");
+        JsonObject attachmentReply = item("attachment-reply", "agent", "message", null, null);
+        attachmentReply.getAsJsonObject("raw").add("meta", com.google.gson.JsonParser.parseString(
+                "{\"happier\":{\"kind\":\"attachments.v1\",\"payload\":{\"attachments\":[{\"name\":\"cloud.txt\",\"kind\":\"file\",\"availability\":\"unavailable\",\"reason\":\"cloud_reference_unavailable\"}]}}}"));
+        attachedItems.add(attachmentReply);
+        attached = TranscriptText.read(attachedItems);
+        if (attached.size() != 2 || attached.get(1).outgoing || attached.get(1).attachments.get(0).isAvailable())
+            throw new AssertionError("助手纯附件的不可用引用没有保留");
+        multipleAttachmentRows();
         System.out.println("TranscriptText: 主对话文字、来源身份与工具过滤通过");
+    }
+
+    /** 同批文件仅在本地展开，第一行保留说明和原身份，其余行逐个派生身份。 */
+    private static void multipleAttachmentRows() {
+        JsonObject batch = item("batch", "user", "text", "同批说明", null);
+        batch.getAsJsonObject("raw").add("meta", DesktopAttachment.meta(java.util.List.of(
+                new DesktopAttachment("one.png", "image", "/computer/one.png", null, null, null, null, null),
+                new DesktopAttachment("two.txt", "file", "/computer/two.txt", null, null, null, null, null),
+                new DesktopAttachment("three.txt", "file", null, null, null, null, "unavailable", "missing"))));
+        String original = batch.toString();
+        JsonArray items = new JsonArray(); items.add(batch);
+        var rows = TranscriptText.read(items);
+        if (rows.size() != 3) throw new AssertionError("多附件未展开为独立原生消息");
+        for (int i = 0; i < rows.size(); i++) {
+            var row = rows.get(i);
+            String suffix = i == 0 ? "" : ":attachment:" + i;
+            if (!row.id.equals("batch" + suffix) || !row.localId.equals("local-batch" + suffix)
+                    || !row.text.equals(i == 0 ? "同批说明" : "") || row.attachments.size() != 1
+                    || row.createdAtMs != 1234 || !row.outgoing)
+                throw new AssertionError("多附件展开破坏原身份、说明或方向时间");
+        }
+        if (!batch.toString().equals(original)) throw new AssertionError("本地展开改写了原始协议");
+        batch.remove("localId");
+        for (TranscriptText row : TranscriptText.read(items))
+            if (row.localId != null) throw new AssertionError("缺失localId被生成了虚假发送身份");
     }
 
     /** 根据正式 raw 契约生成独立的合成消息。 */
