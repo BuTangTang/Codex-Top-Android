@@ -238,6 +238,23 @@ public class RadialProgressView extends View {
         updateAnimation();
     }
 
+    /** 按共享单调帧时间绘制原无限进度曲线；调用方控制刷新，新出现的控件直接进入同一相位。 */
+    public void drawIndeterminateAtTime(Canvas canvas, float cx, float cy, long frameTimeMs) {
+        final long cycleTime = (long) (risingTime * 2);
+        final long cycle = frameTimeMs / cycleTime;
+        final long phase = frameTimeMs % cycleTime;
+        final boolean rising = phase >= risingTime;
+        final float progress = (rising ? phase - risingTime : phase) / risingTime;
+        final float length = rising
+                ? 4 + 266 * accelerateInterpolator.getInterpolation(progress)
+                : 4 - 270 * (1f - decelerateInterpolator.getInterpolation(progress));
+        // 原曲线每次伸长结束后将起点前移 270 度。
+        final float offset = (360f * (frameTimeMs % (long) rotationTime) / rotationTime
+                + (cycle % 4) * 270f) % 360f;
+        cicleRect.set(cx - size / 2f, cy - size / 2f, cx + size / 2f, cy + size / 2f);
+        canvas.drawArc(cicleRect, offset, drawingCircleLenght = length, false, progressPaint);
+    }
+
     public boolean isCircle() {
         return Math.abs(drawingCircleLenght) >= 360;
     }

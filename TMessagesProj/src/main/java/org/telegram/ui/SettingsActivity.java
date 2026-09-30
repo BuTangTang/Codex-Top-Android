@@ -193,6 +193,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     private String codexBrowseCursor;
     private boolean codexBrowseLoaded;
     private boolean codexBrowseIncomplete;
+    private String codexBrowseRequestCursor;
 
     /** 使用原设置列表承载电脑和项目子页，保留原导航栈与转场。 */
     private boolean codexBrowser() {
@@ -205,42 +206,57 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return codexBrowser() && getArguments().getBoolean("codexConversations", false);
     }
 
-    /** 加载所选电脑或项目的下一页；退出后的旧响应不更新界面，失败保留原列表。 */
-    private void loadCodexBrowser() {
+    /** 原入口先接收本地快照，再静默更新；分页结果已由 Runtime 合并，页面不清空已有行。 */
+    private void loadCodexBrowser(boolean nextPage) {
         if (!codexBrowser() || codexBrowseLoading) return;
         codexBrowseLoading = true;
         codexBrowseError = null;
+        codexBrowseRequestCursor = nextPage ? codexBrowseCursor : null;
         int generation = ++codexBrowseGeneration;
+        com.butang.codextop.CodexRuntime.BrowseCallback callback = (snapshot, error, cached) -> {
+            if (generation != codexBrowseGeneration) return;
+            if (!cached) codexBrowseLoading = false;
+            codexBrowseError = error;
+            if (snapshot != null) applyCodexBrowse(snapshot);
+            updateCodexBrowserItems();
+        };
         if (codexConversations()) {
             com.butang.codextop.CodexRuntime.browseConversations(currentAccount,
                     getArguments().getString("codexMachine"), getArguments().getStringArrayList("codexRoots"),
-                    codexBrowseCursor, (page, error) -> {
-                if (generation != codexBrowseGeneration) return;
-                codexBrowseLoading = false;
-                codexBrowseError = error;
-                if (page != null) {
-                    if (codexBrowseCursor == null) codexBrowseRows = new com.google.gson.JsonArray();
-                    java.util.HashSet<Long> present = new java.util.HashSet<>();
-                    for (com.google.gson.JsonElement value : codexBrowseRows)
-                        present.add(value.getAsJsonObject().get("localDialogId").getAsLong());
-                    for (com.google.gson.JsonElement value : page.getAsJsonArray("candidates"))
-                        if (present.add(value.getAsJsonObject().get("localDialogId").getAsLong())) codexBrowseRows.add(value);
-                    codexBrowseCursor = page.has("nextCursor") && !page.get("nextCursor").isJsonNull()
-                            ? page.get("nextCursor").getAsString() : null;
-                    codexBrowseIncomplete = page.has("searchIncomplete") && page.get("searchIncomplete").getAsBoolean();
-                    codexBrowseLoaded = true;
-                }
-                if (listView != null) listView.adapter.update(true);
-            });
-            return;
+                    codexBrowseRequestCursor, callback);
+        } else {
+            com.butang.codextop.CodexRuntime.browseComputers(getArguments().getString("codexMachine"), callback);
         }
-        com.butang.codextop.CodexRuntime.browseComputers(getArguments().getString("codexMachine"), (rows, error) -> {
-            if (generation != codexBrowseGeneration) return;
-            codexBrowseLoading = false;
-            codexBrowseError = error;
-            if (rows != null) codexBrowseRows = rows;
-            if (listView != null) listView.adapter.update(true);
-        });
+        updateCodexBrowserItems();
+    }
+
+    /** 空 rows 也是成功加载过的缓存，回访不会重新展示首开加载态。 */
+    private void applyCodexBrowse(com.google.gson.JsonObject snapshot) {
+        codexBrowseRows = snapshot.getAsJsonArray("rows");
+        codexBrowseCursor = snapshot.has("nextCursor") && !snapshot.get("nextCursor").isJsonNull()
+                ? snapshot.get("nextCursor").getAsString() : null;
+        codexBrowseIncomplete = snapshot.has("searchIncomplete") && snapshot.get("searchIncomplete").getAsBoolean();
+        codexBrowseLoaded = true;
+    }
+
+    /** 沿原差异适配器更新，以可见实体及其像素偏移保存普通回访和增量刷新位置。 */
+    private void updateCodexBrowserItems() {
+        if (listView == null) return;
+        if (listView.isComputingLayout()) { listView.post(this::updateCodexBrowserItems); return; }
+        int first = listView.layoutManager.findFirstVisibleItemPosition();
+        UItem anchor = listView.adapter.getItem(first);
+        View anchorView = listView.layoutManager.findViewByPosition(first);
+        int offset = anchorView == null ? 0 : anchorView.getTop() - listView.getPaddingTop();
+        listView.adapter.update(true);
+        if (first > 0 && anchor != null && anchor.object2 instanceof String && anchorView != null) {
+            for (int i = 0; i < listView.adapter.getItemCount(); i++) {
+                UItem row = listView.adapter.getItem(i);
+                if (row != null && anchor.object2.equals(row.object2)) {
+                    listView.layoutManager.scrollToPositionWithOffset(i, offset);
+                    break;
+                }
+            }
+        }
     }
 
     public SettingsActivity() {
@@ -412,9 +428,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             search.loadFaqWebPage();
         }
 
+        // 同进程回访在首个布局前取得缓存；冷启动的磁盘读取由 Runtime 通用后台队列完成。
+        if (codexBrowser()) {
+            com.google.gson.JsonObject cached = com.butang.codextop.CodexRuntime.cachedBrowse(
+                    getArguments().getString("codexMachine"), getArguments().getStringArrayList("codexRoots"), codexConversations());
+            if (cached != null) applyCodexBrowse(cached);
+        }
         listView = new UniversalRecyclerView(this, this::fillItems, this::onClick, this::onLongClick);
-        // 常驻电脑栏由 onResume 每次进入刷新；子页仍只在创建时加载原分页。
-        if (codexBrowser() && !hasMainTabs) loadCodexBrowser();
         listView.adapter.setApplyBackground(false);
         listView.setSections();
         listView.setPadding(0, AndroidUtilities.statusBarHeight + dp(12), 0, AndroidUtilities.navigationBarHeight + additionNavigationBarHeight);
@@ -565,15 +585,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return fragmentView = contentView;
     }
 
-    /** 每次重新进入电脑栏只发起一次刷新，保留已有行及原列表滚动位置。 */
+    /** 每次进入浏览页沿原入口刷新一次；先保留本地行及多页位置。 */
     @Override
     public void onResume() {
         super.onResume();
-        if (codexBrowser() && hasMainTabs && listView != null) {
-            // 复用加载中的去重和失败保留数据逻辑；不清空列表、不重建布局管理器。
-            loadCodexBrowser();
-            listView.adapter.update(true);
-        }
+        if (codexBrowser() && listView != null) loadCodexBrowser(false);
     }
 
     @Override
@@ -710,22 +726,24 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 }
                 for (int i = 0; i < codexBrowseRows.size(); i++) {
                     com.google.gson.JsonObject row = codexBrowseRows.get(i).getAsJsonObject();
-                    String subtitle = conversations ? "" : computers ? (row.get("active").getAsBoolean() ? "在线" : "离线")
+                    String subtitle = conversations ? "" : row.has("cached") && row.get("cached").getAsBoolean() ? "状态未更新"
+                            : computers ? (row.get("active").getAsBoolean() ? "在线" : "离线")
                             : (row.get("available").getAsBoolean() ? "项目" : "暂不可用");
-                    items.add(SettingCell.Factory.of(1000 + i, IconBackgroundColors.BLUE_DEEP.top,
+                    String kind = conversations ? "conversations" : computers ? "computers" : "projects";
+                    items.add(SettingCell.Factory.ofBrowse(kind + ":" + com.butang.codextop.BrowseStore.identity(kind, row), row, IconBackgroundColors.BLUE_DEEP.top,
                             IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data,
                             conversations ? (row.has("title") && !row.get("title").isJsonNull()
                                     ? row.get("title").getAsString() : "未命名对话") : row.get("name").getAsString(), subtitle));
                 }
-                if (codexBrowseLoading || codexBrowseError != null || codexBrowseRows.isEmpty() || codexBrowseIncomplete) {
+                if ((!codexBrowseLoaded && codexBrowseLoading) || codexBrowseError != null || codexBrowseRows.isEmpty() || codexBrowseIncomplete) {
                     items.add(SettingCell.Factory.of(9, IconBackgroundColors.BLUE_DEEP.top,
                             IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data,
-                            codexBrowseLoading ? "正在加载" : codexBrowseError != null ? codexBrowseError
+                            !codexBrowseLoaded && codexBrowseLoading ? "正在加载" : codexBrowseError != null ? codexBrowseError
                                     : codexBrowseIncomplete ? "部分对话尚未读取" : conversations ? "当前页暂无匹配对话" : "暂无项目或电脑",
-                            codexBrowseLoading ? "" : "点击刷新"));
+                            !codexBrowseLoaded && codexBrowseLoading ? "" : "点击刷新"));
                 }
                 // 分页失败时上方已有原游标重试入口，避免同时展示两个相同操作。
-                if (conversations && codexBrowseCursor != null && !codexBrowseLoading && codexBrowseError == null) {
+                if (conversations && codexBrowseCursor != null && codexBrowseError == null) {
                     items.add(SettingCell.Factory.of(10, IconBackgroundColors.BLUE_DEEP.top,
                             IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data, "加载更多对话", ""));
                 }
@@ -915,16 +933,15 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         if (com.butang.codextop.CodexRuntime.enabled()) {
             if (codexBrowser()) {
                 if (item.id == 9 || item.id == 10) {
-                    if (item.id == 9 && codexBrowseError == null) codexBrowseCursor = null;
-                    loadCodexBrowser();
+                    loadCodexBrowser(item.id == 10 || (codexBrowseError != null && codexBrowseRequestCursor != null));
                 } else if (item.id == 8) {
                     Bundle child = new Bundle(getArguments());
                     child.remove("hasMainTabs");
                     child.putBoolean("codexConversations", true);
                     child.putString("codexTitle", "所有对话");
                     presentFragment(new SettingsActivity(child));
-                } else if (item.id >= 1000 && item.id - 1000 < codexBrowseRows.size()) {
-                    com.google.gson.JsonObject row = codexBrowseRows.get(item.id - 1000).getAsJsonObject();
+                } else if (item.id == 1000 && item.object instanceof com.google.gson.JsonObject) {
+                    com.google.gson.JsonObject row = (com.google.gson.JsonObject) item.object;
                     if (codexConversations()) {
                         Bundle chat = new Bundle();
                         chat.putLong("user_id", row.get("localDialogId").getAsLong());
@@ -935,7 +952,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                         if (getArguments().getString("codexMachine") == null) {
                             child.putString("codexMachine", row.get("id").getAsString());
                         } else {
-                            if (!row.get("available").getAsBoolean()) return;
+                            if (!row.get("available").getAsBoolean() && !(row.has("cached") && row.get("cached").getAsBoolean())) return;
                             ArrayList<String> roots = new ArrayList<>();
                             for (com.google.gson.JsonElement root : row.getAsJsonArray("rootPaths")) roots.add(root.getAsString());
                             child.putStringArrayList("codexRoots", roots);
@@ -1502,6 +1519,32 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 item.textValue = value;
                 item.longValue = ((long) iconColorBottom << 32) | (iconColorTop & 0xFFFFFFFFL);
                 return item;
+            }
+
+            /** 浏览行使用实体键而非行号或文字作为身份，点击负载保持当前页真实归属。 */
+            public static UItem ofBrowse(String key, com.google.gson.JsonObject row, int iconColorTop,
+                    int iconColorBottom, int icon, CharSequence title, CharSequence subtitle) {
+                UItem item = of(1000, iconColorTop, iconColorBottom, icon, title, subtitle);
+                item.object2 = key;
+                item.object = row;
+                return item;
+            }
+
+            /** 仅浏览实体启用稳定身份；原设置项仍使用原版判等规则。 */
+            @Override
+            public boolean equals(UItem a, UItem b) {
+                if (a.object2 instanceof String || b.object2 instanceof String)
+                    return a.id == b.id && java.util.Objects.equals(a.object2, b.object2);
+                return super.equals(a, b);
+            }
+
+            /** 标题、状态文字是内容变化，不能把同一电脑或项目变成一次删行加行。 */
+            @Override
+            public boolean contentsEquals(UItem a, UItem b) {
+                if (a.object2 instanceof String || b.object2 instanceof String)
+                    return equals(a, b) && TextUtils.equals(a.text, b.text) && TextUtils.equals(a.subtext, b.subtext)
+                            && TextUtils.equals(a.textValue, b.textValue) && a.iconResId == b.iconResId && a.longValue == b.longValue;
+                return super.contentsEquals(a, b);
             }
 
             public static UItem ofBot(TLRPC.TL_attachMenuBot attachMenuBot, int iconColorTop, int iconColorBottom, int icon) {

@@ -281,6 +281,8 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
     private class ItemInternal extends AdapterWithDiffUtils.Item {
 
         TLRPC.Dialog dialog;
+        private int codexDate;
+        private String codexTitle;
         TLRPC.RecentMeUrl recentMeUrl;
         TLRPC.TL_contact contact;
         boolean isForumCell;
@@ -343,9 +345,14 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             }
         }
 
+        /** 保存 Codex 展示字段快照，复用可变 Dialog 后仍能检测真实内容变化。 */
         public ItemInternal(int viewType, TLRPC.Dialog dialog) {
             super(viewType, true);
             this.dialog = dialog;
+            if (dialog != null && com.butang.codextop.CodexRuntime.enabled()) {
+                codexDate = dialog.last_message_date;
+                codexTitle = com.butang.codextop.CodexRuntime.conversationInfo(dialog.id).title;
+            }
             if (dialog != null) {
                 int currentId = dialogsStableIds.get(dialog.id, -1);
                 if (currentId >= 0) {
@@ -576,12 +583,12 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 return oldItems.get(oldItemPosition).compare(newItems.get(newItemPosition));
             }
 
-            /** Codex 列表没有 Telegram 消息更新事件，最近时间变化必须触发原单元格重新绑定。 */
+            /** Codex 只对标题或时间变化的稳定行重新绑定，其余行不因周期同步重建。 */
             @Override
             public boolean areContentsTheSame(int oldItemPosition, int newItemPosition) {
                 ItemInternal oldItem = oldItems.get(oldItemPosition), newItem = newItems.get(newItemPosition);
                 if (com.butang.codextop.CodexRuntime.enabled() && oldItem.dialog != null && newItem.dialog != null
-                        && oldItem.dialog.last_message_date != newItem.dialog.last_message_date) return false;
+                        && (oldItem.codexDate != newItem.codexDate || !java.util.Objects.equals(oldItem.codexTitle, newItem.codexTitle))) return false;
                 return oldItem.viewType == newItem.viewType;
             }
         };

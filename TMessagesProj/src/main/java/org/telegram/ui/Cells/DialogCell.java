@@ -3772,7 +3772,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
         boolean current = "current".equals(status.validity);
         boolean running = current && "running".equals(status.state);
-        int colorKey = Theme.key_windowBackgroundWhiteGrayIcon;
+        int colorKey = Theme.key_windowBackgroundWhiteGrayText;
         int icon = R.drawable.msg_help;
         if ("stale".equals(status.validity) || "syncing".equals(status.validity)) {
             icon = R.drawable.msg_recent;
@@ -3819,7 +3819,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 codexStatusProgress.setStrokeWidth(2);
             }
             codexStatusProgress.setProgressColor(color);
-            codexStatusProgress.draw(canvas, cx, cy);
+            // 同一 View 树共享单调绘制帧时间，滚动新出现的单元格也立即对齐原圆环相位。
+            codexStatusProgress.drawIndeterminateAtTime(canvas, cx, cy, getDrawingTime());
             postInvalidateOnAnimation();
         } else {
             if (codexStatusIcon == null || codexStatusIconRes != icon) {
@@ -3827,8 +3828,14 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 codexStatusIcon = ContextCompat.getDrawable(getContext(), icon).mutate();
             }
             codexStatusIcon.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN));
-            int half = dp(14);
-            codexStatusIcon.setBounds((int) cx - half, (int) cy - half, (int) cx + half, (int) cy + half);
+            // 原警示图是窄长感叹号，必须等比居中；强制正方形会把它拉伸成黑块。
+            int sourceWidth = Math.max(1, codexStatusIcon.getIntrinsicWidth());
+            int sourceHeight = Math.max(1, codexStatusIcon.getIntrinsicHeight());
+            float scale = dp(28) / (float) Math.max(sourceWidth, sourceHeight);
+            int width = Math.max(1, Math.round(sourceWidth * scale));
+            int height = Math.max(1, Math.round(sourceHeight * scale));
+            int left = Math.round(cx - width / 2f), top = Math.round(cy - height / 2f);
+            codexStatusIcon.setBounds(left, top, left + width, top + height);
             codexStatusIcon.draw(canvas);
         }
     }
@@ -6246,6 +6253,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         public long lastDrawnDialogId;
         public long lastDrawnMessageId;
         private int lastDrawnCodexDate;
+        private String lastDrawnCodexTitle;
         private String lastDrawnCodexStatus;
         public boolean lastDrawnTranslated;
         public boolean lastDrawnDialogIsFolder;
@@ -6265,7 +6273,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         long startWaitingTime;
 
 
-        /** 比较当前行的绘制依据；Codex 无 Telegram 消息编号更新时也要刷新最近时间。 */
+        /** 比较当前行的绘制依据；Codex 无 Telegram 消息编号更新时也要刷新标题和最近时间。 */
         public boolean update() {
             TLRPC.Dialog dialog = MessagesController.getInstance(currentAccount).dialogs_dict.get(currentDialogId);
             if (dialog == null) {
@@ -6275,9 +6283,12 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 }
                 return false;
             }
-            int codexDate = com.butang.codextop.CodexRuntime.enabled() ? dialog.last_message_date : 0;
+            // 只记实际参与布局的日期，避免非零 mask 提前把模型新日期标记为已绘制。
+            int codexDate = com.butang.codextop.CodexRuntime.enabled() ? lastMessageDate : 0;
+            String codexTitle = null;
             String codexStatus = null;
             if (hasCodexStatusAvatar()) {
+                codexTitle = com.butang.codextop.CodexRuntime.conversationInfo(currentDialogId).title;
                 com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
                 codexStatus = status.validity + ":" + status.state + ":" + status.pendingKind;
             }
@@ -6332,6 +6343,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             boolean translated = MessagesController.getInstance(currentAccount).getTranslateController().isTranslatingDialog(currentDialogId);
             if (lastDrawnSizeHash == sizeHash &&
                     lastDrawnCodexDate == codexDate &&
+                    TextUtils.equals(lastDrawnCodexTitle, codexTitle) &&
                     TextUtils.equals(lastDrawnCodexStatus, codexStatus) &&
                     lastDrawnMessageId == messageHash &&
                     lastDrawnTranslated == translated &&
@@ -6371,6 +6383,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             lastDrawnDialogId = currentDialogId;
             lastDrawnMessageId = messageHash;
             lastDrawnCodexDate = codexDate;
+            lastDrawnCodexTitle = codexTitle;
             lastDrawnCodexStatus = codexStatus;
             lastDrawnDialogIsFolder = dialog.isFolder;
             lastDrawnReadState = readHash;

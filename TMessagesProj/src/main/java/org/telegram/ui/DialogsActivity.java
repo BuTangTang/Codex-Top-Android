@@ -3442,9 +3442,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         });
         fragmentSearchFieldWatcher.setDoNotCloseAfterFieldEmpty();
 
-        if (initialDialogsType == DIALOGS_TYPE_DEFAULT) {
+        // Codex 首页已由底栏承载导航，不创建会被原可见性动画重新显示的更多入口。
+        if (initialDialogsType == DIALOGS_TYPE_DEFAULT
+                && !(hasMainTabs && com.butang.codextop.CodexRuntime.enabled())) {
             optionsItem = menu.addItem(4, R.drawable.ic_ab_other);
-            if (hasMainTabs && com.butang.codextop.CodexRuntime.enabled()) optionsItem.setVisibility(View.GONE);
             optionsItem.setContentDescription(LocaleController.getString(R.string.AccDescrMoreOptions));
             optionsItem.setOnClickListener(v -> {
                 getContactsController().loadGlobalPrivacySetting();
