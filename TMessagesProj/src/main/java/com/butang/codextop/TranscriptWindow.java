@@ -85,14 +85,58 @@ public final class TranscriptWindow {
         } catch (RuntimeException error) { throw new IOException("缓存格式无效", error); }
     }
 
+    /** 没有真实尾游标时重新读取最新页；不能因为旧缓存标为loaded就永久跳过。 */
+    public boolean needsTailBootstrap() {
+        return !loaded || tailCursor == null || tailCursor.isEmpty()
+                || needsVisibleHistory() && (cursor == null || cursor.isEmpty());
+    }
+
+    /** 空投影页仍可能有可显示的旧消息；沿已有历史游标继续，不能标记该版本已追平。 */
+    public boolean needsVisibleHistory() { return loaded && entries.isEmpty() && hasMore; }
+
+    /** 缺尾游标时只用缓存最新消息的真实连续锚点恢复，旧正文及编号均保持不变。 */
+    public ArrayList<Entry> recoverTail(JsonObject page) throws IOException {
+        String tail = page.has("tailCursor") && !page.get("tailCursor").isJsonNull()
+                ? page.get("tailCursor").getAsString() : null;
+        if (page.has("truncationReason") && !page.get("truncationReason").isJsonNull()
+                && "source_discontinuity".equals(page.get("truncationReason").getAsString()))
+            throw new IOException("消息来源出现断档");
+        if (entries.isEmpty()) {
+            prepend(page, true);
+            // 缺失尾游标仍保留实际正文；下一轮必须重新恢复，不能伪造追平。
+            tailCursor = tail;
+            return new ArrayList<>(entries.values());
+        }
+        if (tail == null || tail.isEmpty()) throw new IOException("最新页缺少尾部游标");
+        if (!page.has("items") || !page.get("items").isJsonArray()) throw new IOException("最新消息格式无效");
+        ArrayList<TranscriptText> source = TranscriptText.read(page.getAsJsonArray("items"));
+        int anchor = -1;
+        int latest = entries.lastKey();
+        for (int i = 0; i < source.size(); i++) {
+            TranscriptText text = source.get(i);
+            Integer known = sourceIds.get(text.id);
+            if (known == null && hasLocalIdentity(text)) known = localIds.get(text.localId);
+            if (known != null && known == latest && anchor < 0) anchor = i;
+            if (anchor >= 0 && known != null && known < latest) throw new IOException("最新页来源顺序不连续");
+        }
+        if (anchor < 0) throw new IOException("最新页缺少缓存连续锚点");
+        // 仅追加锚点之后的真实投影成员，多附件来源也不把锚点之前的项移到末尾。
+        ArrayList<Entry> added = appendMessages(source.subList(anchor + 1, source.size()));
+        tailCursor = tail;
+        return added;
+    }
+
     /** 接收从旧到新排列的上一页；过滤工具后仍沿真实游标继续，不按条数判断结束。 */
-    public void prepend(JsonObject page) throws IOException {
+    public void prepend(JsonObject page) throws IOException { prepend(page, false); }
+
+    /** 最新页恢复允许重复向旧游标；普通翻旧页仍要求游标前进，防止空页循环。 */
+    private void prepend(JsonObject page, boolean recoveringLatest) throws IOException {
         if (!page.has("items") || !page.get("items").isJsonArray() || !page.has("hasMore"))
             throw new IOException("历史消息格式无效");
         boolean more = page.get("hasMore").getAsBoolean();
         String next = page.has("nextCursor") && !page.get("nextCursor").isJsonNull()
                 ? page.get("nextCursor").getAsString() : null;
-        if (more && (next == null || next.isEmpty() || next.equals(cursor)))
+        if (more && (next == null || next.isEmpty() || !recoveringLatest && next.equals(cursor)))
             throw new IOException("历史游标无法继续");
         ArrayList<TranscriptText> fresh = new ArrayList<>();
         java.util.HashSet<String> seen = new java.util.HashSet<>();
@@ -125,9 +169,16 @@ public final class TranscriptWindow {
         if (!page.has("items") || !page.get("items").isJsonArray()) throw new IOException("新增消息格式无效");
         if (page.has("truncationReason") && !page.get("truncationReason").isJsonNull() && "source_discontinuity".equals(page.get("truncationReason").getAsString()))
             throw new IOException("消息来源出现断档");
+        ArrayList<Entry> added = appendMessages(TranscriptText.read(page.getAsJsonArray("items")));
+        if (page.has("nextCursor") && !page.get("nextCursor").isJsonNull()) tailCursor = page.get("nextCursor").getAsString();
+        return added;
+    }
+
+    /** 尾部增量与连续恢复共用原编号规则，仅为实际新消息分配编号。 */
+    private ArrayList<Entry> appendMessages(java.util.List<TranscriptText> messages) throws IOException {
         ArrayList<Entry> added = new ArrayList<>();
         int latest = entries.isEmpty() ? 1_000_000_000 : entries.lastKey();
-        for (TranscriptText text : TranscriptText.read(page.getAsJsonArray("items"))) {
+        for (TranscriptText text : messages) {
             if (containsMessage(text)) continue;
             if (latest == Integer.MAX_VALUE) throw new IOException("本地消息编号已满");
             Entry entry = new Entry(++latest, text);
@@ -135,7 +186,6 @@ public final class TranscriptWindow {
             remember(text, entry.id);
             added.add(entry);
         }
-        if (page.has("nextCursor") && !page.get("nextCursor").isJsonNull()) tailCursor = page.get("nextCursor").getAsString();
         return added;
     }
 

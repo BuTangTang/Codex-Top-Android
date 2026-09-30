@@ -81,6 +81,8 @@ public final class CodexRuntime {
     private static final org.telegram.messenger.DispatchQueue prefetchQueue = new org.telegram.messenger.DispatchQueue("codex-prefetch");
     private static final Map<Long, Long> prefetchedRevisions = new HashMap<>();
     private static final java.util.HashSet<Long> prefetching = new java.util.HashSet<>();
+    // 仍由原列表周期触发，单飞门禁防止慢电脑在现预取队列里逐轮堆积。
+    private static boolean connectedComputersPrefetching;
     public static String loadError;
 
     /** 仅独立 Codex 包启用适配，避免改变原版 Telegram 构建。 */
@@ -148,6 +150,7 @@ public final class CodexRuntime {
                     loggingOut = false;
                     listRefreshScheduled = false;
                     loading = false;
+                    connectedComputersPrefetching = false;
                     failed.accept("退出失败，请重试");
                 });
                 return;
@@ -185,6 +188,7 @@ public final class CodexRuntime {
                         attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear();
                         statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
+                        connectedComputersPrefetching = false;
                         loading = false; listRefreshScheduled = false; loadError = null;
                         loggingOut = false;
                     }
@@ -316,6 +320,7 @@ public final class CodexRuntime {
                 try {
                     JsonObject page = new JsonObject();
                     com.google.gson.JsonArray rows;
+                    DesktopConnection conversationConnection = null;
                     if ("computers".equals(kind)) rows = computers();
                     else if ("projects".equals(kind)) {
                         JsonObject response = openDesktop(machine).projects();
@@ -323,6 +328,7 @@ public final class CodexRuntime {
                         if (response.has("searchIncomplete")) page.add("searchIncomplete", response.get("searchIncomplete"));
                     } else {
                         DesktopConnection connection = openDesktop(machine);
+                        conversationConnection = connection;
                         startedAt = android.os.SystemClock.elapsedRealtime();
                         JsonObject response = connection.candidates(100, cursor);
                         rows = new com.google.gson.JsonArray();
@@ -345,6 +351,10 @@ public final class CodexRuntime {
                     // 缓存写失败不抹掉成功的内存页，也不改变完整性和下一页游标。
                     try { store.write(kind, machine, scopeRoots, merged); } catch (java.io.IOException ignored) { }
                     publishBrowse(account, accountEpoch, key, kind, machine, prepared, false, startedAt, receivedAt, callback);
+                    // 只预取本次成功页，不把合并缓存页当新候选，也不改变首页来源。
+                    if (conversationConnection != null && isAccountCurrent(accountEpoch)
+                            && desktopConnections.get(conversationConnection.machineId) == conversationConnection)
+                        prefetchDialogs(rows, conversationConnection);
                 } catch (Exception error) {
                     AndroidUtilities.runOnUIThread(() -> {
                         if (isAccountCurrent(accountEpoch)) callback.accept(null,
@@ -1209,7 +1219,7 @@ public final class CodexRuntime {
         String remote = remoteIds.get(dialogId);
         Utilities.globalQueue.postRunnable(new Runnable() {
             private int consecutiveTailPages;
-            /** 每次只拉取新消息，后台失败延后重试，不发出空历史覆盖已有正文。 */
+            /** 跟随增量，旧缓存缺尾游标先连续恢复；失败延后重试，不清空已有正文。 */
             @Override public void run() {
                 if (generation != watchGeneration) return;
                 long delay = 2000;
@@ -1222,17 +1232,19 @@ public final class CodexRuntime {
                             if (generation == watchGeneration) refreshDialogs(account);
                         });
                         delay = 5000;
-                    } else if (history != null && history.loaded && history.tailCursor != null) {
+                    } else if (history != null && history.loaded) {
+                        final boolean bootstrap = history.needsTailBootstrap();
                         final String previousCursor = history.tailCursor;
+                        final String previousOlderCursor = history.cursor;
                         final Runnable next = this;
                         // 网络等待离开本地历史队列；同一观察轮只在请求结束后安排下一次。
                         transcriptQueue.postRunnable(() -> {
                             JsonObject page = null;
                             try {
                                 if (generation == watchGeneration && connection == dialogConnection(dialogId))
-                                    page = connection.readAfter(remote, previousCursor);
+                                    page = bootstrap ? connection.transcript(remote) : connection.readAfter(remote, previousCursor);
                             } catch (Exception error) {
-                                logTranscriptFailure("tail_request", error, null);
+                                logTranscriptFailure(bootstrap ? "tail_recovery_request" : "tail_request", error, null);
                                 /* 保留原记录，按失败间隔重试。 */
                             }
                             final JsonObject received = page;
@@ -1243,9 +1255,10 @@ public final class CodexRuntime {
                                     // 返回期间可能换电脑连接或被预取推进游标，旧响应不能回写。
                                     if (received != null && connection == dialogConnection(dialogId)
                                             && histories.get(dialogId) == history
-                                            && java.util.Objects.equals(previousCursor, history.tailCursor)) {
-                                        ArrayList<TranscriptWindow.Entry> added = history.append(received);
-                                        if (!added.isEmpty() || !java.util.Objects.equals(previousCursor, history.tailCursor))
+                                            && java.util.Objects.equals(previousCursor, history.tailCursor)
+                                            && (!bootstrap || java.util.Objects.equals(previousOlderCursor, history.cursor))) {
+                                        ArrayList<TranscriptWindow.Entry> added = bootstrap ? history.recoverTail(received) : history.append(received);
+                                        if (bootstrap || !added.isEmpty() || !java.util.Objects.equals(previousCursor, history.tailCursor))
                                             saveHistory(dialogId, remote, history);
                                         AndroidUtilities.runOnUIThread(() -> {
                                             if (generation != watchGeneration) return;
@@ -1266,7 +1279,7 @@ public final class CodexRuntime {
                                                     NotificationCenter.didReceiveNewMessages, dialogId, incoming, false, 0);
                                         });
                                         // 有积压才连续取页，最多四页后让出两秒；追平不增加空轮询。
-                                        if (TranscriptWindow.hasPendingTail(received, previousCursor) && ++consecutiveTailPages < 4) {
+                                        if (!bootstrap && TranscriptWindow.hasPendingTail(received, previousCursor) && ++consecutiveTailPages < 4) {
                                             nextDelay = 0;
                                         } else {
                                             consecutiveTailPages = 0;
@@ -1280,7 +1293,7 @@ public final class CodexRuntime {
                                                     + " delay=" + nextDelay);
                                     }
                                 } catch (Exception error) {
-                                    logTranscriptFailure("tail_merge", error, received);
+                                    logTranscriptFailure(bootstrap ? "tail_recovery_merge" : "tail_merge", error, received);
                                     consecutiveTailPages = 0; /* 无效增量不清空已有正文。 */
                                 }
                                 if (generation == watchGeneration) Utilities.globalQueue.postRunnable(next, nextDelay);
@@ -1526,8 +1539,8 @@ public final class CodexRuntime {
         catch (java.io.IOException error) { return new TranscriptWindow(); }
     }
 
-    /** 同一电脑目录先保存回显，再移除已送达的待发记录。 */
-    private static void saveHistory(long dialogId, String remote, TranscriptWindow history) {
+    /** 同一电脑目录先保存回显，再移除待发记录；失败不把预取版本记成已落地。 */
+    private static boolean saveHistory(long dialogId, String remote, TranscriptWindow history) {
         try {
             transcriptStore(dialogId).write(remote, history);
             // 先确认历史已落盘，之后才能删除同一发送编号的待发记录。
@@ -1540,9 +1553,11 @@ public final class CodexRuntime {
                 }
                 for (OutboxStore.Item item : queued) if (batchEchoed(item, echoed)) outbox.remove(item.localId);
             }
+            return true;
         }
         catch (java.io.IOException error) {
             if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.w("CodexBridge", "history_cache_write_failed");
+            return false;
         }
     }
 
@@ -1654,63 +1669,128 @@ public final class CodexRuntime {
     private static void prefetchDialogs(com.google.gson.JsonArray candidates, DesktopConnection connection, int catchupPages) {
         final long accountEpoch = accountGeneration;
         final PasswordLogin.Session owner = session;
-        if (!isAccountCurrent(accountEpoch)) return;
+        if (!isAccountCurrent(accountEpoch) || connection == null || !connection.isConnected()
+                || desktopConnections.get(connection.machineId) != connection) return;
         Utilities.globalQueue.postRunnable(() -> {
-            if (!isAccountCurrent(accountEpoch)) return;
+            if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection
+                    || !connection.isConnected()) return;
             int remaining = recentDialogLimit();
             for (com.google.gson.JsonElement value : candidates) {
-                if (remaining-- <= 0) break;
-                JsonObject candidate = value.getAsJsonObject();
-                String remote = candidate.get("remoteSessionId").getAsString();
-                long revision = candidate.get("updatedAtMs").getAsLong();
+                if (remaining <= 0) break;
+                final JsonObject candidate;
+                final String remote;
+                final long revision;
+                try {
+                    candidate = value.getAsJsonObject();
+                    remote = candidate.get("remoteSessionId").getAsString();
+                    revision = candidate.get("updatedAtMs").getAsLong();
+                } catch (RuntimeException error) {
+                    // 坏行只记录类型并跳过，不中断队列或占用后续合法候选的预取额度。
+                    logTranscriptFailure("prefetch_candidate", error, null);
+                    continue;
+                }
+                remaining--;
                 long dialogId = bindDialog(connection.machineId, remote, owner, accountEpoch);
-                if (dialogId == 0 || dialogId == watchedDialog || prefetching.contains(dialogId)
-                        || java.util.Objects.equals(prefetchedRevisions.get(dialogId), revision)) continue;
+                if (dialogId == 0 || dialogConnection(dialogId) != connection
+                        || dialogId == watchedDialog || prefetching.contains(dialogId)) continue;
                 TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
-                String cursor = history.tailCursor;
-                boolean initial = !history.loaded;
-                if (!initial && cursor == null) continue;
+                final boolean bootstrap = history.needsTailBootstrap();
+                final boolean older = !bootstrap && history.needsVisibleHistory();
+                if (!bootstrap && !older && java.util.Objects.equals(prefetchedRevisions.get(dialogId), revision)) continue;
+                final String tailCursor = history.tailCursor;
+                final String olderCursor = history.cursor;
+                final boolean wasLoaded = history.loaded;
+                final String cursor = older ? olderCursor : tailCursor;
                 prefetching.add(dialogId);
                 prefetchQueue.postRunnable(() -> {
                     if (!isAccountCurrent(accountEpoch)) return;
                     JsonObject page = null;
                     try {
-                        if (connection == desktop && !ApplicationLoader.mainInterfacePaused)
-                            page = initial ? connection.transcript(remote) : connection.readAfter(remote, cursor);
+                        if (dialogConnection(dialogId) == connection && connection.isConnected()
+                                && !ApplicationLoader.mainInterfacePaused)
+                            page = bootstrap ? connection.transcript(remote)
+                                    : older ? connection.transcript(remote, cursor) : connection.readAfter(remote, cursor);
                     } catch (Exception error) {
-                        logTranscriptFailure(initial ? "prefetch_initial_request" : "prefetch_tail_request", error, null);
+                        logTranscriptFailure(bootstrap ? "prefetch_initial_request" : older ? "prefetch_older_request" : "prefetch_tail_request", error, null);
                         /* 下一次列表刷新重试，不把失败记为已同步。 */
                     }
                     final JsonObject received = page;
                     Utilities.globalQueue.postRunnable(() -> {
                         if (!isAccountCurrent(accountEpoch)) return;
                         prefetching.remove(dialogId);
-                        if (received == null || connection != desktop || dialogId == watchedDialog
-                                || !java.util.Objects.equals(cursor, history.tailCursor) || initial != !history.loaded) return;
+                        if (received == null || connection != dialogConnection(dialogId) || dialogId == watchedDialog
+                                || histories.get(dialogId) != history || wasLoaded != history.loaded
+                                || !java.util.Objects.equals(tailCursor, history.tailCursor)
+                                || (bootstrap || older) && !java.util.Objects.equals(olderCursor, history.cursor)) return;
                         try {
-                            if (initial) history.prepend(received); else history.append(received);
-                            saveHistory(dialogId, remote, history);
+                            if (bootstrap) history.recoverTail(received);
+                            else if (older) history.prepend(received);
+                            else history.append(received);
+                            boolean saved = saveHistory(dialogId, remote, history);
                             // 服务端仍有后续增量时，下次继续同一游标，不能提前记为追平。
                             boolean more = received.has("hasMore") && received.get("hasMore").getAsBoolean();
                             boolean truncated = received.has("truncated") && received.get("truncated").getAsBoolean();
-                            if (initial || (!more && !truncated)) prefetchedRevisions.put(dialogId, revision);
+                            boolean missingBody = history.needsVisibleHistory();
+                            // 向旧找到正文只补首屏，不能代表新尾部已追平；沿同一预算再核对原尾游标。
+                            boolean pendingTail = older ? !missingBody : !bootstrap && TranscriptWindow.hasPendingTail(received, cursor);
+                            if (saved && !older && !history.needsTailBootstrap() && !missingBody && (bootstrap || (!more && !truncated)))
+                                prefetchedRevisions.put(dialogId, revision);
+                            else prefetchedRevisions.remove(dialogId);
                             if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
                                 android.util.Log.i("CodexBridge", "prefetch_page batch=" + catchupPages
-                                        + " initial=" + initial + " items=" + received.getAsJsonArray("items").size()
-                                        + " pending=" + TranscriptWindow.hasPendingTail(received, cursor));
-                            // 与前台相同：只在原游标明确仍有积压时有界追赶，空闲不增加请求。
-                            if (!initial && catchupPages < 4 && TranscriptWindow.hasPendingTail(received, cursor)) {
+                                        + " initial=" + bootstrap + " older=" + older + " items=" + received.getAsJsonArray("items").size()
+                                        + " pending=" + (missingBody || pendingTail));
+                            // 首屏空投影也沿真实旧页游标找正文；每轮总共最多四页，剩余仍交原列表周期继续。
+                            if (catchupPages < 4 && ((missingBody && !history.needsTailBootstrap()) || pendingTail)) {
                                 com.google.gson.JsonArray pending = new com.google.gson.JsonArray();
                                 pending.add(candidate);
                                 prefetchDialogs(pending, connection, catchupPages + 1);
                             }
                         } catch (Exception error) {
-                            logTranscriptFailure(initial ? "prefetch_initial_merge" : "prefetch_tail_merge", error, received);
+                            logTranscriptFailure(bootstrap ? "prefetch_initial_merge" : older ? "prefetch_older_merge" : "prefetch_tail_merge", error, received);
                             /* 保留已有正文，下一轮仍可重试。 */
                         }
                     });
                 });
             }
+        });
+    }
+
+    /** 首页完成后复用现预取队列读取已连接电脑的一页候选；不另建连接或聚合首页。 */
+    private static void prefetchConnectedComputers(long accountEpoch) {
+        if (!isAccountCurrent(accountEpoch)) return;
+        Utilities.globalQueue.postRunnable(() -> {
+            if (!isAccountCurrent(accountEpoch) || connectedComputersPrefetching) return;
+            ArrayList<DesktopConnection> connections = new ArrayList<>();
+            for (DesktopConnection connection : desktopConnections.values()) {
+                if (connection != desktop && connection.isConnected()) connections.add(connection);
+            }
+            if (connections.isEmpty()) return;
+            connectedComputersPrefetching = true;
+            prefetchQueue.postRunnable(() -> {
+                try {
+                    for (DesktopConnection connection : connections) {
+                        if (!isAccountCurrent(accountEpoch) || ApplicationLoader.mainInterfacePaused) break;
+                        if (connection == desktop || desktopConnections.get(connection.machineId) != connection
+                                || !connection.isConnected()) continue;
+                        try {
+                            JsonObject page = connection.candidates(recentDialogLimit());
+                            if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection
+                                    || connection == desktop || !connection.isConnected()) continue;
+                            if (!page.has("candidates") || !page.get("candidates").isJsonArray())
+                                throw new IOException("电脑会话列表格式无效");
+                            prefetchDialogs(page.getAsJsonArray("candidates"), connection);
+                        } catch (Exception error) {
+                            logTranscriptFailure("connected_candidates", error, null);
+                        }
+                    }
+                } finally {
+                    // 旧账号结束不得清除新账号的单飞门禁。
+                    Utilities.globalQueue.postRunnable(() -> {
+                        if (isAccountCurrent(accountEpoch)) connectedComputersPrefetching = false;
+                    });
+                }
+            });
         });
     }
 
@@ -1915,7 +1995,11 @@ public final class CodexRuntime {
                 catch (java.io.IOException error) { /* 写缓存失败不丢弃已取得的列表。 */ }
                 publishDialogs(account, desktop.machineId, candidates, observationStartedAt, observedAt, false);
                 prefetchDialogs(candidates, desktop);
-                AndroidUtilities.runOnUIThread(() -> { if (isAccountCurrent(accountEpoch)) loading = false; });
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (!isAccountCurrent(accountEpoch)) return;
+                    loading = false;
+                    prefetchConnectedComputers(accountEpoch);
+                });
             } catch (Exception error) {
                 // 仅记录阶段和异常类型，不输出响应正文、账号、密钥或电脑路径。
                 if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
@@ -1929,6 +2013,8 @@ public final class CodexRuntime {
                     loadError = "电脑会话暂时无法读取";
                     if (dialogs.isEmpty()) NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
+                    // 首页来源离线也不阻断其它已连接电脑；仍在本次首页请求结束后才安排。
+                    prefetchConnectedComputers(accountEpoch);
                 });
             }
         });

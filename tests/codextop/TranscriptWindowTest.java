@@ -64,8 +64,157 @@ public final class TranscriptWindowTest {
             throw new AssertionError("接受了缺失游标");
         } catch (IOException expected) { }
         attachmentSnapshotsAndEchoes();
+        missingTailRecovery();
+        emptyProjectedHistory();
         System.out.println("TranscriptWindow: 重叠去重、旧页顺序、完整性与游标校验通过");
     }
+    /** 缺尾游标必须以缓存最新项作连续锚点；恢复不改变旧正文、编号或历史分页位置。 */
+    private static void missingTailRecovery() throws Exception {
+        TranscriptWindow window = new TranscriptWindow();
+        window.prepend(page(item("a") + "," + item("c"), true, "original-older", null));
+        window = TranscriptWindow.restore(window.snapshot());
+        if (!window.needsTailBootstrap()) throw new AssertionError("重开的旧缓存缺尾游标却不允许恢复");
+        var original = window.before(0, 10);
+        var latest = page(item("a") + "," + item("b") + "," + item("c") + "," + item("d"), false, null, "real-tail");
+        latest.getAsJsonArray("items").get(2).getAsJsonObject().getAsJsonObject("raw")
+                .getAsJsonObject("content").addProperty("text", "different-source-body");
+        var added = window.recoverTail(latest);
+        var rows = window.before(0, 10);
+        if (rows.size() != 3 || added.size() != 1 || !added.get(0).message.id.equals("d")
+                || !rows.get(0).message.id.equals("d") || rows.get(1).id != original.get(0).id
+                || !rows.get(1).message.text.equals(original.get(0).message.text)
+                || rows.get(2).id != original.get(1).id || !"original-older".equals(window.cursor)
+                || !window.hasMore || window.complete || !"real-tail".equals(window.tailCursor)
+                || window.needsTailBootstrap()) throw new AssertionError("恢复重排旧消息、改正文编号或错误接受旧页前缀");
+        var storeRoot = java.nio.file.Files.createTempDirectory("codex-tail-recovery");
+        try {
+            var store = new TranscriptStore(storeRoot.toFile(), "server", "account", "machine");
+            store.write("thread", window);
+            if (!store.read("thread").snapshot().equals(window.snapshot()))
+                throw new AssertionError("尾游标恢复落盘重开后身份变化");
+        } finally {
+            try (var paths = java.nio.file.Files.walk(storeRoot)) {
+                for (var path : paths.sorted(java.util.Comparator.reverseOrder()).toArray(java.nio.file.Path[]::new))
+                    java.nio.file.Files.delete(path);
+            }
+        }
+        // 只重叠更早的a，或完全无重叠，都不能把新tail当成已追平。
+        for (String source : new String[] { item("a") + "," + item("e"), item("x") }) {
+            var unchanged = window.snapshot();
+            try { window.recoverTail(page(source, false, null, "unsupported-tail"));
+                throw new AssertionError("没有缓存最新锚点仍接受尾游标");
+            } catch (IOException expected) { }
+            if (!unchanged.equals(window.snapshot())) throw new AssertionError("无锚点失败改变了原缓存");
+        }
+        var discontinuity = page(item("d") + "," + item("e"), false, null, "broken-tail");
+        discontinuity.addProperty("truncationReason", "source_discontinuity");
+        var unchanged = window.snapshot();
+        try { window.recoverTail(discontinuity); throw new AssertionError("来源断档被当成连续恢复"); }
+        catch (IOException expected) { }
+        if (!unchanged.equals(window.snapshot())) throw new AssertionError("断档恢复改变了原缓存");
+        try { window.recoverTail(page(item("d") + "," + item("a"), false, null, "reversed-tail"));
+            throw new AssertionError("接受了锚点后回到旧消息的乱序来源");
+        } catch (IOException expected) { }
+        if (!unchanged.equals(window.snapshot())) throw new AssertionError("乱序来源改变了原缓存");
+        try { window.recoverTail(page(item("d"), false, null, null)); throw new AssertionError("凭空接受尾游标"); }
+        catch (IOException expected) { }
+        if (!unchanged.equals(window.snapshot())) throw new AssertionError("无尾游标改变了原缓存");
+
+        TranscriptWindow local = new TranscriptWindow();
+        var localPage = page(item("local-source"), false, null, null);
+        localPage.getAsJsonArray("items").get(0).getAsJsonObject().addProperty("localId", "same-user-send");
+        local.prepend(localPage);
+        int stableId = local.before(0, 1).get(0).id;
+        var echo = page(item("desktop-source") + "," + item("answer"), false, null, "echo-tail");
+        echo.getAsJsonArray("items").get(0).getAsJsonObject().addProperty("localId", "same-user-send");
+        if (local.recoverTail(echo).size() != 1 || local.before(0, 10).get(1).id != stableId
+                || !local.before(0, 10).get(1).message.id.equals("local-source"))
+            throw new AssertionError("原用户localId不能连续恢复或改掉旧来源身份");
+
+        var duplicateAnchor = new TranscriptWindow(); duplicateAnchor.prepend(localPage);
+        var duplicatePage = page(item("desktop-source") + "," + item("d") + "," + item("echo-again") + "," + item("e"),
+                false, null, "duplicate-echo-tail");
+        duplicatePage.getAsJsonArray("items").get(0).getAsJsonObject().addProperty("localId", "same-user-send");
+        duplicatePage.getAsJsonArray("items").get(2).getAsJsonObject().addProperty("localId", "same-user-send");
+        var duplicateAdded = duplicateAnchor.recoverTail(duplicatePage);
+        if (duplicateAdded.size() != 2 || !duplicateAdded.get(0).message.id.equals("d")
+                || !duplicateAdded.get(1).message.id.equals("e") || duplicateAnchor.before(0, 10).size() != 3)
+            throw new AssertionError("选择末个重复锚点漏了新后缀，或重复用户回显生成气泡");
+
+        // 助手即使携带相同localId也不能冒充用户发送的连续锚点。
+        var assistant = new TranscriptWindow(); assistant.prepend(localPage);
+        echo.getAsJsonArray("items").get(0).getAsJsonObject().getAsJsonObject("raw").addProperty("role", "agent");
+        try { assistant.recoverTail(echo); throw new AssertionError("助手localId被用作用户连续锚点"); }
+        catch (IOException expected) { }
+
+        // 同一来源多附件展开时，锚点之前未缓存的成员也不能追加到新消息后。
+        var attachments = page(item("bundle"), false, null, "attachment-tail");
+        attachments.getAsJsonArray("items").get(0).getAsJsonObject().getAsJsonObject("raw").add("meta",
+                JsonParser.parseString("{\"happier\":{\"kind\":\"attachments.v1\",\"payload\":{\"attachments\":["
+                        + "{\"name\":\"first.txt\",\"kind\":\"file\",\"path\":\"/synthetic/first.txt\"},"
+                        + "{\"name\":\"second.txt\",\"kind\":\"file\",\"path\":\"/synthetic/second.txt\"},"
+                        + "{\"name\":\"third.txt\",\"kind\":\"file\",\"path\":\"/synthetic/third.txt\"}]}}}"));
+        var fullBundle = new TranscriptWindow(); fullBundle.prepend(attachments);
+        var bundleSnapshot = fullBundle.snapshot(); bundleSnapshot.add("tailCursor", com.google.gson.JsonNull.INSTANCE);
+        fullBundle = TranscriptWindow.restore(bundleSnapshot);
+        int bundleLatest = fullBundle.before(0, 1).get(0).id;
+        var bundleWithSuffix = attachments.deepCopy(); bundleWithSuffix.getAsJsonArray("items").add(JsonParser.parseString(item("after-bundle")));
+        if (fullBundle.recoverTail(bundleWithSuffix).size() != 1 || fullBundle.before(0, 10).size() != 4
+                || fullBundle.before(0, 10).get(1).id != bundleLatest)
+            throw new AssertionError("未按展开后的多附件末行恢复锚点");
+        var partial = new TranscriptWindow(); partial.prepend(attachments);
+        var partialSnapshot = partial.snapshot();
+        partialSnapshot.getAsJsonArray("rows").remove(2); partialSnapshot.getAsJsonArray("rows").remove(0);
+        partialSnapshot.add("tailCursor", com.google.gson.JsonNull.INSTANCE);
+        partial = TranscriptWindow.restore(partialSnapshot);
+        int secondId = partial.before(0, 1).get(0).id;
+        if (partial.recoverTail(attachments).size() != 1 || partial.before(0, 10).size() != 2
+                || partial.before(0, 10).get(1).id != secondId
+                || !partial.before(0, 10).get(0).message.id.equals("bundle:attachment:2"))
+            throw new AssertionError("附件恢复把锚点前成员移到末尾或改变展开身份");
+    }
+
+    /** 空投影仍保留真实双向游标；四页预算用尽后保持待续，重开可从旧游标继续。 */
+    private static void emptyProjectedHistory() throws Exception {
+        TranscriptWindow window = new TranscriptWindow();
+        window.recoverTail(page("", true, "older-1", "initial-tail"));
+        if (!window.loaded || !window.needsVisibleHistory() || window.needsTailBootstrap() || window.complete)
+            throw new AssertionError("空首屏被当成已完成或丢失真实游标");
+        for (int pageNumber = 2; pageNumber <= 4; pageNumber++)
+            window.prepend(page("", true, "older-" + pageNumber, "must-not-replace-tail"));
+        window = TranscriptWindow.restore(window.snapshot());
+        if (!window.needsVisibleHistory() || window.complete || !"older-4".equals(window.cursor)
+                || !"initial-tail".equals(window.tailCursor)) throw new AssertionError("空页预算用尽被永久标记完成");
+        var unchanged = window.snapshot();
+        try { window.prepend(page("", true, "older-4", null)); throw new AssertionError("空旧页游标原地重复"); }
+        catch (IOException expected) { }
+        if (!unchanged.equals(window.snapshot())) throw new AssertionError("不前进的空旧页改变缓存");
+        window.prepend(page(item("visible-older"), true, "older-5", "must-not-replace-tail"));
+        if (window.needsVisibleHistory() || window.before(0, 10).size() != 1
+                || !"initial-tail".equals(window.tailCursor)) throw new AssertionError("空页后正文未保留或尾部游标被旧页覆盖");
+        var exhausted = new TranscriptWindow(); exhausted.recoverTail(page("", true, "older", "tail"));
+        exhausted.prepend(page("", false, null, null));
+        if (exhausted.needsVisibleHistory() || !exhausted.complete)
+            throw new AssertionError("明确耗尽的空历史无法停止");
+        var cachedEmpty = new TranscriptWindow(); cachedEmpty.prepend(page("", true, "same-older", null));
+        cachedEmpty = TranscriptWindow.restore(cachedEmpty.snapshot());
+        if (!cachedEmpty.needsTailBootstrap()
+                || cachedEmpty.recoverTail(page(item("visible"), true, "same-older", "recovered-tail")).size() != 1
+                || cachedEmpty.needsTailBootstrap()) throw new AssertionError("空旧缓存不能用同一个最新页向旧游标恢复");
+        var noTail = new TranscriptWindow(); noTail.recoverTail(page(item("cached-body"), false, null, null));
+        if (!noTail.needsTailBootstrap() || noTail.before(0, 1).isEmpty())
+            throw new AssertionError("缺尾游标首屏丢正文或伪装已追平");
+    }
+
+    /** 所有页均为合成来源；明确标记真实历史耗尽时才允许complete。 */
+    private static com.google.gson.JsonObject page(String items, boolean more, String cursor, String tail) {
+        var page = JsonParser.parseString("{\"items\":[" + items + "],\"hasMore\":" + more
+                + ",\"historyAvailability\":\"available\"}").getAsJsonObject();
+        if (cursor != null) page.addProperty("nextCursor", cursor);
+        if (tail != null) page.addProperty("tailCursor", tail);
+        return page;
+    }
+
     /** 附件沿原正文缓存落盘，重复localId回声不增气泡也不改稳定消息编号。 */
     private static void attachmentSnapshotsAndEchoes() throws Exception {
         var root = java.nio.file.Files.createTempDirectory("codex-attachment-history");
