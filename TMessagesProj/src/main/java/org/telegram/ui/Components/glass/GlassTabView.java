@@ -548,6 +548,10 @@ public class GlassTabView extends FrameLayout implements MainTabsLayout.Tab, Fac
         CHATS(R.raw.tab_chats),
         SETTINGS(R.raw.tab_settings),
         DEVICE(TabAnimationType.STATIC, R.drawable.settings_devices),
+        /** Codex 会话、电脑、我的三个入口的静态像素图标，着色和点击仍走原控件。 */
+        CHATS_PIXEL(TabAnimationType.STATIC, R.drawable.codextop_pixel_chat),
+        DEVICE_PIXEL(TabAnimationType.STATIC, R.drawable.codextop_pixel_devices),
+        PROFILE_PIXEL(TabAnimationType.STATIC, R.drawable.codextop_pixel_profile),
 
         CHECKLIST(R.raw.tab_checklist, R.raw.tab_checklist_reverse),
         COLORS(R.raw.tab_colors, R.raw.tab_colors_reverse),

@@ -315,10 +315,12 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
 
         final boolean codex = com.butang.codextop.CodexRuntime.enabled();
         tabs = new GlassTabView[codex ? 3 : 5];
-        tabs[INDEX_CHATS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.CHATS, R.string.MainTabsChats);
+        tabs[INDEX_CHATS] = GlassTabView.createMainTab(context, resourceProvider,
+                codex ? GlassTabView.TabAnimation.CHATS_PIXEL : GlassTabView.TabAnimation.CHATS, R.string.MainTabsChats);
         tabs[INDEX_CONTACTS] = GlassTabView.createMainTab(context, resourceProvider,
-                codex ? GlassTabView.TabAnimation.DEVICE : GlassTabView.TabAnimation.CONTACTS, R.string.MainTabsContacts);
-        tabs[INDEX_SETTINGS] = GlassTabView.createMainTab(context, resourceProvider, GlassTabView.TabAnimation.SETTINGS, R.string.Settings);
+                codex ? GlassTabView.TabAnimation.DEVICE_PIXEL : GlassTabView.TabAnimation.CONTACTS, R.string.MainTabsContacts);
+        tabs[INDEX_SETTINGS] = GlassTabView.createMainTab(context, resourceProvider,
+                codex ? GlassTabView.TabAnimation.PROFILE_PIXEL : GlassTabView.TabAnimation.SETTINGS, R.string.Settings);
         if (codex) {
             tabs[INDEX_CHATS].setText("会话");
             tabs[INDEX_CONTACTS].setText("电脑");

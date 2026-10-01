@@ -4058,6 +4058,15 @@ public class Theme {
         ThemeInfo applyingTheme = null;
         SharedPreferences preferences = MessagesController.getGlobalMainSettings();
         try {
+            // 在原主题名恢复前迁移一次。自动夜间参数仍由下面的原读取保留，读完后再保存。
+            String storedTheme = preferences.getString("theme", null);
+            ThemeInfo resolvedStoredTheme = storedTheme == null ? null : themesDict.get(storedTheme);
+            boolean codexPixelThemesMigrated = commitCodexPixelThemeMigration(
+                    com.butang.codextop.CodexRuntime.enabled(),
+                    preferences,
+                    themeConfig,
+                    resolvedStoredTheme == null ? null : resolvedStoredTheme.getKey(),
+                    resolvedStoredTheme != null && resolvedStoredTheme.isDark());
             final ThemeInfo themeDarkBlue = themesDict.get("Dark Blue");
 
             String theme = preferences.getString("theme", null);
@@ -4270,6 +4279,9 @@ public class Theme {
                 autoNightLocationLongitude = 10000;
             }
             autoNightLastSunCheckDay = preferences.getInt("autoNightLastSunCheckDay", -1);
+            if (codexPixelThemesMigrated) {
+                saveAutoNightThemeConfig();
+            }
         } catch (Exception e) {
             FileLog.e(e);
             throw new RuntimeException(e);
@@ -4356,6 +4368,122 @@ public class Theme {
 
     private static Method StateListDrawable_getStateDrawableMethod;
     private static Field BitmapDrawable_mColorFilter;
+
+    /** 一次迁移要写入的 Day/Night 键。apply 为 false 时调用方不写偏好。 */
+    static final class CodexPixelThemeMigration {
+        final boolean apply;
+        final String theme;
+        final String nightTheme;
+        final String lastDayTheme;
+        final String lastDarkTheme;
+
+        /** 记下本次是否迁移，以及日间、夜间和两侧记忆键。 */
+        private CodexPixelThemeMigration(boolean apply, String theme, String nightTheme, String lastDayTheme, String lastDarkTheme) {
+            this.apply = apply;
+            this.theme = theme;
+            this.nightTheme = nightTheme;
+            this.lastDayTheme = lastDayTheme;
+            this.lastDarkTheme = lastDarkTheme;
+        }
+    }
+
+    /**
+     * 决定是否把本包主题名迁到已有 Day/Night。
+     * 自动模式只记下日间 Day 和夜间 Night，当前深浅仍交给随后的 needSwitchToTheme；NONE 且原主题明确深色时当前主题用 Night。
+     */
+    static CodexPixelThemeMigration planCodexPixelThemeMigration(boolean codexPackage, boolean alreadyMigrated, int autoNightType, boolean explicitDark) {
+        if (!codexPackage || alreadyMigrated) {
+            return new CodexPixelThemeMigration(false, null, null, null, null);
+        }
+        boolean manualDark = autoNightType == AUTO_NIGHT_TYPE_NONE && explicitDark;
+        return new CodexPixelThemeMigration(true, manualDark ? "Night" : "Day", "Night", "Day", "Night");
+    }
+
+    /**
+     * 把尚未迁移的 Codex 主题名写入 Day/Night 并落盘。
+     * 先确认两侧记忆键提交成功，最后才写 main 的主题、夜键和成功标记。
+     * 任一提交失败都不宣告成功；失败的 commit 可能已改内存，随即按提交前的值撤回，同进程不能把标记当成已迁移。
+     * 不改自动夜间类型、时间、系统或感光；夜间键由读入这些参数后的 saveAutoNightThemeConfig 再保存。
+     */
+    static boolean commitCodexPixelThemeMigration(boolean codexPackage, SharedPreferences main, SharedPreferences themePreferences, String resolvedThemeKey, boolean resolvedDark) {
+        boolean alreadyMigrated = main.getBoolean("codexPixelDayNightMigrated", false);
+        int autoNightType = main.getInt("selectedAutoNightType", Build.VERSION.SDK_INT >= 29 ? AUTO_NIGHT_TYPE_SYSTEM : AUTO_NIGHT_TYPE_NONE);
+        String theme = main.getString("theme", null);
+        boolean explicitDark = "Dark".equals(theme) || "Dark Blue".equals(theme) || "Night".equals(theme)
+                || (resolvedDark && theme != null && theme.equals(resolvedThemeKey));
+        CodexPixelThemeMigration plan = planCodexPixelThemeMigration(codexPackage, alreadyMigrated, autoNightType, explicitDark);
+        if (!plan.apply) {
+            return false;
+        }
+        String previousLastDay = themePreferences.getString("lastDayTheme", null);
+        String previousLastDark = themePreferences.getString("lastDarkTheme", null);
+        boolean themesSaved = themePreferences.edit()
+                .putString("lastDayTheme", plan.lastDayTheme)
+                .putString("lastDarkTheme", plan.lastDarkTheme)
+                .commit();
+        if (!themesSaved) {
+            SharedPreferences.Editor revertThemes = themePreferences.edit();
+            if (previousLastDay == null) {
+                revertThemes.remove("lastDayTheme");
+            } else {
+                revertThemes.putString("lastDayTheme", previousLastDay);
+            }
+            if (previousLastDark == null) {
+                revertThemes.remove("lastDarkTheme");
+            } else {
+                revertThemes.putString("lastDarkTheme", previousLastDark);
+            }
+            revertThemes.commit();
+            return false;
+        }
+        String previousNight = main.getString("nighttheme", null);
+        boolean mainSaved = main.edit()
+                .putString("theme", plan.theme)
+                .putString("nighttheme", plan.nightTheme)
+                .putBoolean("codexPixelDayNightMigrated", true)
+                .commit();
+        if (!mainSaved) {
+            SharedPreferences.Editor revertMain = main.edit();
+            if (theme == null) {
+                revertMain.remove("theme");
+            } else {
+                revertMain.putString("theme", theme);
+            }
+            if (previousNight == null) {
+                revertMain.remove("nighttheme");
+            } else {
+                revertMain.putString("nighttheme", previousNight);
+            }
+            revertMain.remove("codexPixelDayNightMigrated");
+            revertMain.commit();
+            return false;
+        }
+        return true;
+    }
+
+    /** 仅 Codex 包的 Day/Night 把色表抄进当前颜色。调用点必须在强调色填充之后、派生表格色之前。 */
+    static void copyCodexPixelPalette(SparseIntArray colors, String themeName, boolean dark, boolean codexPackage) {
+        if (!codexPackage || (!"Day".equals(themeName) && !"Night".equals(themeName))) {
+            return;
+        }
+        SparseIntArray palette = dark ? com.butang.codextop.CodexPixelPalette.dark() : com.butang.codextop.CodexPixelPalette.light();
+        for (int index = 0; index < palette.size(); index++) {
+            colors.put(palette.keyAt(index), palette.valueAt(index));
+        }
+    }
+
+    /** 像素 Day/Night 用当前壁纸色生成平涂背景，不读取、不写入、不删除墙纸文件。 */
+    static BackgroundDrawableSettings codexPixelWallpaper(String themeName, SparseIntArray colors, boolean codexPackage) {
+        if (!codexPackage || (!"Day".equals(themeName) && !"Night".equals(themeName)) || colors == null || colors.indexOfKey(key_chat_wallpaper) < 0) {
+            return null;
+        }
+        BackgroundDrawableSettings settings = new BackgroundDrawableSettings();
+        settings.wallpaper = new ColorDrawable(colors.get(key_chat_wallpaper));
+        settings.isWallpaperMotion = Boolean.FALSE;
+        settings.isPatternWallpaper = Boolean.FALSE;
+        settings.isCustomTheme = Boolean.TRUE;
+        return settings;
+    }
 
     public static void saveAutoNightThemeConfig() {
         SharedPreferences.Editor editor = MessagesController.getGlobalMainSettings().edit();
@@ -6073,6 +6201,7 @@ public class Theme {
         if (accent != null) {
             shouldDrawGradientIcons = accent.fillAccentColors(currentColorsNoAccent, currentColors);
         }
+        copyCodexPixelPalette(currentColors, currentTheme == null ? null : currentTheme.name, currentTheme != null && currentTheme.isDark(), com.butang.codextop.CodexRuntime.enabled());
         applyCalculatedTableColors(currentColorsNoAccent, currentColors, currentTheme.isDark());
         applyCalculatedArticleCodeColors(currentColorsNoAccent, currentColors, currentTheme.isDark());
         if (!messages) {
@@ -9382,6 +9511,10 @@ public class Theme {
     ) {
         BackgroundDrawableSettings settings = new BackgroundDrawableSettings();
         settings.wallpaper = local ? null : wallpaper;
+        BackgroundDrawableSettings pixelWallpaper = codexPixelWallpaper(currentTheme == null ? null : currentTheme.name, currentColors, com.butang.codextop.CodexRuntime.enabled());
+        if (pixelWallpaper != null) {
+            return pixelWallpaper;
+        }
         boolean overrideTheme = (!hasPreviousTheme || isApplyingAccent) && overrideWallpaper != null;
         if (overrideWallpaper != null) {
             settings.isWallpaperMotion = overrideWallpaper.isMotion;
