@@ -959,7 +959,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private ArrayList<Integer> accountNumbers = new ArrayList<>();
-    /** “我的”将真实额度前置，再列原账号与设置；电脑子页和 Telegram 原列表保持。 */
+    /** “我的”保留额度优先布局；电脑子页按实体复用原语义素材，会话及辅助行不放装饰图标。 */
     private void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
             items.add(UItem.asSpace(ActionBar.getCurrentActionBarHeight()));
@@ -972,7 +972,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 boolean conversations = codexConversations();
                 if (!computers && !conversations) {
                     items.add(SettingCell.Factory.of(8, IconBackgroundColors.BLUE_DEEP.top,
-                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data, "所有对话", "查看此电脑的对话"));
+                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_chat, "所有对话", "查看此电脑的对话"));
                 }
                 for (int i = 0; i < codexBrowseRows.size(); i++) {
                     com.google.gson.JsonObject row = codexBrowseRows.get(i).getAsJsonObject();
@@ -981,13 +981,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                             : (row.get("available").getAsBoolean() ? "项目" : "暂不可用");
                     String kind = conversations ? "conversations" : computers ? "computers" : "projects";
                     items.add(SettingCell.Factory.ofBrowse(kind + ":" + com.butang.codextop.BrowseStore.identity(kind, row), row, IconBackgroundColors.BLUE_DEEP.top,
-                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data,
+                            IconBackgroundColors.BLUE_DEEP.bottom, conversations ? 0 : computers ? R.drawable.settings_devices : R.drawable.settings_folders,
                             conversations ? (row.has("title") && !row.get("title").isJsonNull()
                                     ? row.get("title").getAsString() : "未命名对话") : row.get("name").getAsString(), subtitle));
                 }
                 if ((!codexBrowseLoaded && codexBrowseLoading) || codexBrowseError != null || codexBrowseRows.isEmpty() || codexBrowseIncomplete) {
                     items.add(SettingCell.Factory.of(9, IconBackgroundColors.BLUE_DEEP.top,
-                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data,
+                            IconBackgroundColors.BLUE_DEEP.bottom, 0,
                             !codexBrowseLoaded && codexBrowseLoading ? "正在加载" : codexBrowseError != null ? codexBrowseError
                                     : codexBrowseIncomplete ? "部分对话尚未读取" : conversations ? "当前页暂无匹配对话" : "暂无项目或电脑",
                             !codexBrowseLoaded && codexBrowseLoading ? "" : "点击刷新"));
@@ -995,7 +995,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 // 分页失败时上方已有原游标重试入口，避免同时展示两个相同操作。
                 if (conversations && codexBrowseCursor != null && codexBrowseError == null) {
                     items.add(SettingCell.Factory.of(10, IconBackgroundColors.BLUE_DEEP.top,
-                            IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_data, "加载更多对话", ""));
+                            IconBackgroundColors.BLUE_DEEP.bottom, 0, "加载更多对话", ""));
                 }
                 items.add(UItem.asShadow(null));
                 return;
