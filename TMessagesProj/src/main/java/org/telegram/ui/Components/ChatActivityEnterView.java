@@ -7923,6 +7923,7 @@ public class ChatActivityEnterView extends FrameLayout implements
         return isInScheduleMode() || animatorEphemeralMessageVisibility.getValue();
     }
 
+    /** 按输入、录音和编辑状态更新原发送控件；电脑对话空输入时保留原附件入口。 */
     public void checkSendButton(boolean animated) {
         if (editingMessageObject != null || recordingAudioVideo) {
             return;
@@ -8125,6 +8126,12 @@ public class ChatActivityEnterView extends FrameLayout implements
         } else if (com.butang.codextop.CodexRuntime.enabled() || message.length() > 0 || forceShowSendButton || richDraftActive || audioToSend != null || videoToSendMessageObject != null || slowModeTimer == Integer.MAX_VALUE && !isSlowModeIgnored() || isLiveComment && getStarsPrice() > 0 || animatorIsBlockedByStreaming.getValue()) {
             shownSendButton = true;
             final String caption = messageEditText == null ? null : messageEditText.getCaption();
+            // 电脑对话保留发送态以隐藏录音，空普通输入仍沿原纸夹和输入框间距显示附件入口。
+            final boolean codexEmptyInput = com.butang.codextop.CodexRuntime.enabled() && sideButtons == null
+                && message.length() == 0 && caption == null && !forceShowSendButton && !richDraftActive
+                && audioToSend == null && videoToSendMessageObject == null
+                && !(slowModeTimer == Integer.MAX_VALUE && !isSlowModeIgnored())
+                && !(isLiveComment && getStarsPrice() > 0) && !animatorIsBlockedByStreaming.getValue();
             boolean showBotButton = caption != null && (getSendButtonInternal().getVisibility() == VISIBLE || expandStickersButton != null && expandStickersButton.getVisibility() == VISIBLE);
             boolean showSendButton = caption == null && (cancelBotButton.getVisibility() == VISIBLE || expandStickersButton != null && expandStickersButton.getVisibility() == VISIBLE);
             int color;
@@ -8142,7 +8149,10 @@ public class ChatActivityEnterView extends FrameLayout implements
 
             if (audioVideoButtonContainer.getVisibility() == VISIBLE || slowModeButton.getVisibility() == VISIBLE || showBotButton || showSendButton || animatorIsBlockedByStreaming.getValue()) {
                 if (animated) {
-                    if (runningAnimationType == 1 && caption == null || runningAnimationType == 3 && caption != null) {
+                    // 动画途中空输入与文字互换时，纸夹目标变化也要沿原取消流程重新应用。
+                    if ((runningAnimationType == 1 && caption == null || runningAnimationType == 3 && caption != null)
+                        && (!com.butang.codextop.CodexRuntime.enabled() || sideButtons != null
+                            || attachButtonAlpha == (codexEmptyInput ? 1.0f : 0.0f))) {
                         return;
                     }
                     if (runningAnimation != null) {
@@ -8171,9 +8181,9 @@ public class ChatActivityEnterView extends FrameLayout implements
                                 animators.add(ObjectAnimator.ofFloat(attachButton, View.SCALE_Y, captionNearAttach ? 0.5f : 1.0f));
                             }
                         } else if (attachButton != null) {
-                            animators.add(ObjectAnimator.ofFloat(attachButton, View.ALPHA, attachButtonAlpha = 0.0f));
-                            animators.add(ObjectAnimator.ofFloat(attachButton, View.SCALE_X, 0.5f));
-                            animators.add(ObjectAnimator.ofFloat(attachButton, View.SCALE_Y, 0.5f));
+                            animators.add(ObjectAnimator.ofFloat(attachButton, View.ALPHA, attachButtonAlpha = codexEmptyInput ? 1.0f : 0.0f));
+                            animators.add(ObjectAnimator.ofFloat(attachButton, View.SCALE_X, codexEmptyInput ? 1.0f : 0.5f));
+                            animators.add(ObjectAnimator.ofFloat(attachButton, View.SCALE_Y, codexEmptyInput ? 1.0f : 0.5f));
                         }
                         boolean hasScheduled = delegate != null && delegate.hasScheduledMessages();
                         scheduleButtonHidden = true;
@@ -8212,7 +8222,7 @@ public class ChatActivityEnterView extends FrameLayout implements
                             }
                         });
                         runningAnimation2.start();
-                        updateFieldRight(0);
+                        updateFieldRight(codexEmptyInput ? 1 : 0);
                         if (delegate != null && getVisibility() == VISIBLE) {
                             delegate.onAttachButtonHidden();
                         }
@@ -8288,6 +8298,12 @@ public class ChatActivityEnterView extends FrameLayout implements
                     });
                     runningAnimation.start();
                 } else {
+                    // 暂停后直接更新纸夹时，先取消目标已过期的附件动画，避免晚完成覆盖当前输入状态。
+                    if (com.butang.codextop.CodexRuntime.enabled() && sideButtons == null && runningAnimation2 != null
+                        && attachButtonAlpha != (codexEmptyInput ? 1.0f : 0.0f)) {
+                        runningAnimation2.cancel();
+                        runningAnimation2 = null;
+                    }
                     audioVideoSendButton.setScaleX(0.1f);
                     audioVideoSendButton.setScaleY(0.1f);
                     audioVideoSendButton.setAlpha(0.0f);
@@ -8328,7 +8344,7 @@ public class ChatActivityEnterView extends FrameLayout implements
                         if (delegate != null && getVisibility() == VISIBLE) {
                             delegate.onAttachButtonHidden();
                         }
-                        updateFieldRight(0);
+                        updateFieldRight(codexEmptyInput ? 1 : 0);
 
                         if (sideButtons != null) {
                             sideButtons.showButton(ChatActivitySideControlsButtonsLayout.BUTTON_ATTACH, captionNearAttach, true);
@@ -8338,9 +8354,9 @@ public class ChatActivityEnterView extends FrameLayout implements
                                 attachButton.setScaleY(captionNearAttach ? 0.5f : 1.0f);
                             }
                         } else if (attachButton != null) {
-                            attachButton.setAlpha(attachButtonAlpha = 0.0f);
-                            attachButton.setScaleX(0.5f);
-                            attachButton.setScaleY(0.5f);
+                            attachButton.setAlpha(attachButtonAlpha = codexEmptyInput ? 1.0f : 0.0f);
+                            attachButton.setScaleX(codexEmptyInput ? 1.0f : 0.5f);
+                            attachButton.setScaleY(codexEmptyInput ? 1.0f : 0.5f);
                         }
                     }
                     scheduleButtonHidden = true;
@@ -8356,17 +8372,22 @@ public class ChatActivityEnterView extends FrameLayout implements
                     }
                 }
             } else {
-                if (sideButtons != null) {
-                    sideButtons.showButton(ChatActivitySideControlsButtonsLayout.BUTTON_ATTACH, captionNearAttach, true);
+                if (sideButtons != null || com.butang.codextop.CodexRuntime.enabled()) {
+                    if (sideButtons != null) {
+                        sideButtons.showButton(ChatActivitySideControlsButtonsLayout.BUTTON_ATTACH, captionNearAttach, true);
+                    } else {
+                        updateFieldRight(codexEmptyInput ? 1 : 0);
+                    }
+                    final boolean hideAttachButton = sideButtons != null ? captionNearAttach : !codexEmptyInput;
                     if (attachButton != null) {
                         if (attachButtonAnimator != null) {
                             attachButtonAnimator.cancel();
                             attachButtonAnimator = null;
                         }
                         attachButtonAnimator = attachButton.animate()
-                            .alpha(attachButtonAlpha = captionNearAttach ? 0.0f : 1.0f)
-                            .scaleX(captionNearAttach ? 0.5f : 1.0f)
-                            .scaleY(captionNearAttach ? 0.5f : 1.0f)
+                            .alpha(attachButtonAlpha = hideAttachButton ? 0.0f : 1.0f)
+                            .scaleX(hideAttachButton ? 0.5f : 1.0f)
+                            .scaleY(hideAttachButton ? 0.5f : 1.0f)
                             .setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT)
                             .setDuration(320);
                         attachButtonAnimator.start();
