@@ -26,9 +26,11 @@ public final class SessionStatus {
             this.questionIds = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(questionIds));
         }
 
-        /** 失效保留上次事实供说明，但禁止将其继续显示为实时运行或完成。 */
+        /** 失效时明确标注已验证的上次事实和本次原因，不续有效期或重复叠加前缀。 */
         private Snapshot invalid(String validity, String label) {
-            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, label, questionIds);
+            String previous = knownLabel(state, pendingKind);
+            String display = previous == null ? label : "上次：" + previous + " · " + label;
+            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, display, questionIds);
         }
     }
 
@@ -200,19 +202,24 @@ public final class SessionStatus {
         return known(state, pending, source, turnId, eventAt, checkedAt, receivedAt, questionIds);
     }
 
-    /** 两种来源只在此处将已校验事实映射为可读标签；UI 不反向解析标签。 */
+    /** 两种来源只在此处创建当前事实；历史说明复用文字映射，不授予当前有效性。 */
     private static Snapshot known(String state, String pending, String source, String turnId,
             long eventAt, long checkedAt, long receivedAt, java.util.Set<String> questionIds) {
-        String label;
-        switch (state) {
-            case "running": label = "运行中"; break;
-            case "completed": label = "已完成"; break;
-            case "failed": label = "执行失败"; break;
-            case "cancelled": label = "已取消"; break;
-            case "needs_input": label = "question".equals(pending) ? "待你回复" : "approval".equals(pending)
-                    ? "待批准" : "mixed".equals(pending) ? "待你回复／批准" : "待处理"; break;
-            default: return unknown("unknown", "状态未知", receivedAt);
-        }
+        String label = knownLabel(state, pending);
+        if (label == null) return unknown("unknown", "状态未知", receivedAt);
         return new Snapshot(state, pending, "current", source, turnId, eventAt, checkedAt, receivedAt, label, questionIds);
+    }
+
+    /** 仅映射既有明确状态；当前和上次文案共用，不从显示文字恢复事实。 */
+    private static String knownLabel(String state, String pending) {
+        switch (state) {
+            case "running": return "运行中";
+            case "completed": return "已完成";
+            case "failed": return "执行失败";
+            case "cancelled": return "已取消";
+            case "needs_input": return "question".equals(pending) ? "待你回复" : "approval".equals(pending)
+                    ? "待批准" : "mixed".equals(pending) ? "待你回复／批准" : "待处理";
+            default: return null;
+        }
     }
 }

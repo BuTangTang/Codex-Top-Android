@@ -166,14 +166,14 @@ public final class DialogCellCodexSubtitleTest {
                 cell.clearingDialog=false;cell.codex=false;check(cell.preview().length()==0,"普通 Telegram 空消息改变");
                 cell.codex=true;cell.currentDialogFolderId=1;check("archive".contentEquals(cell.preview()),"原文件夹摘要改变");
                 cell.currentDialogFolderId=0;CodexRuntime.now=15100;
-                check("状态已过期".contentEquals(cell.preview()),"过期状态冒充运行");
+                check("上次：运行中 · 状态已过期".contentEquals(cell.preview()),"过期状态未保留上次事实或冒充当前运行");
                 reset();CodexRuntime.store.unavailable("machine",120);CodexRuntime.now=121;
-                check("连接暂不可用".contentEquals(cell.preview()),"断连标签没有沿用");
+                check("上次：运行中 · 连接暂不可用".contentEquals(cell.preview()),"断连标签未保留上次事实与不可用说明");
                 CodexRuntime.store=new SessionStatus.Store();check("同步中".contentEquals(cell.preview()),"缺失事实没有明确显示");
                 CodexRuntime.store.candidate(1,"machine",new JsonObject(),100,110,false);
                 check("状态未知".contentEquals(cell.preview()),"未知事实没有明确显示");
                 CodexRuntime.store=new SessionStatus.Store();CodexRuntime.store.candidate(1,"machine",candidate("running"),100,110,true);
-                check("状态未更新".contentEquals(cell.preview()),"磁盘缓存获得当前运行文字");
+                check("上次：运行中 · 状态未更新".contentEquals(cell.preview()),"磁盘缓存未标注上次事实或获得当前运行文字");
             }
             static void statusRebuild(){
                 reset();DialogSubtitleProbe cell=new DialogSubtitleProbe();

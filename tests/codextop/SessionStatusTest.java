@@ -38,6 +38,7 @@ public final class SessionStatusTest {
         listAndConversationShareFacts();
         expirationAndRecovery();
         listFailureDoesNotDisconnectNewerObservations();
+        invalidLabelsKeepLastKnownFact();
         System.out.println("SessionStatus: 生命周期事实、缺失身份、未知协议和连接状态区分通过");
     }
 
@@ -190,6 +191,58 @@ public final class SessionStatusTest {
         snapshot(store, 1, 900000, "running", "none", "stale");
         store.candidate(1, "machine", JsonParser.parseString("{\"activity\":\"running\",\"updatedAtMs\":999999}").getAsJsonObject(), 900001, 900002, false);
         snapshot(store, 1, 900003, "unknown", "unknown", "unknown");
+    }
+
+    /** 冷缓存和失效只补上次事实说明，不续有效期、嵌套前缀或恢复旧待办权限。 */
+    private static void invalidLabelsKeepLastKnownFact() {
+        SessionStatus.Store store = new SessionStatus.Store();
+        String[][] facts = {
+                {"completed", "", "已完成"}, {"running", "", "运行中"},
+                {"failed", "", "执行失败"}, {"cancelled", "", "已取消"},
+                {"needs_input", "user_action_request", "待你回复"},
+                {"needs_input", "permission_request", "待批准"}
+        };
+        for (int i = 0; i < facts.length; i++) {
+            String[] fact = facts[i];
+            long id = i + 1;
+            store.candidate(id, "machine", candidate(fact[0], fact[1]), -1, -1, true);
+            label(store, id, 100, "上次：" + fact[2] + " · 状态未更新");
+            if (!"stale".equals(store.get(id, 100).validity)) throw new AssertionError("缓存状态重新获得有效期");
+        }
+        var before = store.get(5, 100);
+        store.listFailed("machine", 200);
+        label(store, 1, 201, "上次：已完成 · 状态暂不可用");
+        store.unavailable("machine", 300);
+        store.unavailable("machine", 301);
+        label(store, 5, 302, "上次：待你回复 · 连接暂不可用");
+        var after = store.get(5, 302);
+        if (!"unavailable".equals(after.validity) || !before.state.equals(after.state)
+                || !before.pendingKind.equals(after.pendingKind) || !before.source.equals(after.source)
+                || !before.turnId.equals(after.turnId) || !before.questionIds.equals(after.questionIds)
+                || before.eventAtMs != after.eventAtMs || before.checkedAtMs != after.checkedAtMs
+                || before.observedAtElapsedMs != after.observedAtElapsedMs)
+            throw new AssertionError("失效文案改变了原事实、来源或有效性");
+        store.candidate(1, "machine", candidate("running", ""), 400, 410, false);
+        label(store, 1, 15399, "运行中");
+        snapshot(store, 1, 15399, "running", "none", "current");
+        label(store, 1, 15400, "上次：运行中 · 状态已过期");
+        label(store, 1, 15401, "上次：运行中 · 状态已过期");
+        snapshot(store, 1, 15401, "running", "none", "stale");
+        store.candidate(1, "machine", candidate("completed", ""), 16000, 16010, false);
+        label(store, 1, 16011, "已完成");
+        store.candidate(1, "machine", JsonParser.parseString("{\"activity\":\"running\"}").getAsJsonObject(), 17000, 17010, false);
+        label(store, 1, 17011, "状态未知");
+        store.listFailed("machine", 17100);
+        label(store, 1, 17101, "状态暂不可用");
+        store.unavailable("machine", 17200);
+        label(store, 1, 17201, "连接暂不可用");
+        label(store, 99, 17201, "同步中");
+    }
+
+    /** 断言真实快照的原位文案，不根据展示文字推断状态。 */
+    private static void label(SessionStatus.Store store, long dialogId, long now, String expected) {
+        String actual = store.get(dialogId, now).label;
+        if (!expected.equals(actual)) throw new AssertionError("Expected " + expected + ", got " + actual);
     }
 
     /** 合成同次候选事实，使用独立于手机时间的电脑时间域。 */
