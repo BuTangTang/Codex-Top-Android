@@ -17,8 +17,11 @@ import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.AnimatorSet;
 import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.ColorFilter;
+import android.graphics.PixelFormat;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.drawable.BitmapDrawable;
@@ -49,6 +52,7 @@ import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
+import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
 import org.telegram.tgnet.ConnectionsManager;
@@ -84,6 +88,7 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
     private SimpleTextView titleTextView;
     private AtomicReference<SimpleTextView> titleTextLargerCopyView = new AtomicReference<>();
     private SimpleTextView subtitleTextView;
+    private CodexRunningDrawable codexRunningDrawable;
     private AnimatedTextView animatedSubtitleTextView;
     private AtomicReference<SimpleTextView> subtitleTextLargerCopyView = new AtomicReference<>();
     private ImageView timeItem;
@@ -127,6 +132,81 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
 
     protected boolean useAnimatedSubtitle() {
         return false;
+    }
+
+    /** 在原副标题内复用列表圆环，不建立独立时钟或改变顶栏高度。 */
+    private class CodexRunningDrawable extends Drawable {
+        private final RadialProgressView progress;
+        private int alpha = 255;
+
+        /** 14 dp 外框包含 12 dp 弧线和原生 2 dp 线宽。 */
+        CodexRunningDrawable() {
+            progress = new RadialProgressView(getContext(), resourcesProvider);
+            progress.setSize(dp(12));
+            progress.setStrokeWidth(2);
+            progress.setUseSelfAlpha(true);
+        }
+
+        /** 与会话列表共用绘制帧时间，仅前台可见且允许动画时请求下一帧。 */
+        @Override
+        public void draw(@NonNull Canvas canvas) {
+            if (!isVisible() || alpha == 0 || parentFragment == null) {
+                return;
+            }
+            com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(parentFragment.getDialogId());
+            if (!"current".equals(status.validity) || !"running".equals(status.state)) {
+                return;
+            }
+            boolean animate = ChatAvatarContainer.this.isAttachedToWindow() && isShown()
+                    && getWindowVisibility() == VISIBLE && !ApplicationLoader.mainInterfacePaused
+                    && !parentFragment.isPaused() && SharedConfig.animationsEnabled()
+                    && (android.os.Build.VERSION.SDK_INT < 26 || ValueAnimator.areAnimatorsEnabled());
+            progress.setProgressColor(getThemedColor(Theme.key_windowBackgroundWhiteBlueText));
+            progress.setAlpha(alpha / 255f);
+            progress.drawIndeterminateAtTime(canvas, getBounds().exactCenterX(), getBounds().exactCenterY(),
+                    animate ? ChatAvatarContainer.this.getDrawingTime() : 0);
+            if (animate && subtitleTextView != null) {
+                subtitleTextView.postInvalidateOnAnimation();
+            }
+        }
+
+        /** 保留原 Drawable 的透明度更新及一次性重绘。 */
+        @Override
+        public void setAlpha(int alpha) {
+            if (this.alpha != alpha) {
+                this.alpha = alpha;
+                invalidateSelf();
+            }
+        }
+
+        /** 向原 Drawable 生命周期返回当前透明度。 */
+        @Override
+        public int getAlpha() {
+            return alpha;
+        }
+
+        /** 圆环沿列表主题蓝色绘制，不叠加其他状态着色。 */
+        @Override
+        public void setColorFilter(ColorFilter colorFilter) {
+        }
+
+        /** 原副标题只需为透明圆弧预留固定宽高。 */
+        @Override
+        public int getOpacity() {
+            return PixelFormat.TRANSLUCENT;
+        }
+
+        /** 图形尺寸包含描边，避免原副标题裁切。 */
+        @Override
+        public int getIntrinsicWidth() {
+            return dp(14);
+        }
+
+        /** 沿原文字垂直居中，不增加行高。 */
+        @Override
+        public int getIntrinsicHeight() {
+            return dp(14);
+        }
     }
 
     public void hideSubtitle() {
@@ -255,7 +335,9 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
                 parentFragment.getChatMode() == ChatActivity.MODE_PINNED ||
                 parentFragment.getChatMode() == ChatActivity.MODE_QUICK_REPLIES ||
                 parentFragment.getChatMode() == ChatActivity.MODE_WELCOME_MESSAGES ||
-                parentFragment.getChatMode() == ChatActivity.MODE_EDIT_BUSINESS_LINK
+                parentFragment.getChatMode() == ChatActivity.MODE_EDIT_BUSINESS_LINK ||
+                // Codex 从首次测量即沿原无头像布局，避免进入时闪现 C 头像。
+                com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(parentFragment.getDialogId())
             );
             if (avatarImageIsHidden) {
                 avatarImageView.setVisibility(GONE);
@@ -1090,7 +1172,7 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
 
     private boolean showingSavedMessagesHint;
 
-    /** 原双行顶栏展示完整标题和状态/电脑，长名称沿原布局省略。 */
+    /** 原双行顶栏展示标题和状态/电脑，仅有效运行状态在副标题前显示同步圆环。 */
     public void updateSubtitle(boolean animated) {
         if (parentFragment == null) {
             return;
@@ -1100,10 +1182,22 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
             long dialogId = parentFragment.getDialogId();
             com.butang.codextop.CodexRuntime.ConversationInfo source = com.butang.codextop.CodexRuntime.conversationInfo(dialogId);
             com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(dialogId);
+            avatarImageIsHidden = true;
+            avatarImageView.setVisibility(GONE);
+            if (subtitleTextView != null) {
+                boolean running = "current".equals(status.validity) && "running".equals(status.state);
+                if (running && codexRunningDrawable == null) {
+                    codexRunningDrawable = new CodexRunningDrawable();
+                }
+                subtitleTextView.setLeftDrawable(running ? codexRunningDrawable : null);
+            }
             setTitle(TextUtils.isEmpty(source.title) ? "未命名对话" : source.title);
             setSubtitle(status.label + " · " + (TextUtils.isEmpty(source.machineName) ? "电脑未知" : source.machineName));
             getSubtitleTextView().setVisibility(VISIBLE);
             return;
+        }
+        if (codexRunningDrawable != null && subtitleTextView != null && subtitleTextView.getLeftDrawable() == codexRunningDrawable) {
+            subtitleTextView.setLeftDrawable(null);
         }
         if (parentFragment.getChatMode() == ChatActivity.MODE_EDIT_BUSINESS_LINK) {
             setSubtitle(BusinessLinksController.stripHttps(parentFragment.businessLink.link));
