@@ -65,7 +65,7 @@ public final class DialogCellCodexSubtitleTest {
                 "    private boolean updateCodexPreview(int mask) {", "\n    /** 只画 14dp 蓝环"));
         String statusColumnSource = between(source,
                 "        // 原计数、失败及标记槽已从 messageWidth 扣除，状态只占剩余文字区域，不能盖住它们。",
-                "\n        if (checkMessage)");
+                "\n        messageString = codexReadablePreview(messageString);");
         var statusColumn = StaticJavaParser.parseStatement(statusColumnSource.substring(statusColumnSource.indexOf("        if (")).trim());
         var avatarHit = StaticJavaParser.parseMethodDeclaration(between(source,
                 "    public boolean isPointInsideAvatar(float x, float y) {", "\n    public void setDialogSelected"));
@@ -117,11 +117,269 @@ public final class DialogCellCodexSubtitleTest {
                     throw new AssertionError("原列表副标题回归失败", error.getCause());
                 }
             }
+            previewGate(source);
         } finally {
             try (var paths = Files.walk(temp)) {
                 for (Path path : paths.sorted(Comparator.reverseOrder()).toArray(Path[]::new)) Files.delete(path);
             }
         }
+    }
+
+    /**
+     * 执行真实预览门禁。草稿、搜索、媒体、说明和非 Codex 行必须返回原对象；多选不另开判断。
+     */
+    private static void previewGate(String source) throws Exception {
+        String call = "messageString = codexReadablePreview(messageString);";
+        int use = source.indexOf(call);
+        int again = use < 0 ? -1 : source.indexOf(call, use + call.length());
+        int cut = source.indexOf("TextUtils.ellipsize(messageString", Math.max(use, 0));
+        int checkAt = source.indexOf("        if (checkMessage) {");
+        String checkBlock = checkAt < 0 ? "" : extractBlock(source, checkAt);
+        int truncate = checkBlock.indexOf("mess = mess.subSequence(0, 150);");
+        int emoji = checkBlock.indexOf("Emoji.replaceEmoji");
+        if (use < 0 || again >= 0 || cut < 0 || checkAt < 0 || truncate < 0 || emoji < 0) {
+            throw new AssertionError("文字预览缺少折叠、截断或 emoji");
+        }
+        String pipeline = use < checkAt ? call + "\n" + checkBlock : checkBlock + "\n" + call;
+        String method = extractMethod(source, "private CharSequence codexReadablePreview(CharSequence messageString)");
+        if (method.contains("shouldUseCompactCodexLayout") || method.contains("checkBox") || method.contains("isActionModeShowed")) {
+            throw new AssertionError("多选另开了预览判断");
+        }
+        Path temp = Files.createTempDirectory("codex-dialog-preview-gate-");
+        try {
+            Files.writeString(temp.resolve("AndroidUtilities.java"), """
+                    package org.telegram.messenger;
+                    public final class AndroidUtilities {
+                        private AndroidUtilities() {}
+                        public static CharSequence replaceNewLines(CharSequence original) {
+                            if (original == null || original.toString().indexOf('\\n') < 0) return original;
+                            if (original instanceof android.text.SpannableStringBuilder) return original;
+                            return original.toString().replace('\\n', ' ');
+                        }
+                        public static CharSequence replaceTwoNewLinesToOne(CharSequence original) { return replaceNewLines(original); }
+                        public static CharSequence highlightText(CharSequence text, Object words, Object resources) { return null; }
+                    }
+                    """);
+            Files.writeString(temp.resolve("Emoji.java"), """
+                    package org.telegram.messenger;
+                    public final class Emoji {
+                        public static CharSequence replaceEmoji(CharSequence text, Object metrics, boolean only) {
+                            if (text != null && text.toString().contains("😊")) return new EmojiMarked(text);
+                            return text;
+                        }
+                        public static final class EmojiMarked implements CharSequence {
+                            public final CharSequence inner;
+                            public EmojiMarked(CharSequence inner) { this.inner = inner; }
+                            public int length() { return inner.length(); }
+                            public char charAt(int index) { return inner.charAt(index); }
+                            public CharSequence subSequence(int start, int end) { return inner.subSequence(start, end); }
+                            public String toString() { return inner.toString(); }
+                        }
+                    }
+                    """);
+            Files.writeString(temp.resolve("SharedConfig.java"), """
+                    package org.telegram.messenger;
+                    public final class SharedConfig { public static boolean useThreeLinesLayout; }
+                    """);
+            Files.writeString(temp.resolve("Theme.java"), """
+                    package org.telegram.ui.ActionBar;
+                    public final class Theme {
+                        public static final Paint[] dialogs_messagePaint = { new Paint() };
+                        public static final class Paint { public Object getFontMetricsInt() { return null; } }
+                    }
+                    """);
+            Files.writeString(temp.resolve("Spanned.java"), """
+                    package android.text;
+                    public interface Spanned extends CharSequence {
+                        int getSpanStart(Object span);
+                        int getSpanEnd(Object span);
+                        int getSpanFlags(Object span);
+                        Object[] getSpans(int start, int end, Class type);
+                    }
+                    """);
+            Files.writeString(temp.resolve("Spannable.java"), """
+                    package android.text;
+                    public interface Spannable extends Spanned {
+                        void setSpan(Object span, int start, int end, int flags);
+                        void removeSpan(Object span);
+                    }
+                    """);
+            Files.writeString(temp.resolve("SpannableStringBuilder.java"), """
+                    package android.text;
+                    import java.util.ArrayList;
+                    public class SpannableStringBuilder implements Spannable {
+                        private final StringBuilder text;
+                        private final ArrayList<Mark> marks = new ArrayList<>();
+                        public SpannableStringBuilder(CharSequence value) { text = new StringBuilder(value.toString()); }
+                        public int length() { return text.length(); }
+                        public char charAt(int index) { return text.charAt(index); }
+                        public CharSequence subSequence(int start, int end) { return new SpannableStringBuilder(text.subSequence(start, end)); }
+                        public String toString() { return text.toString(); }
+                        public void setSpan(Object span, int start, int end, int flags) { marks.add(new Mark(span, start, end, flags)); }
+                        public void removeSpan(Object span) { marks.removeIf(mark -> mark.span == span); }
+                        public Object[] getSpans(int start, int end, Class type) {
+                            ArrayList<Object> found = new ArrayList<>();
+                            for (Mark mark : marks) if (mark.start < end && mark.end > start) found.add(mark.span);
+                            return found.toArray();
+                        }
+                        public int getSpanStart(Object span) { for (Mark mark : marks) if (mark.span == span) return mark.start; return -1; }
+                        public int getSpanEnd(Object span) { for (Mark mark : marks) if (mark.span == span) return mark.end; return -1; }
+                        public int getSpanFlags(Object span) { for (Mark mark : marks) if (mark.span == span) return mark.flags; return 0; }
+                        static final class Mark {
+                            final Object span; final int start, end, flags;
+                            Mark(Object span, int start, int end, int flags) { this.span = span; this.start = start; this.end = end; this.flags = flags; }
+                        }
+                    }
+                    """);
+            Files.writeString(temp.resolve("DialogPreviewGate.java"), """
+                    package com.butang.codextop;
+                    import org.telegram.messenger.AndroidUtilities;
+                    import org.telegram.messenger.Emoji;
+                    import org.telegram.messenger.SharedConfig;
+                    import org.telegram.ui.ActionBar.Theme;
+                    public final class DialogPreviewGate {
+                        boolean codex = true;
+                        boolean draftVoice;
+                        boolean checkMessage = true;
+                        boolean useForceThreeLines;
+                        Object draftMessage;
+                        Object messageNameString;
+                        Object resourcesProvider;
+                        int paintIndex;
+                        CharSequence messageString;
+                        MessageObject message;
+                        boolean selected;
+                        boolean hasCodexStatusAvatar() { return codex; }
+                        boolean hasTags() { return false; }
+                        MessageObject getCaptionMessage() { return message != null && message.caption ? message : null; }
+                        static final class R { static final class string { static final int AttachPhoto = 1; } }
+                        String getString(int id) { return id == R.string.AttachPhoto ? "AttachPhoto" : Integer.toString(id); }
+                    """ + method + """
+                        void originalOrder() {
+                    """ + pipeline + """
+                        }
+                        CharSequence apply(String text) { return codexReadablePreview(text); }
+                        static void check(boolean ok, String reason) { if (!ok) throw new AssertionError(reason); }
+                        public static void main(String[] args) {
+                            DialogPreviewGate cell = new DialogPreviewGate();
+                            cell.message = new MessageObject();
+                            String markdown = "请看 [文档](https://example.com/a)";
+                            check("请看 文档".contentEquals(cell.apply(markdown)), "普通 Codex 文字没有折叠链接");
+                            cell.selected = true;
+                            check("请看 文档".contentEquals(cell.apply(markdown)), "多选时预览折叠被关掉");
+                            String draft = "[草稿](https://example.com/a)";
+                            cell.draftMessage = draft;
+                            check(cell.apply(draft) == draft, "草稿被折叠");
+                            cell.draftMessage = null;
+                            cell.draftVoice = true;
+                            check(cell.apply(draft) == draft, "语音草稿被折叠");
+                            cell.draftVoice = false;
+                            cell.message.highlighted = true;
+                            check(cell.apply(markdown) == markdown, "搜索高亮被折叠");
+                            cell.message.highlighted = false;
+                            cell.message.mediaEmpty = false;
+                            check(cell.apply(markdown) == markdown, "媒体行被折叠");
+                            cell.message.mediaEmpty = true;
+                            cell.message.caption = true;
+                            check(cell.apply(markdown) == markdown, "媒体说明被折叠");
+                            cell.message.caption = false;
+                            cell.codex = false;
+                            check(cell.apply(markdown) == markdown, "普通 Telegram 行被折叠");
+                            cell.codex = true;
+                            cell.messageString = "请看 [界面](https://example.com/" + "x".repeat(180) + ")";
+                            cell.originalOrder();
+                            check("请看 界面".contentEquals(cell.messageString), "完整长链接先被截断，目标泄漏");
+                            cell.messageString = "```java\\nint x = 1;\\n```";
+                            cell.originalOrder();
+                            check("int x = 1;".contentEquals(cell.messageString), "代码围栏的换行先被抹掉，语言头留了下来");
+                            android.text.SpannableStringBuilder marked = new android.text.SpannableStringBuilder("看 [说明](https://example.com) 😊");
+                            Object keep = new Object();
+                            marked.setSpan(keep, 0, 1, 0);
+                            cell.messageString = marked;
+                            cell.originalOrder();
+                            check(cell.messageString instanceof Emoji.EmojiMarked, "改写后的 emoji 没有再走原有 emoji 处理");
+                            android.text.Spanned inner = (android.text.Spanned) ((Emoji.EmojiMarked) cell.messageString).inner;
+                            check("看 说明 😊".contentEquals(inner), "带 emoji 的链接没有留下标签");
+                            check(inner.getSpanStart(keep) == 0, "保留文字上的 span 在改写后丢失");
+                            String oversized = "请看 [文档](https://example.com/a) " + "字".repeat(5000);
+                            cell.messageString = oversized;
+                            cell.originalOrder();
+                            check(oversized.substring(0, 150).contentEquals(cell.messageString), "超长文字没有退回原有 150 字截断");
+                            System.out.println("PASS Codex dialog preview gate");
+                        }
+                        static final class MessageObject {
+                            boolean highlighted;
+                            boolean mediaEmpty = true;
+                            boolean caption;
+                            Object highlightedWords;
+                            boolean hasHighlightedWords() { return highlighted; }
+                            boolean isMediaEmpty() { return mediaEmpty; }
+                        }
+                    }
+                    """);
+            if (ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", temp.toString(),
+                    temp.resolve("Spanned.java").toString(),
+                    temp.resolve("Spannable.java").toString(),
+                    temp.resolve("SpannableStringBuilder.java").toString(),
+                    temp.resolve("AndroidUtilities.java").toString(),
+                    temp.resolve("Emoji.java").toString(),
+                    temp.resolve("SharedConfig.java").toString(),
+                    temp.resolve("Theme.java").toString(),
+                    temp.resolve("DialogPreviewGate.java").toString(),
+                    "TMessagesProj/src/main/java/com/butang/codextop/CodexDialogPreview.java") != 0) {
+                throw new AssertionError("预览门禁夹具编译失败");
+            }
+            var classpath = new ArrayList<URL>();
+            classpath.add(temp.toUri().toURL());
+            for (String entry : System.getProperty("java.class.path").split(java.io.File.pathSeparator)) {
+                classpath.add(Path.of(entry).toUri().toURL());
+            }
+            try (var loader = new URLClassLoader(classpath.toArray(URL[]::new), ClassLoader.getPlatformClassLoader())) {
+                try {
+                    loader.loadClass("com.butang.codextop.DialogPreviewGate").getMethod("main", String[].class)
+                            .invoke(null, (Object) new String[0]);
+                } catch (java.lang.reflect.InvocationTargetException error) {
+                    throw new AssertionError("预览门禁回归失败", error.getCause());
+                }
+            }
+        } finally {
+            try (var paths = Files.walk(temp)) {
+                for (Path path : paths.sorted(Comparator.reverseOrder()).toArray(Path[]::new)) Files.deleteIfExists(path);
+            }
+        }
+    }
+
+    /** 按花括号提取一个完整方法，避免为整份列表单元格建立语法树。 */
+    private static String extractMethod(String source, String signature) {
+        int start = source.indexOf(signature);
+        int open = start < 0 ? -1 : source.indexOf('{', start);
+        if (start < 0 || open < 0) throw new AssertionError("缺少方法 " + signature);
+        int depth = 0;
+        for (int index = open; index < source.length(); index++) {
+            char value = source.charAt(index);
+            if (value == '{') depth++;
+            else if (value == '}') {
+                depth--;
+                if (depth == 0) return source.substring(start, index + 1);
+            }
+        }
+        throw new AssertionError("方法没有结束 " + signature);
+    }
+
+    /** 提取从起点开始的完整花括号块，供按源码顺序执行预览。 */
+    private static String extractBlock(String source, int start) {
+        int open = start < 0 ? -1 : source.indexOf('{', start);
+        if (open < 0) throw new AssertionError("缺少预览处理块");
+        int depth = 0;
+        for (int index = open; index < source.length(); index++) {
+            char value = source.charAt(index);
+            if (value == '{') depth++;
+            else if (value == '}') {
+                depth--;
+                if (depth == 0) return source.substring(start, index + 1);
+            }
+        }
+        throw new AssertionError("预览处理块没有结束");
     }
 
     /** 提取已知代码边界；原结构改变时明确失败，避免测试静默漏验。 */

@@ -2666,6 +2666,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 messageWidth -= statusWidth + dp(8) + thumbnailExpansion;
             }
         }
+        // 普通文字先交给列表折叠；超过折叠上限时退回原文。下面仍是原有的 150 字截断、换行和 emoji。
+        messageString = codexReadablePreview(messageString);
         if (checkMessage) {
             if (messageString == null) {
                 messageString = "";
@@ -5765,6 +5767,18 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
         event.setContentDescription(sb);
         setContentDescription(sb);
+    }
+
+    /**
+     * 截断前只折叠普通 Codex 文字预览。
+     * 草稿、搜索高亮、媒体和说明保持原 CharSequence；多选仍走这一判断，不看勾选槽。
+     */
+    private CharSequence codexReadablePreview(CharSequence messageString) {
+        if (!hasCodexStatusAvatar() || draftVoice || draftMessage != null || message == null
+                || message.hasHighlightedWords() || !message.isMediaEmpty() || getCaptionMessage() != null) {
+            return messageString;
+        }
+        return com.butang.codextop.CodexDialogPreview.readable(messageString, getString(R.string.AttachPhoto));
     }
 
     private MessageObject getCaptionMessage() {
