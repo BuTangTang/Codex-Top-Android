@@ -1,8 +1,13 @@
 package com.butang.codextop;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.Strictness;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import java.io.StringReader;
 import java.util.ArrayList;
 
 /** 将现有桌面历史契约投影为原生消息模型所需的文字，不展示工具调用。 */
@@ -25,7 +30,7 @@ public final class TranscriptText {
         this.attachments = attachments;
     }
 
-    /** 只读取用户文字和主对话助手文字；保留顺序，隐藏助手末尾的内部引用元数据。 */
+    /** 只读取用户文字和主对话助手文字；原生回答只作可读投影，助手末尾内部引用隐藏。 */
     public static ArrayList<TranscriptText> read(JsonArray items) {
         ArrayList<TranscriptText> result = new ArrayList<>();
         for (JsonElement element : items) {
@@ -54,6 +59,7 @@ public final class TranscriptText {
             if (!mainMessage) continue;
             java.util.List<DesktopAttachment> attachments = DesktopAttachment.readRaw(raw);
             if (text != null && "agent".equals(role)) text = visibleAssistantText(text);
+            if (text != null && "user".equals(role)) text = visibleUserText(text);
             if (attachments.isEmpty()) {
                 if (text != null && !text.trim().isEmpty())
                     result.add(new TranscriptText(item, text, "user".equals(role), attachments, 0));
@@ -76,6 +82,55 @@ public final class TranscriptText {
     /** 仅移除独立位于回复末尾的完整内部引用块；正文中引用或未闭合内容原样保留。 */
     private static String visibleAssistantText(String text) {
         return text.replaceFirst("(?s)(?:\\A|\\r?\\n)[\\t \\r\\n]*<oai-mem-citation>\\s*<citation_entries>.*?</citation_entries>\\s*<rollout_ids>.*?</rollout_ids>\\s*</oai-mem-citation>\\s*$", "");
+    }
+
+    /** 完整异步回答封套仅转换可见文字；引用、正文嵌入及非法结构原样保留，不据此确认提交或状态。 */
+    private static String visibleUserText(String text) {
+        String source = text.trim();
+        String start = "<send_user_message_question_reply>", end = "</send_user_message_question_reply>";
+        if (!source.startsWith(start) || !source.endsWith(end)) return text;
+        try {
+            JsonElement payload = questionReplyJson(source.substring(start.length(), source.length() - end.length()));
+            JsonArray replies;
+            if (payload.isJsonObject()) {
+                replies = new JsonArray(); replies.add(payload);
+            } else if (payload.isJsonArray()) replies = payload.getAsJsonArray();
+            else return text;
+            if (replies.size() == 0) return text;
+            StringBuilder visible = new StringBuilder();
+            // 整批校验后才返回文字，不能把部分合法回答从含未知内容的封套中摘出来。
+            for (JsonElement entry : replies) {
+                if (!entry.isJsonObject()) return text;
+                JsonObject reply = entry.getAsJsonObject();
+                String questionId = string(reply, "questionItemId"), question = string(reply, "question"), answer = string(reply, "answer");
+                if (reply.size() != 3 || questionId == null || question == null || answer == null) return text;
+                JsonElement parsedId = questionReplyJson(questionId);
+                if (!parsedId.isJsonArray()) return text;
+                JsonArray identity = parsedId.getAsJsonArray();
+                if (identity.size() != 3 || !identity.get(0).isJsonPrimitive() || !identity.get(0).getAsJsonPrimitive().isString()
+                        || !"request_user_input_async".equals(identity.get(0).getAsString())
+                        || !identity.get(1).isJsonPrimitive() || !identity.get(1).getAsJsonPrimitive().isString()
+                        || identity.get(1).getAsString().trim().isEmpty()
+                        || !identity.get(2).isJsonPrimitive() || !identity.get(2).getAsJsonPrimitive().isNumber()) return text;
+                if (identity.get(2).getAsBigDecimal().intValueExact() < 0) return text;
+                if (visible.length() > 0) visible.append("\n\n");
+                visible.append(question).append('\n').append(answer);
+            }
+            // 空问题和空答案不能让原本可见的封套消息消失。
+            return visible.toString().trim().isEmpty() ? text : visible.toString();
+        } catch (java.io.IOException | RuntimeException invalid) {
+            return text;
+        }
+    }
+
+    /** 严格读取一份完整 JSON，拒绝注释、单引号及尾随正文，避免示例内容被误作原生封套。 */
+    private static JsonElement questionReplyJson(String source) throws java.io.IOException {
+        try (JsonReader reader = new JsonReader(new StringReader(source))) {
+            reader.setStrictness(Strictness.STRICT);
+            JsonElement value = new Gson().getAdapter(JsonElement.class).read(reader);
+            if (reader.peek() != JsonToken.END_DOCUMENT) throw new java.io.IOException("回答封套含尾随内容");
+            return value;
+        }
     }
 
     /** 读取可选文本，缺失或空值保持未知，避免把 null 变成界面正文。 */
