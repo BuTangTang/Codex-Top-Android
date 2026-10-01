@@ -1677,7 +1677,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                                 showChecks = false;
                                 drawTime = false;
                             } else {
-                                messageString = "";
+                                messageString = hasCodexStatusAvatar()
+                                        ? com.butang.codextop.CodexRuntime.status(currentDialogId).label : "";
                             }
                         }
                     } else {
@@ -3317,7 +3318,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             }
 
             if (mask != 0) {
-                boolean continueUpdate = false;
+                boolean continueUpdate = hasCodexStatusAvatar() && (mask & MessagesController.UPDATE_MASK_STATUS) != 0;
                 if (user != null && !MessagesController.isSupportUser(user) && !user.bot && (mask & MessagesController.UPDATE_MASK_STATUS) != 0) {
                     user = MessagesController.getInstance(currentAccount).getUser(user.id);
                     if (wasDrawnOnline != isOnline()) {
@@ -6290,7 +6291,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             if (hasCodexStatusAvatar()) {
                 codexTitle = com.butang.codextop.CodexRuntime.conversationInfo(currentDialogId).title;
                 com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
-                codexStatus = status.validity + ":" + status.state + ":" + status.pendingKind;
+                codexStatus = status.validity + ":" + status.state + ":" + status.pendingKind + ":" + status.label;
             }
             int messageHash = message == null ? 0 : message.getId() + message.hashCode();
             Integer printingType = null;
