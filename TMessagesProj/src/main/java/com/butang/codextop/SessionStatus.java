@@ -10,15 +10,52 @@ public final class SessionStatus {
     // 沿用原聊天状态的15秒有效期；不随列表周期延长，慢请求也消耗该窗口。
     public static final long FRESHNESS_MS = 15000;
 
+    /** 原STATUS目标事实，空值与零值分开；来源时间只展示，手机有效期使用原请求起点。 */
+    public static final class Goal {
+        public final String availability, validity, source, threadId, objective, status, label;
+        public final Long tokenBudget, tokensUsed, timeUsedSeconds;
+        public final long updatedAt, startedAtElapsedMs;
+
+        /** 保存协议原值及该值的请求起点，不制造进度、无限预算或本机计时。 */
+        private Goal(String availability, String validity, String source, String threadId, String objective,
+                String status, Long tokenBudget, Long tokensUsed, Long timeUsedSeconds, long updatedAt,
+                long startedAtElapsedMs, String label) {
+            this.availability=availability; this.validity=validity; this.source=source; this.threadId=threadId;
+            this.objective=objective; this.status=status; this.tokenBudget=tokenBudget; this.tokensUsed=tokensUsed;
+            this.timeUsedSeconds=timeUsedSeconds; this.updatedAt=updatedAt; this.startedAtElapsedMs=startedAtElapsedMs;
+            this.label=label;
+        }
+
+        /** 上次目标仍可只读查看，但必须同时显示失效原因；不会刷新原目标时刻。 */
+        private Goal invalid(String availability, String validity, String reason) {
+            String previous=goalLabel(status);
+            return new Goal(availability,validity,source,threadId,objective,status,tokenBudget,tokensUsed,
+                    timeUsedSeconds,updatedAt,startedAtElapsedMs,previous==null?reason:"上次："+previous+" · "+reason);
+        }
+
+        /** 是否实际保留来源目标，与生命周期是否正在运行无关。 */
+        public boolean hasValue() { return !objective.isEmpty(); }
+    }
+
     /** UI 只读快照；只有 validity=current 才能把 state 当作当前事实。时间缺失使用 -1。 */
     public static final class Snapshot {
         public final String state, pendingKind, validity, source, turnId, label;
         public final long eventAtMs, checkedAtMs, observedAtElapsedMs;
         public final java.util.Set<String> questionIds;
+        public final Goal goal;
 
         /** 保留来源事实与本机接收时刻，来源时钟不与手机墙钟比较。 */
         private Snapshot(String state, String pendingKind, String validity, String source, String turnId,
                 long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label, java.util.Set<String> questionIds) {
+            this(state,pendingKind,validity,source,turnId,eventAtMs,checkedAtMs,observedAtElapsedMs,label,questionIds,
+                    emptyGoal("unsupported","unsupported","目标信息暂不可用"));
+        }
+
+        /** 生命周期和目标分别失效，LIST不会借自己的请求起点延长目标。 */
+        private Snapshot(String state, String pendingKind, String validity, String source, String turnId,
+                long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label,
+                java.util.Set<String> questionIds, Goal goal) {
+            this.goal=goal;
             this.state = state; this.pendingKind = pendingKind; this.validity = validity;
             this.source = source; this.turnId = turnId; this.label = label;
             this.eventAtMs = eventAtMs; this.checkedAtMs = checkedAtMs;
@@ -30,7 +67,11 @@ public final class SessionStatus {
         private Snapshot invalid(String validity, String label) {
             String previous = knownLabel(state, pendingKind);
             String display = previous == null ? label : "上次：" + previous + " · " + label;
-            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, display, questionIds);
+            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, display, questionIds, goal);
+        }
+        /** 合并同一owner的目标投影，不改变原生命周期、来源和待办身份。 */
+        private Snapshot withGoal(Goal goal) {
+            return new Snapshot(state,pendingKind,validity,source,turnId,eventAtMs,checkedAtMs,observedAtElapsedMs,label,questionIds,goal);
         }
     }
 
@@ -42,11 +83,15 @@ public final class SessionStatus {
         /** 保存每条事实的原请求时刻，旧慢响应不能覆盖较新的观察或断连。 */
         private static final class Entry {
             final String machine;
-            final long startedAt;
+            final long startedAt, goalRequestedAt;
             final Snapshot snapshot;
             /** 合并本机请求顺序与来源归属，不存消息正文。 */
             Entry(String machine, long startedAt, Snapshot snapshot) {
-                this.machine = machine; this.startedAt = startedAt; this.snapshot = snapshot;
+                this(machine,startedAt,-1,snapshot);
+            }
+            /** 原Entry同时保留目标响应排序边界，不另建缓存或轮询owner。 */
+            Entry(String machine, long startedAt, long goalRequestedAt, Snapshot snapshot) {
+                this.machine=machine; this.startedAt=startedAt; this.goalRequestedAt=goalRequestedAt; this.snapshot=snapshot;
             }
         }
 
@@ -62,9 +107,28 @@ public final class SessionStatus {
             put(dialogId, machine, startedAt, snapshot);
         }
 
-        /** 消费当前聊天的原 STATUS 响应；与候选走同一缓存和待办判定。 */
+        /** 原生命周期调用兼容旧协议；未绑定remote时不接受可用目标。 */
         public void observation(long dialogId, String machine, JsonObject response, long startedAt, long receivedAt) {
-            put(dialogId, machine, startedAt, responseSnapshot(response, receivedAt));
+            observation(dialogId,machine,"",response,startedAt,receivedAt);
+        }
+
+        /** 同次STATUS分别合并两种事实；较新的LIST不能挡住较新的目标，也不能为旧目标续期。 */
+        public void observation(long dialogId, String machine, String remote, JsonObject response, long startedAt, long receivedAt) {
+            Long disconnected=unavailableAt.get(machine);
+            if(disconnected!=null&&startedAt<=disconnected)return;
+            Entry previous=entries.get(dialogId);
+            if(previous!=null&&!previous.machine.equals(machine))previous=null;
+            Snapshot snapshot=previous!=null&&startedAt<previous.startedAt?previous.snapshot:responseSnapshot(response,receivedAt);
+            long stateStartedAt=previous!=null&&startedAt<previous.startedAt?previous.startedAt:startedAt;
+            long goalRequestedAt=previous==null?-1:previous.goalRequestedAt;
+            Goal goal=previous==null?snapshot.goal:previous.snapshot.goal;
+            if(startedAt>=goalRequestedAt) {
+                Goal observed=goalSnapshot(response,remote,startedAt);
+                if(!"current".equals(observed.validity)&&goal.hasValue())
+                    observed=goal.invalid(observed.availability,observed.validity,observed.label);
+                goal=observed; goalRequestedAt=startedAt;
+            }
+            entries.put(dialogId,new Entry(machine,stateStartedAt,goalRequestedAt,snapshot.withGoal(goal)));
         }
 
         /** 合并规则只使用同一手机的请求顺序，不比较跨端墙钟。 */
@@ -73,7 +137,10 @@ public final class SessionStatus {
             Entry previous = entries.get(dialogId);
             if (disconnected != null && startedAt <= disconnected) return;
             if (previous != null && startedAt < previous.startedAt) return;
-            entries.put(dialogId, new Entry(machine, startedAt, snapshot));
+            if(previous!=null&&previous.machine.equals(machine))
+                snapshot=snapshot.withGoal(previous.snapshot.goal);
+            entries.put(dialogId, new Entry(machine, startedAt,
+                    previous!=null&&previous.machine.equals(machine)?previous.goalRequestedAt:-1,snapshot));
         }
 
         /** LIST 失败只失效尚未被更新观察替代的条目，不建立整机断连边界。 */
@@ -81,7 +148,7 @@ public final class SessionStatus {
             for (Map.Entry<Long, Entry> item : entries.entrySet()) {
                 Entry entry = item.getValue();
                 if (entry.machine.equals(machine) && entry.startedAt <= startedAt)
-                    item.setValue(new Entry(machine, startedAt,
+                    item.setValue(new Entry(machine, startedAt, entry.goalRequestedAt,
                             entry.snapshot.invalid("unavailable", "状态暂不可用")));
             }
         }
@@ -91,8 +158,9 @@ public final class SessionStatus {
             unavailableAt.put(machine, Math.max(now, unavailableAt.getOrDefault(machine, -1L)));
             for (Map.Entry<Long, Entry> item : entries.entrySet()) {
                 Entry entry = item.getValue();
-                if (entry.machine.equals(machine)) item.setValue(new Entry(machine, entry.startedAt,
-                        entry.snapshot.invalid("unavailable", "连接暂不可用")));
+                if (entry.machine.equals(machine)) item.setValue(new Entry(machine, entry.startedAt, entry.goalRequestedAt,
+                        entry.snapshot.invalid("unavailable", "连接暂不可用").withGoal(
+                                entry.snapshot.goal.invalid(entry.snapshot.goal.availability,"unavailable","连接暂不可用"))));
             }
         }
 
@@ -100,14 +168,80 @@ public final class SessionStatus {
         public Snapshot get(long dialogId, long now) {
             Entry entry = entries.get(dialogId);
             if (entry == null) return unknown("syncing", "同步中", -1);
-            if ("current".equals(entry.snapshot.validity)
+            Snapshot snapshot=entry.snapshot;
+            if ("current".equals(snapshot.validity)
                     && (now < entry.startedAt || now - entry.startedAt >= FRESHNESS_MS))
-                return entry.snapshot.invalid("stale", "状态已过期");
-            return entry.snapshot;
+                snapshot=snapshot.invalid("stale", "状态已过期");
+            Goal goal=snapshot.goal;
+            if("current".equals(goal.validity)&&(now<goal.startedAtElapsedMs||now-goal.startedAtElapsedMs>=FRESHNESS_MS))
+                snapshot=snapshot.withGoal(goal.invalid(goal.availability,"stale","目标已过期"));
+            return snapshot;
         }
 
         /** 账号退出清空展示事实和断连边界，不让下一账号继承状态。 */
         public void clear() { entries.clear(); unavailableAt.clear(); }
+    }
+
+    /** 无事实、明确没有目标及旧daemon缺字段保持不同，不把解析失败伪装成none。 */
+    private static Goal emptyGoal(String availability,String validity,String label) {
+        return new Goal(availability,validity,"","","","",null,null,null,-1,-1,label);
+    }
+
+    /** 原STATUS独立目标契约；不依赖生命周期turn或运行状态，身份绑定真实remote。 */
+    private static Goal goalSnapshot(JsonObject response,String remote,long startedAt) {
+        if(!flag(response,"ok")||!flag(response,"machineOnline"))return emptyGoal("unknown","unavailable","目标暂不可用");
+        if(!response.has("goal"))return emptyGoal("unsupported","unsupported","目标信息暂不可用");
+        JsonObject goal=object(response,"goal");
+        String availability=text(goal,"availability");
+        if(goal!=null&&"unknown".equals(availability)&&keys(goal,"availability"))
+            return emptyGoal("unknown","unknown","目标未知");
+        if(goal!=null&&"none".equals(availability)&&"desktop".equals(text(goal,"source"))&&keys(goal,"availability","source"))
+            return new Goal("none","current","desktop","","","",null,null,null,-1,startedAt,"没有目标");
+        try {
+            if(!"available".equals(availability)||!keys(goal,"availability","source","threadId","objective","status","tokenBudget","tokensUsed","timeUsedSeconds","updatedAt")
+                    ||!"desktop".equals(text(goal,"source"))||remote.isEmpty()||!remote.equals(text(goal,"threadId"))
+                    ||text(goal,"objective").trim().isEmpty()||goalLabel(text(goal,"status"))==null)
+                return emptyGoal("unknown","unknown","目标未知");
+            Long budget=goalNumber(goal,"tokenBudget",true),tokens=goalNumber(goal,"tokensUsed",true),seconds=goalNumber(goal,"timeUsedSeconds",true);
+            long updated=goalNumber(goal,"updatedAt",false);
+            return new Goal("available","current","desktop",remote,text(goal,"objective"),text(goal,"status"),
+                    budget,tokens,seconds,updated,startedAt,goalLabel(text(goal,"status")));
+        } catch(RuntimeException error) {return emptyGoal("unknown","unknown","目标未知");}
+    }
+
+    /** 只接受协议布尔值，错误封套不授予目标当前性。 */
+    private static boolean flag(JsonObject object,String key) {
+        JsonElement value=object==null?null:object.get(key);
+        return value!=null&&value.isJsonPrimitive()&&value.getAsJsonPrimitive().isBoolean()&&value.getAsBoolean();
+    }
+
+    /** 严格字段集与冻结协议一致，未知扩展不能悄悄获得可用性。 */
+    private static boolean keys(JsonObject object,String...expected) {
+        return object!=null&&object.keySet().equals(new java.util.HashSet<>(java.util.Arrays.asList(expected)));
+    }
+
+    /** 安全整数及null原样保留；JS安全边界之外、字符串、负数和小数均未知。 */
+    private static Long goalNumber(JsonObject object,String key,boolean nullable) {
+        JsonElement value=object.get(key);
+        if(value==null)throw new IllegalArgumentException("missing");
+        if(nullable&&value.isJsonNull())return null;
+        if(!value.isJsonPrimitive()||!value.getAsJsonPrimitive().isNumber())throw new IllegalArgumentException("type");
+        long number=value.getAsBigDecimal().longValueExact();
+        if(number<0||number>9007199254740991L)throw new IllegalArgumentException("range");
+        return number;
+    }
+
+    /** 仅映射协议的真实目标状态，不与聊天完成状态混为一谈。 */
+    private static String goalLabel(String status) {
+        switch(status) {
+            case "active":return "目标进行中";
+            case "paused":return "目标已暂停";
+            case "blocked":return "目标受阻";
+            case "usageLimited":return "目标额度受限";
+            case "budgetLimited":return "目标预算已达上限";
+            case "complete":return "目标已完成";
+            default:return null;
+        }
     }
 
     /** 兼容原展示入口；候选与 STATUS 都委托同一事实解析，不读取网络或磁盘。 */

@@ -260,10 +260,16 @@ public final class DesktopConnection implements AutoCloseable {
         return rpc("daemon.directSessions.link.ensure", params);
     }
 
-    /** 读取关联会话的真实能力和运行状态，界面不能根据消息时间猜测。 */
+    /** 原调用保持省略目标字段，不让未消费目标的入口增加来源读取。 */
     public JsonObject status(String remoteSessionId, String sessionId) throws Exception {
+        return status(remoteSessionId, sessionId, false);
+    }
+
+    /** 当前聊天在同一次原STATUS内显式请求只读目标；协议不接受false字段。 */
+    public JsonObject status(String remoteSessionId, String sessionId, boolean includeGoal) throws Exception {
         JsonObject params = base(remoteSessionId);
         params.addProperty("sessionId", sessionId);
+        if (includeGoal) params.addProperty("includeGoal", true);
         return rpc("daemon.directSessions.status.get", params);
     }
 

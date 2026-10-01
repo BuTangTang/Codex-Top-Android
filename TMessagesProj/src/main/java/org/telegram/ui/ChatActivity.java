@@ -834,7 +834,7 @@ public class ChatActivity extends BaseFragment implements
     private final HashMap<String, java.util.LinkedHashMap<String, String>> codexQuestionDrafts = new HashMap<>();
     private final HashMap<String, String> codexQuestionCustomDrafts = new HashMap<>();
 
-    /** 顶栏用原弹窗展示完整来源，真实待回复与审批分别可达。 */
+    /** 原会话信息展示完整来源及STATUS只读目标，原待回复与审批按钮保持不变。 */
     public void showCodexConversationInfo() {
         if (getParentActivity() == null) return;
         com.butang.codextop.CodexRuntime.ConversationInfo source = com.butang.codextop.CodexRuntime.conversationInfo(dialog_id);
@@ -844,7 +844,7 @@ public class ChatActivity extends BaseFragment implements
         String directory = TextUtils.isEmpty(source.workingDirectory) ? "项目路径暂不可用" : source.workingDirectory;
         AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate)
                 .setTitle("会话信息")
-                .setMessage("会话：" + title + "\n\n电脑：" + computer + "\n\n项目路径：" + directory + "\n\n状态：" + status.label)
+                .setMessage("会话：" + title + "\n\n电脑：" + computer + "\n\n项目路径：" + directory + "\n\n状态：" + status.label + codexGoalInfo(status.goal))
                 .setPositiveButton("关闭", null);
         if ("current".equals(status.validity) && "needs_input".equals(status.state)
                 && ("approval".equals(status.pendingKind) || "mixed".equals(status.pendingKind))) {
@@ -856,6 +856,17 @@ public class ChatActivity extends BaseFragment implements
             builder.setNegativeButton("关闭", null);
         }
         showDialog(builder.create());
+    }
+
+    /** 仅展示协议原值；null明确未知、零原样显示，秒数和来源更新时间不在手机自主累加。 */
+    private static String codexGoalInfo(com.butang.codextop.SessionStatus.Goal goal) {
+        String info="\n\n目标状态："+goal.label;
+        if(!goal.hasValue())return info;
+        return info+"\n目标："+goal.objective
+                +"\nToken预算："+(goal.tokenBudget==null?"未知":goal.tokenBudget)
+                +"\n已用Token："+(goal.tokensUsed==null?"未知":goal.tokensUsed)
+                +"\n已用时间（秒）："+(goal.timeUsedSeconds==null?"未知":goal.timeUsedSeconds)
+                +"\n来源更新时间："+goal.updatedAt;
     }
 
     /** 复用原对话框按需展示当前桌面审批，不把历史工具记录当作待办。 */
@@ -11777,6 +11788,7 @@ public class ChatActivity extends BaseFragment implements
         contentView.addView(topUndoView, 17, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT, 8, 8, 8, 0));
     }
 
+    /** 复用原48dp置顶容器；Codex目标不进入真实pin的列表、关闭或预览路径。 */
     private void createPinnedMessageView() {
         if (currentEncryptedChat != null || pinnedMessageView != null || getContext() == null) {
             return;
@@ -11789,6 +11801,8 @@ public class ChatActivity extends BaseFragment implements
 
             {
                 setOnLongClickListener(v -> {
+                    // 目标是只读事实，不能长按当作Telegram置顶消息预览。
+                    if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))return false;
                     if (AndroidUtilities.isTablet() || (isThreadChat() && !UserObject.isBot(currentUser))) {
                         return false;
                     }
@@ -11800,6 +11814,8 @@ public class ChatActivity extends BaseFragment implements
 
             @Override
             public boolean onTouchEvent(MotionEvent event) {
+                // 目标栏只沿原点击路径查看会话信息，不触发pin预览的拖动或返回。
+                if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))return super.onTouchEvent(event);
                 lastY = event.getY();
                 if (event.getAction() == MotionEvent.ACTION_UP) {
                     finishPreviewFragment();
@@ -11853,6 +11869,7 @@ public class ChatActivity extends BaseFragment implements
         topPanelLayout.setPriority(pinnedMessageView, 1);
         topPanelLayout.setDebugName(pinnedMessageView, "pinned message view");
         pinnedMessageView.setOnClickListener(v -> {
+            if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)){showCodexConversationInfo();return;}
             wasManualScroll = true;
             if (isThreadChat() && !isTopic) {
                 scrollToMessageId((int) threadMessageId, 0, true, 0, true, 0);
@@ -11973,7 +11990,9 @@ public class ChatActivity extends BaseFragment implements
         pinnedListButton.setScaleY(0.4f);
         pinnedListButton.setBackgroundDrawable(Theme.createSelectorDrawable(getThemedColor(Theme.key_inappPlayerClose) & 0x19ffffff));
         pinnedMessageView.addView(pinnedListButton, LayoutHelper.createFrame(36, 48, Gravity.RIGHT | Gravity.TOP, 0, 0, 7, 0));
-        pinnedListButton.setOnClickListener(v -> openPinnedMessagesList(false));
+        pinnedListButton.setOnClickListener(v -> {
+            if(!com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))openPinnedMessagesList(false);
+        });
 
         closePinned = new ImageView(getContext());
         closePinned.setImageResource(R.drawable.miniplayer_close);
@@ -11992,6 +12011,7 @@ public class ChatActivity extends BaseFragment implements
         closePinned.setBackgroundDrawable(Theme.createSelectorDrawable(getThemedColor(Theme.key_inappPlayerClose) & 0x19ffffff, 1, AndroidUtilities.dp(14)));
         pinnedMessageView.addView(closePinned, LayoutHelper.createFrame(36, 48, Gravity.RIGHT | Gravity.TOP, 0, 0, 2, 0));
         closePinned.setOnClickListener(v -> {
+            if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))return;
             if (getParentActivity() == null) {
                 return;
             }
@@ -12084,7 +12104,9 @@ public class ChatActivity extends BaseFragment implements
         }
     }
 
+    /** 原Telegram pin列表入口不接收Codex只读目标栏。 */
     private void openPinnedMessagesList(boolean preview) {
+        if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))return;
         if (getParentActivity() == null || parentLayout == null || parentLayout.getLastFragment() != this || pinnedMessageIds.isEmpty()) {
             return;
         }
@@ -22339,7 +22361,11 @@ public class ChatActivity extends BaseFragment implements
         } else if (id == NotificationCenter.updateInterfaces) {
             int updateMask = (Integer) args[0];
             // 原状态通知同步已经打开的提问表单，普通聊天与关闭的表单不额外读题。
-            if ((updateMask & MessagesController.UPDATE_MASK_STATUS) != 0) refreshCodexQuestion();
+            if ((updateMask & MessagesController.UPDATE_MASK_STATUS) != 0) {
+                refreshCodexQuestion();
+                // 同一原STATUS通知只更新目标栏，不新增读取或重建聊天记录。
+                if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))updatePinnedMessageView(true);
+            }
             // 字节进度沿原通知只更新可见附件，不重建消息列表或触发网络刷新。
             if ((updateMask & MessagesController.UPDATE_MASK_SEND_STATE) != 0
                     && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) && chatListView != null) {
@@ -28660,7 +28686,15 @@ public class ChatActivity extends BaseFragment implements
         updatePinnedMessageView(animated, 0);
     }
 
+    /** 目标栏隐藏真实pin操作控件；普通Telegram继续使用原按钮动画。 */
     private void updatePinnedListButton(boolean animated) {
+        if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
+            if(pinnedListAnimator!=null){pinnedListAnimator.cancel();pinnedListAnimator=null;}
+            if(pinnedListButton!=null)pinnedListButton.setVisibility(View.GONE);
+            if(closePinned!=null)closePinned.setVisibility(View.GONE);
+            if(pinnedProgress!=null)pinnedProgress.setVisibility(View.GONE);
+            return;
+        }
         if ((isThreadChat() && !isTopic) || pinnedListButton == null) {
             return;
         }
@@ -28771,8 +28805,47 @@ public class ChatActivity extends BaseFragment implements
         return null;
     }
 
+    /** 原48dp栏显示目标真实状态及一行objective，搜索和原生多选沿原隐藏及padding动画。 */
+    private void updateCodexGoalPinnedView(boolean animated) {
+        com.butang.codextop.SessionStatus.Goal goal=com.butang.codextop.CodexRuntime.status(dialog_id).goal;
+        if(!goal.hasValue()||isReport()||actionBar!=null&&(actionBar.isActionModeShowed()||actionBar.isSearchFieldVisible())) {
+            if(hidePinnedMessageView(animated))checkListViewPaddings();
+            return;
+        }
+        if(pinnedMessageView==null)createPinnedMessageView();
+        if(pinnedMessageView==null)return;
+        for(int i=0;i<pinnedNextAnimation.length;i++) {
+            if(pinnedNextAnimation[i]!=null){pinnedNextAnimation[i].cancel();pinnedNextAnimation[i]=null;}
+        }
+        setPinnedTextTranslationX=false;
+        updatePinnedListButton(false);
+        pinnedCounterTextView.setVisibility(View.GONE);
+        for(int i=0;i<2;i++) {
+            pinnedMessageImageView[i].setVisibility(View.GONE);
+            pinnedMessageButton[i].setVisibility(View.GONE);
+            pinnedNameTextView[i].setVisibility(i==0?View.VISIBLE:View.INVISIBLE);
+            pinnedMessageTextView[i].setVisibility(i==0?View.VISIBLE:View.INVISIBLE);
+            pinnedNameTextView[i].setTranslationX(0); pinnedNameTextView[i].setTranslationY(0);
+            pinnedMessageTextView[i].setTranslationX(0); pinnedMessageTextView[i].setTranslationY(0);
+        }
+        pinnedNameTextView[0].setText(goal.label);
+        pinnedMessageTextView[0].setText(Emoji.replaceEmoji(goal.objective,pinnedMessageTextView[0].getPaint().getFontMetricsInt(),false));
+        pinnedLineView.set(0,1,false);
+        pinnedLineView.setTranslationY(0);
+        if(pinnedMessageView.getTag()!=null) {
+            pinnedMessageView.setTag(null);
+            topPanelLayout.setViewVisible(pinnedMessageView,true,animated);
+            checkListViewPaddings();
+        }
+    }
+
+    /** Codex使用同一置顶容器；真实Telegram pin计数、消息和跳转保持原路径。 */
     private void updatePinnedMessageView(boolean animated, int animateToNext) {
         if (currentEncryptedChat != null || chatMode != 0) {
+            return;
+        }
+        if(com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)) {
+            updateCodexGoalPinnedView(animated);
             return;
         }
         int pinned_msg_id;

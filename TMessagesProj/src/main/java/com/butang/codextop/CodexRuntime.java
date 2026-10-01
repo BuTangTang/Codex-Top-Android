@@ -1571,32 +1571,53 @@ public final class CodexRuntime {
                 : connection.isConnected() ? "服务器已连接" : "连接已中断");
     }
 
-    /** 按对话所属电脑观察状态，不能复用其他电脑的实时状态。 */
+    /** 回读当前原身份映射；不让换账号、电脑、连接或linked会话后的旧目标恢复页面。 */
+    private static boolean statusTargetCurrent(int account,long epoch,long dialogId,long generation,
+            String machine,String remote,String linked,DesktopConnection connection) {
+        return isAccountCurrent(epoch)&&account==org.telegram.messenger.UserConfig.selectedAccount
+                &&generation==watchGeneration&&watchedDialog==dialogId
+                &&machine!=null&&remote!=null&&!remote.isEmpty()
+                &&java.util.Objects.equals(machine,dialogMachines.get(dialogId))
+                &&java.util.Objects.equals(remote,remoteIds.get(dialogId))
+                &&java.util.Objects.equals(linked,linkedSessions.get(dialogId))
+                &&connection==dialogConnection(dialogId);
+    }
+
+    /** 原STATUS同时请求只读目标，账号、来源和关联会话变化后的迟到回包不进入原展示owner。 */
     private static void watchStatus(int account, long dialogId, long generation) {
+        final long accountEpoch=accountGeneration;
         Runnable poll = new Runnable() {
             private int initialObservationRetries;
 
-            /** 初次观察短暂追踪基线，稳定后及失败时恢复原查询频率。 */
+            /** 初次观察沿原频率追踪基线；每个异步回包都回核原账号、来源与linked身份。 */
             @Override public void run() {
-                if (generation != watchGeneration) return;
+                if (!isAccountCurrent(accountEpoch) || generation != watchGeneration || watchedDialog != dialogId) return;
+                final String machine=dialogMachines.get(dialogId), remote=remoteIds.get(dialogId);
+                final DesktopConnection connection=dialogConnection(dialogId);
+                String observedLinked=linkedSessions.get(dialogId);
+                if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,observedLinked,connection))return;
                 long nextDelay = 5000;
                 String label = "连接暂不可用";
                 JsonObject statusResponse = null;
                 long observationStartedAt = android.os.SystemClock.elapsedRealtime();
                 try {
-                    DesktopConnection connection = dialogConnection(dialogId);
                     if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
                         android.util.Log.i("CodexBridge", "status_connection=" + (connection == null ? "absent" : "present"));
                     if (connection != null) {
-                        if (observationOwner != null && (observationOwner != connection || observationDialog != dialogId)) releaseObservation();
-                        String linked = linkedSessions.get(dialogId);
+                        if (observationOwner != null && (observationOwner != connection || observationDialog != dialogId
+                                ||!java.util.Objects.equals(observationSession,observedLinked))) releaseObservation();
+                        String linked = observedLinked;
                         if (linked == null) {
-                            linked = connection.openConversation(remoteIds.get(dialogId)).get("sessionId").getAsString();
+                            String opened=connection.openConversation(remote).get("sessionId").getAsString();
+                            if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,linked,connection))return;
+                            linked=opened;
                             linkedSessions.put(dialogId, linked);
+                            observedLinked=linked;
                         }
                         if (observationLease == null || android.os.SystemClock.elapsedRealtime() >= observationRenewAt) {
                             boolean renewing = observationLease != null;
-                            JsonObject attached = connection.observe(remoteIds.get(dialogId), linked, observationLease);
+                            JsonObject attached = connection.observe(remote, linked, observationLease);
+                            if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,linked,connection))return;
                             if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
                                 android.util.Log.i("CodexBridge", renewing ? "observation_lease=renew" : "observation_lease=attach");
                             observationOwner = connection;
@@ -1605,9 +1626,9 @@ public final class CodexRuntime {
                             observationLease = attached.get("leaseId").getAsString();
                             observationRenewAt = android.os.SystemClock.elapsedRealtime() + 30000;
                         }
-                        if (generation != watchGeneration) return;
+                        if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,linked,connection))return;
                         observationStartedAt = android.os.SystemClock.elapsedRealtime();
-                        JsonObject response = connection.status(remoteIds.get(dialogId), linked);
+                        JsonObject response = connection.status(remote, linked, true);
                         statusResponse = response;
                         label = SessionStatus.label(response);
                         // 仅已验证协议和在线状态的同步等待可以加快，未知或离线仍按原频率。
@@ -1630,27 +1651,30 @@ public final class CodexRuntime {
                         }
                     }
                 } catch (Exception error) { observationRenewAt = 0; /* 请求失败明确展示，并在恢复后重新续租。 */ }
+                final String linked=observedLinked;
                 final JsonObject observed = statusResponse;
                 final long startedAt = observationStartedAt;
                 final long receivedAt = android.os.SystemClock.elapsedRealtime();
                 AndroidUtilities.runOnUIThread(() -> {
-                    if (generation != watchGeneration) return;
-                    statuses.observation(dialogId, dialogMachine(dialogId), observed, startedAt, receivedAt);
+                    if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,linked,connection)
+                            ||(observed!=null&&connection!=null&&!connection.isConnected()))return;
+                    statuses.observation(dialogId, machine, remote, observed, startedAt, receivedAt);
                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
                 });
-                if (generation == watchGeneration) statusQueue.postRunnable(this, nextDelay);
+                if (isAccountCurrent(accountEpoch) && generation == watchGeneration && watchedDialog == dialogId)
+                    statusQueue.postRunnable(this, nextDelay);
             }
         };
         // 注册和唤醒均由状态队列串行处理，切页后的旧轮次不能替换当前轮询。
         statusQueue.postRunnable(() -> {
-            if (generation != watchGeneration) return;
+            if (!isAccountCurrent(accountEpoch) || generation != watchGeneration || watchedDialog != dialogId) return;
             if (statusPoll != null) statusQueue.cancelRunnable(statusPoll);
             statusPoll = poll;
             statusQueue.postRunnable(poll);
         });
         AndroidUtilities.runOnUIThread(new Runnable() {
             @Override public void run() {
-                if (generation != watchGeneration) return;
+                if (!isAccountCurrent(accountEpoch) || generation != watchGeneration || watchedDialog != dialogId) return;
                 NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
                 AndroidUtilities.runOnUIThread(this, 5000);
             }

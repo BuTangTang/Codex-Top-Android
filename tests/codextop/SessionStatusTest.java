@@ -8,6 +8,7 @@ public final class SessionStatusTest {
             System.out.println("CodexRuntime: 连接锁占用期间已恢复会话快读通过");
             return;
         }
+        goalFacts();
         check("{\"ok\":true,\"machineOnline\":true,\"runnerActive\":true,\"activity\":\"running\"}", "状态未知");
         check("{\"ok\":true,\"machineOnline\":false}", "电脑离线");
         String base = "{\"ok\":true,\"machineOnline\":true,\"observation\":";
@@ -265,4 +266,97 @@ public final class SessionStatusTest {
     private static void check(String input, String expected) {
         if (!expected.equals(SessionStatus.label(JsonParser.parseString(input).getAsJsonObject()))) throw new AssertionError(expected);
     }
+    /** 通过真实Store方法验证目标独立事实；修复前反射缺字段仍执行原STATUS后给出行为RED。 */
+    private static void goalFacts() throws Exception {
+        SessionStatus.Store store=new SessionStatus.Store();
+        observeGoal(store,1,"machine","remote",available("active","0","null","0","50"),100,110);
+        goalField(store,1,111,"availability","available");
+        goalField(store,1,111,"validity","current");
+        goalField(store,1,111,"tokensUsed",null);
+        goalField(store,1,111,"tokenBudget",0L);
+        goalField(store,1,111,"timeUsedSeconds",0L);
+        // LIST生命周期独立变更，无goal字段不能抹掉或续期原STATUS目标。
+        store.candidate(1,"machine",candidate("completed",""),10000,10010,false);
+        goalField(store,1,14999,"validity","current");
+        goalField(store,1,15100,"validity","stale");
+        goalField(store,1,15100,"startedAtElapsedMs",100L);
+        Object oldGoal=goal(store,1,15100);
+        if(!String.valueOf(field(oldGoal,"label")).startsWith("上次："))throw new AssertionError("旧目标伪装为当前");
+        // lifecycle较新的LIST不能挡住独立较新的目标STATUS。
+        observeGoal(store,1,"machine","remote",available("paused","9007199254740991","1","2","0"),9000,9001);
+        goalField(store,1,10011,"status","paused");
+        snapshot(store,1,10011,"completed","none","current");
+        // 明确unknown保留上次值但不可当前；迟到较早目标不能复活。
+        observeGoal(store,1,"machine","remote","{\"availability\":\"unknown\"}",11000,11001);
+        goalField(store,1,11002,"validity","unknown");
+        goalField(store,1,11002,"status","paused");
+        observeGoal(store,1,"machine","remote",available("active","1","1","1","0"),10000,12000);
+        goalField(store,1,12001,"status","paused");
+        // 老daemon字段缺失与明确none不同，只有none清除旧目标。
+        observeGoal(store,1,"machine","remote",null,12000,12001);
+        goalField(store,1,12002,"validity","unsupported");
+        goalField(store,1,12002,"status","paused");
+        observeGoal(store,1,"machine","remote","{\"availability\":\"none\",\"source\":\"desktop\"}",13000,13001);
+        goalField(store,1,13002,"availability","none");
+        goalField(store,1,13002,"objective","");
+        // 目标有效性不依赖生命周期turn：unknown observation仍接受已验证目标。
+        observeGoal(store,2,"machine","remote",available("complete","null","0","0","0"),100,101);
+        snapshot(store,2,102,"unknown","unknown","unknown");
+        goalField(store,2,102,"validity","current");
+        goalField(store,2,102,"status","complete");
+        var completed=JsonParser.parseString("{\"ok\":true,\"machineOnline\":true,\"observation\":{\"v\":1,\"source\":\"desktop\",\"turnId\":\"real-turn\",\"state\":\"completed\"},\"goal\":"+available("active","0","0","0","0")+"}").getAsJsonObject();
+        SessionStatus.Store.class.getMethod("observation",long.class,String.class,String.class,com.google.gson.JsonObject.class,long.class,long.class).invoke(store,6L,"machine","remote",completed,100L,101L);
+        snapshot(store,6,102,"completed","none","current");goalField(store,6,102,"status","active");goalField(store,6,102,"validity","current");
+        store.listFailed("machine",500);goalField(store,2,501,"validity","current");
+        store.unavailable("machine",600);goalField(store,2,601,"validity","unavailable");
+        observeGoal(store,2,"machine","remote",available("active","1","1","1","0"),550,602);
+        goalField(store,2,603,"status","complete");
+        // 只读协议严格检查安全整数、字段集与remote/source，不能把坏值当无目标。
+        for(String raw:new String[]{"-1","1.5","9007199254740992","1e100","\"0\"","true","{}","[]"}){
+            observeGoal(store,3,"machine","remote",available("active",raw,"1","1","0"),1000,1001);
+            goalField(store,3,1002,"availability","unknown");
+        }
+        for(String bad:new String[]{available("active","1","1","1","null"),
+                available("active","1","1","1","0").replace("remote","linked"),
+                available("active","1","1","1","0").replace("desktop","rollout"),
+                available("active","1","1","1","0").replace("active","running"),
+                available("active","1","1","1","0").replace("objective\":\"真实目标","objective\":\"   "),
+                "{\"availability\":\"none\",\"source\":\"desktop\",\"threadId\":\"remote\"}",
+                "{\"availability\":\"unknown\",\"source\":\"desktop\"}"}){
+            observeGoal(store,4,"machine","remote",bad,1000,1001);goalField(store,4,1002,"availability","unknown");
+        }
+        observeGoal(store,5,"machine","remote",available("blocked","0","0","0","0"),1000,1001);
+        goalField(store,5,999,"validity","stale");
+        store.candidate(5,"other-machine",candidate("running",""),2000,2001,false);
+        goalField(store,5,2002,"availability","unsupported");
+        store.clear();goalField(store,5,2003,"availability","unsupported");
+        System.out.println("SessionStatus goal: 原STATUS独立15秒、LIST不续期、unknown/none/缺失、严格安全整数与来源通过");
+    }
+
+    /** 只构造协议输入，不复制生产目标判定。 */
+    private static String available(String status,String budget,String tokens,String seconds,String updated) {
+        return "{\"availability\":\"available\",\"source\":\"desktop\",\"threadId\":\"remote\",\"objective\":\"真实目标\",\"status\":\""+status
+                +"\",\"tokenBudget\":"+budget+",\"tokensUsed\":"+tokens+",\"timeUsedSeconds\":"+seconds+",\"updatedAt\":"+updated+"}";
+    }
+
+    /** 修复前真实旧入口仍执行，修复后绑定实际remote身份的新入口。 */
+    private static void observeGoal(SessionStatus.Store store,long id,String machine,String remote,String goal,long start,long received) throws Exception {
+        var response=JsonParser.parseString("{\"ok\":true,\"machineOnline\":true,\"observation\":{\"v\":1,\"state\":\"unknown\",\"reason\":\"missing_turn_id\"}"+(goal==null?"":",\"goal\":"+goal)+"}").getAsJsonObject();
+        try {SessionStatus.Store.class.getMethod("observation",long.class,String.class,String.class,com.google.gson.JsonObject.class,long.class,long.class).invoke(store,id,machine,remote,response,start,received);}
+        catch(NoSuchMethodException absent){store.observation(id,machine,response,start,received);}
+    }
+
+    /** 读取真实不可变快照，缺字段给行为断言而非编译失败。 */
+    private static Object goal(SessionStatus.Store store,long id,long now) throws Exception {
+        try{return store.get(id,now).getClass().getField("goal").get(store.get(id,now));}
+        catch(NoSuchFieldException absent){throw new AssertionError("实际STATUS忽略目标事实，LIST无独立目标有效期",absent);}
+    }
+
+    /** 比较原事实字段，包括零值与明确null。 */
+    private static Object field(Object goal,String name) throws Exception {return goal.getClass().getField(name).get(goal);}
+    /** 所有判定均由真实Store进行，测试仅检查可观察结果。 */
+    private static void goalField(SessionStatus.Store store,long id,long now,String name,Object expected) throws Exception {
+        if(!java.util.Objects.equals(expected,field(goal(store,id,now),name)))throw new AssertionError("goal "+name+" expected="+expected+" actual="+field(goal(store,id,now),name));
+    }
+
 }

@@ -22,7 +22,7 @@ public final class DesktopConnectionRpcTest {
         StringBuilder methods = new StringBuilder();
         int extracted = 0;
         var names=Set.of("rpc","candidates","base","isConnected","failPending","close",
-                "attachmentUploadMaxBytes","clearAttachmentUploadLimit");
+                "attachmentUploadMaxBytes","clearAttachmentUploadLimit","status");
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
             if (names.contains(method.getNameAsString())) { methods.append(method).append('\n'); extracted++; }
         }
@@ -157,6 +157,19 @@ public final class DesktopConnectionRpcTest {
     private static final String SCENARIOS = """
             /** 覆盖真实RPC与专用附件调用者之间的拒绝传递及原发送边界。 */
             public static void main(String[] args)throws Exception {
+                // 执行真实STATUS入口：旧调用省略opt-in，当前聊天显式请求且只发送一次。
+                DesktopRpcProbe goalProbe=probe("{\\"ok\\":true,\\"machineOnline\\":true,\\"goal\\":{\\"availability\\":\\"none\\",\\"source\\":\\"desktop\\"}}");
+                goalProbe.status("synthetic-remote","synthetic-linked");
+                JsonObject legacyParams=JsonParser.parseString(goalProbe.socket.request.getString("params").substring(Crypto.PREFIX.length())).getAsJsonObject();
+                check(!legacyParams.has("includeGoal"),"旧STATUS额外请求目标");
+                JsonObject goalResponse;
+                try{goalResponse=(JsonObject)goalProbe.getClass().getMethod("status",String.class,String.class,boolean.class).invoke(goalProbe,"synthetic-remote","synthetic-linked",true);}
+                catch(NoSuchMethodException absent){goalResponse=goalProbe.status("synthetic-remote","synthetic-linked");}
+                JsonObject goalParams=JsonParser.parseString(goalProbe.socket.request.getString("params").substring(Crypto.PREFIX.length())).getAsJsonObject();
+                check(goalParams.has("includeGoal")&&goalParams.get("includeGoal").getAsBoolean(),"当前STATUS没有显式目标opt-in");
+                check(goalProbe.socket.emitted==2&&"synthetic-remote".equals(goalParams.get("remoteSessionId").getAsString())
+                        &&"synthetic-linked".equals(goalParams.get("sessionId").getAsString())&&goalParams.getAsJsonObject("source").get("kind").getAsString().equals("codexHome"),"目标读取增加RPC或丢失原身份");
+                check(goalResponse.getAsJsonObject("goal").get("availability").getAsString().equals("none"),"目标原响应被改写");
                 final String bulk="daemon.bulkTransfer.upload.init";
                 final String send="daemon.directSessions.send";
                 DesktopRpcProbe capacity=probe("{\\"ok\\":true,\\"candidates\\":[],\\"capabilities\\":{\\"attachmentUploadMaxBytes\\":4096}}");
