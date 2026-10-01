@@ -29,12 +29,13 @@ public final class RuntimePrefetchTest {
         try {
             Path probe = temporary.resolve("RuntimePrefetchProbe.java");
             Files.writeString(probe, FIXTURE + methods + SCENARIOS + "\n}");
-            Path flags = temporary.resolve("BuildVars.java"), log = temporary.resolve("Log.java");
+            Path flags = temporary.resolve("BuildVars.java"), log = temporary.resolve("Log.java"), account = temporary.resolve("UserConfig.java");
             Files.writeString(flags, "package org.telegram.messenger; public class BuildVars { public static final boolean DEBUG_VERSION=false; }");
             Files.writeString(log, "package android.util; public class Log { public static int i(String a,String b){return 0;} }");
+            Files.writeString(account, "package org.telegram.messenger; public class UserConfig { public static int selectedAccount; }");
             var compile = new ArrayList<String>();
             compile.addAll(java.util.List.of("-cp", System.getProperty("java.class.path"), "-d", temporary.toString(),
-                    probe.toString(), flags.toString(), log.toString()));
+                    probe.toString(), flags.toString(), log.toString(), account.toString()));
             for (String model : new String[]{"DesktopAttachment", "TranscriptText", "TranscriptWindow"})
                 compile.add(source.resolve(model + ".java").toString());
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(String[]::new)) != 0)
@@ -97,6 +98,8 @@ public final class RuntimePrefetchTest {
             }
             static TranscriptWindow readHistory(long id,String remote){return new TranscriptWindow();}
             static boolean saveHistory(long id,String remote,TranscriptWindow history){saves++;return saveSucceeds;}
+            // 摘要发布的真实选择与 owner 门禁由 RuntimeDialogPreviewTest 单独执行。
+            static void publishHistoryPreview(int account,long epoch,long id,String remote,String machine,DesktopConnection connection,TranscriptWindow history){}
             static void logTranscriptFailure(String stage,Exception error,JsonObject page){failures++;}
         """;
 

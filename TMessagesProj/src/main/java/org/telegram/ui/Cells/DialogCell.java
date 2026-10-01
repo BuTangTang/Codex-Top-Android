@@ -1232,7 +1232,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
     private static final float BADGE_DRAWABLE_SIZE = 16;
     private static final float BADGE_DRAWABLE_OFFSET = (BADGE_SIZE - BADGE_DRAWABLE_SIZE) / 2f;
 
-    /** 沿用原行文字布局，仅对 Codex 无头像行回收前侧留白并嵌入小运行环。 */
+    /** 沿用原行文字布局，Codex 左侧只放真实摘要，状态独立放在时间下方。 */
     public void buildLayout() {
         if (isTransitionSupport) {
             return;
@@ -1248,6 +1248,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         codexCompactLayout = compactCodexLayout;
         // 保留公开原间距；仅本次 Codex 文字布局使用紧凑前距，普通行和 RTL 公式不变。
         final int messagePaddingStart = getContentPaddingStart();
+        codexStatusLabel = hasCodexStatusAvatar()
+                ? com.butang.codextop.CodexRuntime.status(currentDialogId).label : null;
+        codexStatusLayout = null;
 
         if (useForceThreeLines || SharedConfig.useThreeLinesLayout || true) {
             Theme.dialogs_namePaint[0].setTextSize(dp(17));
@@ -1683,8 +1686,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                                 showChecks = false;
                                 drawTime = false;
                             } else {
-                                messageString = hasCodexStatusAvatar()
-                                        ? com.butang.codextop.CodexRuntime.status(currentDialogId).label : "";
+                                // 没有真实消息时摘要留空，状态属于右侧时间栏。
+                                messageString = "";
                             }
                         }
                     } else {
@@ -2632,6 +2635,37 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             drawMention = false;
         }
 
+        // 原计数、失败及标记槽已从 messageWidth 扣除，状态只占剩余文字区域，不能盖住它们。
+        if (hasCodexStatusAvatar()) {
+            com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
+            boolean running = "current".equals(status.validity) && "running".equals(status.state);
+            TextPaint statusPaint = new TextPaint(getTimeTextPaint());
+            int indicatorWidth = running ? dp(20) : 0;
+            int desiredWidth = (int) Math.ceil(statusPaint.measureText(codexStatusLabel)) + indicatorWidth;
+            // 原缩略图分支稍后会扩展消息布局；预先抵消，防止图片摘要和 RTL 左移挤入状态列。
+            boolean expandedThumbnail = thumbsCount > 0 && (!(useForceThreeLines || SharedConfig.useThreeLinesLayout) || hasTags());
+            int thumbnailExpansion = expandedThumbnail ? dp((thumbsCount * (thumbSize + 2) - 2) + 5)
+                    : thumbsCount > 0 && messageNameString != null ? dp(5) : 0;
+            int statusWidth = codexStatusColumnWidth(messageWidth - thumbnailExpansion, desiredWidth);
+            if (statusWidth > indicatorWidth) {
+                int labelWidth = statusWidth - indicatorWidth;
+                CharSequence label = TextUtils.ellipsize(codexStatusLabel, statusPaint, labelWidth, TextUtils.TruncateAt.END);
+                codexStatusLayout = new StaticLayout(label, statusPaint, labelWidth,
+                        Layout.Alignment.ALIGN_NORMAL, 1f, 0f, false);
+                if (LocaleController.isRTL) {
+                    codexStatusLeft = messageLeft;
+                    codexStatusRingLeft = codexStatusLeft + labelWidth + dp(6);
+                    messageLeft += statusWidth + dp(8) + (expandedThumbnail && !isForumCell() ? thumbnailExpansion : 0);
+                    typingLeft += statusWidth + dp(8);
+                    messageNameLeft += statusWidth + dp(8);
+                    buttonLeft += statusWidth + dp(8);
+                } else {
+                    codexStatusRingLeft = messageLeft + messageWidth - dp(12) - statusWidth;
+                    codexStatusLeft = codexStatusRingLeft + indicatorWidth;
+                }
+                messageWidth -= statusWidth + dp(8) + thumbnailExpansion;
+            }
+        }
         if (checkMessage) {
             if (messageString == null) {
                 messageString = "";
@@ -2696,6 +2730,11 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         if (twoLinesForName) {
             messageTop += dp(20);
         }
+        // 三行草稿的消息正文在第三行，右侧状态仍对齐时间下方的第二行。
+        codexStatusTop = messageNameLayout != null ? messageNameTop : messageTop;
+        if ((!(useForceThreeLines || SharedConfig.useThreeLinesLayout) || isForumCell()) && hasTags()) {
+            codexStatusTop -= dp(isForumCell() ? 10 : 11);
+        }
         animatedEmojiStack2 = AnimatedEmojiSpan.update(AnimatedEmojiDrawable.CACHE_TYPE_MESSAGES, this, animatedEmojiStack2, messageNameLayout);
 
 
@@ -2729,7 +2768,6 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             FileLog.e(e);
         }
 
-        messageString = withCodexRunningIndicator(messageString);
         try {
             CharSequence messageStringFinal;
             // Removing links and bold spans to get rid of underlining and boldness
@@ -3204,11 +3242,13 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         return update(mask, true);
     }
 
+    /** 保持原行更新路径，Codex 摘要变化事件可直接重读已发布的真实消息映射。 */
     public boolean update(int mask, boolean animated) {
         boolean requestLayout = false;
         boolean rebuildLayout = false;
         boolean invalidate = false;
         boolean oldIsForumCell = isForumCell();
+        boolean codexPreviewChanged = updateCodexPreview(mask);
         drawAvatarSelector = false;
         ttlPeriod = 0;
 
@@ -3329,7 +3369,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             }
 
             if (mask != 0) {
-                boolean continueUpdate = hasCodexStatusAvatar() && (mask & MessagesController.UPDATE_MASK_STATUS) != 0;
+                boolean continueUpdate = codexPreviewChanged
+                        || hasCodexStatusAvatar() && (mask & MessagesController.UPDATE_MASK_STATUS) != 0;
                 if (user != null && !MessagesController.isSupportUser(user) && !user.bot && (mask & MessagesController.UPDATE_MASK_STATUS) != 0) {
                     user = MessagesController.getInstance(currentAccount).getUser(user.id);
                     if (wasDrawnOnline != isOnline()) {
@@ -3771,6 +3812,11 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
     private org.telegram.ui.Components.RadialProgressView codexStatusProgress;
     private long codexStatusFrameTimeMs;
     private boolean codexCompactLayout;
+    private String codexStatusLabel;
+    private StaticLayout codexStatusLayout;
+    private int codexStatusLeft;
+    private int codexStatusRingLeft;
+    private int codexStatusTop;
 
     /** 仅识别真实 Codex 会话行；普通会话和归档继续使用原头像与布局。 */
     private boolean hasCodexStatusAvatar() {
@@ -3793,31 +3839,29 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 : messagePaddingStart;
     }
 
-    /** 草稿和真实摘要保持原内容及优先级，只在有效运行状态的第二行前留出小环位置。 */
-    private CharSequence withCodexRunningIndicator(CharSequence subtitle) {
-        if (!hasCodexStatusAvatar() || TextUtils.isEmpty(subtitle)) {
-            return subtitle;
-        }
-        com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
-        if (!"current".equals(status.validity) || !"running".equals(status.state)) {
-            return subtitle;
-        }
-        SpannableStringBuilder result = new SpannableStringBuilder(" ").append(subtitle);
-        result.setSpan(new ReplacementSpan() {
-            /** 仅预留小环和文字的间隔，不更改原文本行高或缩略图占位。 */
-            @Override
-            public int getSize(Paint paint, CharSequence text, int start, int end, Paint.FontMetricsInt fm) {
-                return dp(20);
-            }
+    /** 状态列最多使用剩余消息区域的一半，始终给真实摘要保留原最小宽度和间隔。 */
+    private int codexStatusColumnWidth(int availableWidth, int desiredWidth) {
+        return Math.max(0, Math.min(desiredWidth,
+                Math.min(availableWidth / 2, availableWidth - dp(12 + 8))));
+    }
 
-            /** 由原文字排版确定位置和方向，减少动画时保持上次圆环相位。 */
-            @Override
-            public void draw(Canvas canvas, CharSequence text, int start, int end, float x, int top, int y, int bottom, Paint paint) {
-                drawCodexRunningIndicator(canvas, x + dp(LocaleController.isRTL ? 13 : 7),
-                        y + (paint.ascent() + paint.descent()) / 2f, paint.getAlpha());
-            }
-        }, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        return result;
+    /** 只消费已有真实 MessageObject；正文事件不得因日期相同或旧摘要为空而被布局门禁遗漏。 */
+    private boolean updateCodexPreview(int mask) {
+        if (!isDialogCell || !hasCodexStatusAvatar() || mask == 0
+                || (mask & MessagesController.UPDATE_MASK_MESSAGE_TEXT) == 0) {
+            return false;
+        }
+        MessageObject previous = message;
+        groupMessages = MessagesController.getInstance(currentAccount).dialogMessage.get(currentDialogId);
+        message = groupMessages != null && !groupMessages.isEmpty() ? groupMessages.get(0) : null;
+        if (previous == message) {
+            // 同一对象的已读、发送及编辑变化仍由下面原更新分支比较，不能提前覆盖旧依据。
+            return false;
+        }
+        currentEditDate = message != null ? message.messageOwner.edit_date : 0;
+        lastUnreadState = message != null && message.isUnread();
+        if (message != null) lastSendState = message.messageOwner.send_state;
+        return true;
     }
 
     /** 只画 14dp 蓝环；状态失效即停止，离屏、后台和减少动画不驱动下一帧。 */
@@ -3849,7 +3893,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
     private GradientDrawable archiveFadeGradientDrawable;
     private int archiveFadeGradientDrawableColor;
 
-    /** 保持原列表绘制流程，Codex 行不画大头像或状态色块，第二行自行绘制小运行环。 */
+    /** 保持原列表绘制流程，Codex 不画大头像，状态及小运行环只绘制在右侧时间下方。 */
     @SuppressLint("DrawAllocation")
     @Override
     protected void onDraw(Canvas canvas) {
@@ -3859,8 +3903,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         if (!visibleOnScreen) {
             return;
         }
-        // 原生多选开关可能只发 CHECK/REORDER；布局模式变化仍需重建，退场动画结束后回收前距。
-        if (hasCodexStatusAvatar() && codexCompactLayout != shouldUseCompactCodexLayout()) {
+        // 多选开关或状态失效可能只触发重绘；同步列布局并在勾选退场后回收前距。
+        if (hasCodexStatusAvatar() && (codexCompactLayout != shouldUseCompactCodexLayout()
+                || !TextUtils.equals(codexStatusLabel, com.butang.codextop.CodexRuntime.status(currentDialogId).label))) {
             buildLayout();
         }
 
@@ -4256,6 +4301,19 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                     timeLayout.getPaint().setColor(tpColor);
                 }
                 canvas.restore();
+            }
+
+            if (hasCodexStatusAvatar() && codexStatusLayout != null) {
+                final TextPaint statusPaint = (TextPaint) codexStatusLayout.getPaint();
+                statusPaint.setColor(getTimeTextPaint().getColor());
+                // 与原摘要的第二行对齐，三行草稿也不把状态挤到第三行。
+                canvas.save();
+                canvas.translate(codexStatusLeft, codexStatusTop);
+                codexStatusLayout.draw(canvas);
+                canvas.restore();
+                drawCodexRunningIndicator(canvas, codexStatusRingLeft + dp(7),
+                        codexStatusTop + codexStatusLayout.getLineBaseline(0)
+                                + (statusPaint.ascent() + statusPaint.descent()) / 2f, statusPaint.getAlpha());
             }
 
             if (drawLock2()) {

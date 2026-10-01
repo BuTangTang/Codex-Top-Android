@@ -82,6 +82,10 @@ public final class RuntimeSendFailureTest {
             }
             static final Queue sendQueue=new Queue(),ui=new Queue();static Runnable onUiEnqueue;
             static final class AndroidUtilities {/** 只排入合成界面队列，可在原异步边界注入写失败。 */static void runOnUIThread(Runnable r){if(onUiEnqueue!=null)onUiEnqueue.run();ui.postRunnable(r);}}
+            /** 原列表摘要发布边界由 RuntimeDialogPreviewTest 独立执行，不改变发送或收发事件计数。 */
+            static void publishPendingPreview(int a,long e,long id,ArrayList<MessageObject> messages,boolean fresh){}
+            /** 原历史摘要发布边界由 RuntimeDialogPreviewTest 独立执行，不改变本专项的原失败场景。 */
+            static void publishHistoryPreview(int a,long e,long id,String remote,String machine,DesktopConnection connection,TranscriptWindow history){}
             static final class NotificationCenter {
                 static final int didReceiveNewMessages=1,updateInterfaces=2,messageReceivedByServer=3,messageSendError=4;
                 static final int messagesDidLoad=5; static int notices, reconciled, loaded;
@@ -111,6 +115,7 @@ public final class RuntimeSendFailureTest {
                 /** 恢复原选择仅设置附件标识。 */static void applySelected(TLRPC.TL_message m,OutboxStore.Selection s){m.params.put("codexSelectedFile",s.localPath==null?"":s.localPath);}
             }
             static final class DesktopConnection {
+                final String machineId="synthetic-machine";
                 int initCalls,sendCalls,openCalls;int rejectAt=1;String error="File exceeds upload size limit",failStage;Long uploadLimit;boolean connected=true;
                 String activeName,publicKey;Runnable onReject,onSend,onLimit;JsonObject transcriptPage,tailPage;
                 JsonObject transcript(String remote,String cursor){return transcriptPage;}

@@ -144,6 +144,7 @@ public final class CodexRuntime {
     /** 从原退出确认调用；停止接单、清凭据、关连接并等旧工作离开队列后返回登录页。 */
     public static void logout(Runnable completed, java.util.function.Consumer<String> failed) {
         if (loggingOut) return;
+        final int previewAccount = org.telegram.messenger.UserConfig.selectedAccount;
         loggingOut = true;
         accountGeneration++;
         watchGeneration++;
@@ -188,6 +189,9 @@ public final class CodexRuntime {
                         cachedDialogsRead = false;
                         // 与冷盘恢复共用小锁；旧账号绑定不能越过清理写入下一账号。
                         synchronized (dialogIdentityLock) {
+                            // 原消息预览也属于当前账号，只清本包绑定行，不留下可被下一账号认领的摘要。
+                            MessagesController controller = MessagesController.getInstance(previewAccount);
+                            for (Long dialogId : remoteIds.keySet()) controller.dialogMessage.remove(dialogId);
                             dialogIdentities = null;
                             browseSnapshots.clear(); remoteIds.clear(); dialogMachines.clear();
                         }
@@ -787,6 +791,8 @@ public final class CodexRuntime {
             pending.messageOwner.params.remove("codexSendFailure");
             pendingMessages.put(pending.messageOwner.params.get("codexLocalId"), pending);
         }
+        // 列表复用同一真实气泡；新批立即显示，重试旧批不抢占其他最新消息。
+        publishPendingPreview(account, epoch, dialogId, messages, params.retryMessageObject == null);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
         final long sendStarted = android.os.SystemClock.elapsedRealtime();
         final ArrayList<Map<String, String>> selectedMetadata = new ArrayList<>();
@@ -1389,6 +1395,12 @@ public final class CodexRuntime {
                     if (!isAccountCurrent(accountEpoch)) return;
                     pendingMessages.entrySet().removeIf(entry -> entry.getValue().getDialogId() == dialogId
                             && selected.contains(entry.getValue().getId()));
+                    ArrayList<MessageObject> preview = MessagesController.getInstance(account).dialogMessage.get(dialogId);
+                    if (preview != null && !preview.isEmpty() && selected.contains(preview.get(0).getId())) {
+                        MessagesController.getInstance(account).dialogMessage.remove(dialogId);
+                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_MESSAGE_TEXT);
+                        restoreDialogPreviews(account, accountEpoch, dialogMachines.get(dialogId), java.util.Collections.singletonMap(remote, dialogId));
+                    }
                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesDeleted,
                             selected, 0L, false, false, false, 0);
                 });
@@ -1419,9 +1431,10 @@ public final class CodexRuntime {
                 + " type=" + cause.getClass().getSimpleName() + " reason=" + reason);
     }
 
-    /** 原聊天页进入前台时跟随尾部游标；停止后旧响应不再投递到页面。 */
+    /** 原聊天页跟随尾部游标并发布真实列表摘要；停止后的旧响应不再投递到页面。 */
     public static void watchConversation(int account, long dialogId) {
         if (loggingOut || !loggedIn() || !ownsConversation(dialogId)) return;
+        final long accountEpoch = accountGeneration;
         watchedDialog = dialogId;
         long generation = ++watchGeneration;
         watchStatus(account, dialogId, generation);
@@ -1469,6 +1482,7 @@ public final class CodexRuntime {
                                         ArrayList<TranscriptWindow.Entry> added = bootstrap ? history.recoverTail(received) : history.append(received);
                                         if (bootstrap || !added.isEmpty() || !java.util.Objects.equals(previousCursor, history.tailCursor))
                                             saveHistory(dialogId, remote, history);
+                                        publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
                                         AndroidUtilities.runOnUIThread(() -> {
                                             if (generation != watchGeneration) return;
                                             ArrayList<org.telegram.messenger.MessageObject> incoming = new ArrayList<>();
@@ -1700,6 +1714,122 @@ public final class CodexRuntime {
         return object;
     }
 
+    /** 界面线程绑定列表后恢复原历史及待发摘要；后台读取不能覆盖期间新创建的气泡。 */
+    private static void restoreDialogPreviews(int account, long epoch, String machine, Map<String, Long> publishedIds) {
+        if (!isAccountCurrent(epoch)) return;
+        final Map<Long, MessageObject> previous = new HashMap<>();
+        for (Long dialogId : publishedIds.values()) {
+            ArrayList<MessageObject> preview = MessagesController.getInstance(account).dialogMessage.get(dialogId);
+            previous.put(dialogId, preview == null || preview.isEmpty() ? null : preview.get(0));
+        }
+        Utilities.globalQueue.postRunnable(() -> {
+            if (!isAccountCurrent(epoch)) return;
+            for (Map.Entry<String, Long> binding : publishedIds.entrySet()) {
+                long dialogId = binding.getValue();
+                String remote = binding.getKey();
+                DesktopConnection connection = dialogConnection(dialogId);
+                if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) continue;
+                TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
+                try {
+                    ArrayList<OutboxStore.Item> queued = outboxStore(dialogId).list(remote);
+                    if (!queued.isEmpty()) {
+                        java.util.HashSet<String> echoed = new java.util.HashSet<>();
+                        for (TranscriptWindow.Entry entry : history.before(0, Integer.MAX_VALUE)) {
+                            if (entry.message.outgoing && entry.message.localId != null) echoed.add(entry.message.localId);
+                        }
+                        OutboxStore.Item newest = null;
+                        for (OutboxStore.Item item : queued) {
+                            if (!batchEchoed(item, echoed) && (newest == null || item.date > newest.date)) newest = item;
+                        }
+                        ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
+                        if (newest != null && (latest.isEmpty() || newest.date >= latest.get(0).message.createdAtMs / 1000)) {
+                            final OutboxStore.Item selected = newest;
+                            AndroidUtilities.runOnUIThread(() -> {
+                                if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
+                                ArrayList<MessageObject> current = MessagesController.getInstance(account).dialogMessage.get(dialogId);
+                                MessageObject visible = current == null || current.isEmpty() ? null : current.get(0);
+                                if (visible != previous.get(dialogId)) return;
+                                if (visible != null && visible.messageOwner.params != null) {
+                                    String localId = visible.messageOwner.params.get("codexLocalId");
+                                    String batch = visible.messageOwner.params.getOrDefault("codexBatchLocalId", localId);
+                                    if (pendingMessages.get(localId) == visible && !selected.localId.equals(batch)) return;
+                                }
+                                // 原恢复器保留ACK/未知/失败、每件附件及批内顺序，不写新缓存或自动提交。
+                                ArrayList<MessageObject> pending = restoredPending(account, dialogId, selected, echoed);
+                                publishPendingPreview(account, epoch, dialogId, pending, true);
+                            });
+                        }
+                    }
+                } catch (java.io.IOException error) {
+                    logTranscriptFailure("preview_pending_restore", error, null);
+                }
+                publishHistoryPreview(account, epoch, dialogId, remote, machine, connection, history);
+            }
+        });
+    }
+
+    /** 在原历史队列取真实最新记录及回显身份，界面线程只发布不可变消息快照。 */
+    private static void publishHistoryPreview(int account, long epoch, long dialogId, String remote, String machine,
+            DesktopConnection connection, TranscriptWindow history) {
+        if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
+        ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
+        if (latest.isEmpty()) return;
+        TLRPC.TL_message message = historyMessage(dialogId, latest.get(0));
+        java.util.HashSet<String> echoed = new java.util.HashSet<>();
+        for (TranscriptWindow.Entry entry : history.before(0, Integer.MAX_VALUE)) {
+            if (entry.message.outgoing && entry.message.localId != null) echoed.add(entry.message.localId);
+        }
+        AndroidUtilities.runOnUIThread(() -> publishDialogPreview(account, epoch, dialogId, remote, machine,
+                connection, message, null, echoed));
+    }
+
+    /** 新批按原创建顺序显示最后一件；旧批重试只刷新仍属于该批的预览，不按负编号判断新旧。 */
+    private static void publishPendingPreview(int account, long epoch, long dialogId, ArrayList<MessageObject> messages, boolean fresh) {
+        if (messages.isEmpty()) return;
+        String remote = remoteIds.get(dialogId), machine = dialogMachines.get(dialogId);
+        DesktopConnection connection = dialogConnection(dialogId);
+        if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
+        ArrayList<MessageObject> current = MessagesController.getInstance(account).dialogMessage.get(dialogId);
+        if (!fresh && current != null && !current.isEmpty() && !messages.contains(current.get(0))) return;
+        MessageObject pending = messages.get(messages.size() - 1);
+        publishDialogPreview(account, epoch, dialogId, remote, machine, connection,
+                pending.messageOwner, pending, java.util.Collections.emptySet());
+    }
+
+    /** 仅更新原对话消息映射及正文重绘事件，不更改日期、未读、全局消息编号表或历史通知。 */
+    private static void publishDialogPreview(int account, long epoch, long dialogId, String remote, String machine,
+            DesktopConnection connection, TLRPC.Message message, MessageObject pending, java.util.Set<String> echoed) {
+        if (message.dialog_id != dialogId || !previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
+        MessagesController controller = MessagesController.getInstance(account);
+        ArrayList<MessageObject> old = controller.dialogMessage.get(dialogId);
+        MessageObject current = old == null || old.isEmpty() ? null : old.get(0);
+        String localId = current == null || current.messageOwner.params == null ? null : current.messageOwner.params.get("codexLocalId");
+        // 未回显的本地气泡优先；原历史已包含同身份时才释放，真实新回复不会被负编号挡住。
+        if (pending == null && localId != null && pendingMessages.get(localId) == current && !echoed.contains(localId)) return;
+        if (current != null && sameDialogPreview(current.messageOwner, message)) return;
+        MessageObject next = pending != null ? pending : historyObject(account, (TLRPC.TL_message) message);
+        ArrayList<MessageObject> preview = new ArrayList<>();
+        preview.add(next);
+        controller.dialogMessage.put(dialogId, preview);
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_MESSAGE_TEXT);
+    }
+
+    /** 比较实际影响原摘要和附件就绪的消息字段，同一真实摘要不在原列表周期重复重建。 */
+    private static boolean sameDialogPreview(TLRPC.Message left, TLRPC.Message right) {
+        return left.id == right.id && left.date == right.date && left.out == right.out && left.send_state == right.send_state
+                && java.util.Objects.equals(left.message, right.message) && java.util.Objects.equals(left.params, right.params)
+                && java.util.Objects.equals(left.attachPath, right.attachPath);
+    }
+
+    /** 每次界面发布复核原账号、对话归属及连接；同电脑旧连接不能回写新来源。 */
+    private static boolean previewCurrent(int account, long epoch, long dialogId, String remote, String machine, DesktopConnection connection) {
+        return account == org.telegram.messenger.UserConfig.selectedAccount && isAccountCurrent(epoch)
+                && remote != null && remote.equals(remoteIds.get(dialogId))
+                && machine != null && machine.equals(dialogMachines.get(dialogId))
+                && dialogConnection(dialogId) == connection
+                && (connection == null || machine.equals(connection.machineId));
+    }
+
     /** 待发消息始终写入对话所属电脑目录。 */
     private static OutboxStore outboxStore(long dialogId) {
         return new OutboxStore(new java.io.File(ApplicationLoader.applicationContext.getNoBackupFilesDir(), "codex-outbox"),
@@ -1781,7 +1911,7 @@ public final class CodexRuntime {
         }
     }
 
-    /** 用原聊天页的加载事件交付桌面文字，保持原列表布局和滚动逻辑。 */
+    /** 原聊天加载同时发布真实最新摘要；分页交付仍保持原布局、锚点和滚动逻辑。 */
     public static void loadMessages(int account, long dialogId, int count, int maxId,
                                     int classGuid, int loadType, int loadIndex, int mode) {
         final long accountEpoch = accountGeneration;
@@ -1796,6 +1926,8 @@ public final class CodexRuntime {
                 try {
                     if (fetchError != null) throw fetchError;
                     TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
+                    DesktopConnection previewConnection = dialogConnection(dialogId);
+                    publishHistoryPreview(account, accountEpoch, dialogId, remote, dialogMachines.get(dialogId), previewConnection, history);
                     boolean newer = loadType == 1;
                     ArrayList<TranscriptWindow.Entry> selected = newer ? history.after(maxId, count + 1) : history.before(maxId, count + 1);
                     boolean cachedPage = !selected.isEmpty();
@@ -1886,10 +2018,11 @@ public final class CodexRuntime {
         prefetchDialogs(candidates, connection, 1);
     }
 
-    /** 预取保留原账号快照，后台分配编号时使用同一代次校验。 */
+    /** 预取保留原账号快照并发布真实最新摘要；未变版本的缓存也进入原消息映射。 */
     private static void prefetchDialogs(com.google.gson.JsonArray candidates, DesktopConnection connection, int catchupPages) {
         final long accountEpoch = accountGeneration;
         final PasswordLogin.Session owner = session;
+        final int account = org.telegram.messenger.UserConfig.selectedAccount;
         if (!isAccountCurrent(accountEpoch) || connection == null || !connection.isConnected()
                 || desktopConnections.get(connection.machineId) != connection) return;
         Utilities.globalQueue.postRunnable(() -> {
@@ -1915,6 +2048,7 @@ public final class CodexRuntime {
                 if (dialogId == 0 || dialogConnection(dialogId) != connection
                         || dialogId == watchedDialog || prefetching.contains(dialogId)) continue;
                 TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
+                publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
                 final boolean bootstrap = history.needsTailBootstrap();
                 final boolean older = !bootstrap && history.needsVisibleHistory();
                 if (!bootstrap && !older && java.util.Objects.equals(prefetchedRevisions.get(dialogId), revision)) continue;
@@ -1948,6 +2082,7 @@ public final class CodexRuntime {
                             else if (older) history.prepend(received);
                             else history.append(received);
                             boolean saved = saveHistory(dialogId, remote, history);
+                            publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
                             // 服务端仍有后续增量时，下次继续同一游标，不能提前记为追平。
                             boolean more = received.has("hasMore") && received.get("hasMore").getAsBoolean();
                             boolean truncated = received.has("truncated") && received.get("truncated").getAsBoolean();
@@ -2106,7 +2241,7 @@ public final class CodexRuntime {
         refreshDialogs(account);
     }
 
-    /** 后台保存编号，界面复用稳定模型；只有顺序或展示字段改变才提交原列表差异。 */
+    /** 后台保存编号，界面复用稳定模型并恢复真实摘要；列表差异仍只认顺序和原展示字段。 */
     private static void publishDialogs(int account, String machine, com.google.gson.JsonArray candidates,
             long startedAt, long receivedAt, boolean cached) {
         final long accountEpoch = accountGeneration;
@@ -2162,6 +2297,7 @@ public final class CodexRuntime {
             if (statusChanged || presentationChanged)
                 NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces,
                         MessagesController.UPDATE_MASK_STATUS | (presentationChanged ? MessagesController.UPDATE_MASK_NAME : 0));
+            restoreDialogPreviews(account, accountEpoch, machine, publishedIds);
         });
     }
 
