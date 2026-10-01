@@ -14,9 +14,9 @@ import java.util.Comparator;
 import java.util.LinkedHashSet;
 import javax.tools.ToolProvider;
 
-/** 执行原空消息分支、STATUS 布局门禁与状态布局指纹；文字排版和 View 由最小平台替身提供。 */
+/** 执行原副标题、状态门禁及无头像行多选切换；文字排版和 View 由最小平台替身提供。 */
 public final class DialogCellCodexSubtitleTest {
-    /** 提取并运行原分支，分别核对空摘要、STATUS 重绘和状态布局指纹。 */
+    /** 提取原分支与方法，核对文字优先级、状态重绘、多选布局重建和头像命中边界。 */
     public static void main(String[] args) throws Exception {
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
         Path sourcePath = Path.of(args.length == 0
@@ -48,6 +48,17 @@ public final class DialogCellCodexSubtitleTest {
         IfStmt rebuild = StaticJavaParser.parseStatement(between(source, "        if (rebuildLayout) {",
                 "\n        updatePremiumBlocked")).asIfStmt();
         var statusKey = StaticJavaParser.parseStatement(between(source, "                codexStatus = status.validity", "\n").trim());
+        var compactMode = StaticJavaParser.parseMethodDeclaration(between(source,
+                "    private boolean shouldUseCompactCodexLayout() {", "\n    /** Codex 浏览时"));
+        var contentPadding = StaticJavaParser.parseMethodDeclaration(between(source,
+                "    private int getContentPaddingStart() {", "\n    /** 草稿和真实摘要"));
+        var avatarHit = StaticJavaParser.parseMethodDeclaration(between(source,
+                "    public boolean isPointInsideAvatar(float x, float y) {", "\n    public void setDialogSelected"));
+        String buildPrefix = between(source, "        final boolean compactCodexLayout = shouldUseCompactCodexLayout();",
+                "\n        // 保留公开原间距");
+        var drawModeGate = StaticJavaParser.parseStatement(between(source,
+                "        if (hasCodexStatusAvatar() && codexCompactLayout != shouldUseCompactCodexLayout()) {",
+                "\n\n        boolean needInvalidate").trim());
 
         LinkedHashSet<String> resources = new LinkedHashSet<>();
         preview.findAll(com.github.javaparser.ast.expr.FieldAccessExpr.class).stream()
@@ -65,7 +76,10 @@ public final class DialogCellCodexSubtitleTest {
                     + "boolean update(int mask){boolean requestLayout=false,rebuildLayout=false;"
                     + gate + earlyExit + measured + rebuild + "return requestLayout;}"
                     + "String statusKey(){var status=CodexRuntime.status(currentDialogId);String codexStatus=null;"
-                    + statusKey + "return codexStatus;}" + SCENARIOS + "}");
+                    + statusKey + "return codexStatus;}"
+                    + compactMode + contentPadding + avatarHit
+                    + "void buildLayout(){" + buildPrefix + "builds++;}"
+                    + "void drawModeProbe(){" + drawModeGate + "}" + SCENARIOS + "}");
             Path runtime = temp.resolve("CodexRuntime.java");
             Files.writeString(runtime, "package com.butang.codextop; public final class CodexRuntime {"
                     + "public static SessionStatus.Store store=new SessionStatus.Store();public static long now;"
@@ -109,11 +123,17 @@ public final class DialogCellCodexSubtitleTest {
             int currentDialogCommunityId,currentDialogFolderId,dialogsType,paintIndex,builds,invalidates;
             long currentDialogId=1;TLRPC.EncryptedChat encryptedChat;Object user;String draftMessage,message;
             Object currentMessagePaint;Parent parentFragment;
-            static class Parent {boolean isQuote;}
+            boolean isDialogCell,codexCompactLayout,useForceThreeLines;
+            int messagePaddingStart=72;CheckBox checkBox;UpdateHelper updateHelper=new UpdateHelper();
+            static class UpdateHelper {boolean update(){return false;}}
+            static class CheckBox {boolean checked;float progress;boolean isChecked(){return checked;}float getProgress(){return progress;}}
+            static class Parent {boolean isQuote;ActionBar actionBar=new ActionBar();ActionBar getActionBar(){return actionBar;}}
+            static class ActionBar {boolean selection;boolean isActionModeShowed(){return selection;}}
+            static class SharedConfig {static boolean useThreeLinesLayout;}
             boolean showChecks=true,drawTime=true;
             boolean hasCodexStatusAvatar(){return codex&&currentDialogFolderId==0;}
             int getMeasuredWidth(){return 400;}int getMeasuredHeight(){return 72;}
-            void invalidate(){invalidates++;}void buildLayout(){builds++;}
+            int dp(int value){return value;}void invalidate(){invalidates++;}
             String formatCommunityDialogNames(){return "community";}
             String formatArchivedDialogNames(){return "archive";}
             static String getString(String value){return value;}
@@ -125,7 +145,7 @@ public final class DialogCellCodexSubtitleTest {
                 static class TL_encryptedChatDiscarded extends EncryptedChat{}static class TL_encryptedChat extends EncryptedChat{}
             }
             static class UserObject {static String getFirstName(Object user){return "user";}static boolean isUserSelf(Object user){return true;}}
-            static class LocaleController {static String formatString(String resource,String name){return resource;}}
+            static class LocaleController {static boolean isRTL;static String formatString(String resource,String name){return resource;}}
             static class UserConfig {static UserConfig getInstance(int account){return new UserConfig();}long getClientUserId(){return 0;}}
             static class DialogsActivity {static final int DIALOGS_TYPE_FORWARD=99;}
             int currentAccount;
@@ -172,9 +192,31 @@ public final class DialogCellCodexSubtitleTest {
                 CodexRuntime.store.unavailable("machine",130);CodexRuntime.now=131;String offline=cell.statusKey();
                 check(!failed.equals(offline),"同状态类型的标签变化被布局指纹遗漏");
             }
+            // 执行原多选布局门禁和左右头像命中，未运行 Android 实际绘制。
+            static void selectionAndAvatarHit(){
+                DialogSubtitleProbe cell=new DialogSubtitleProbe();cell.isDialogCell=true;
+                cell.buildLayout();check(cell.builds==1&&cell.codexCompactLayout,"Codex 浏览没有回收头像槽");
+                cell.drawModeProbe();check(cell.builds==1,"未切换模式却重复重建");
+                cell.parentFragment=new Parent();cell.parentFragment.actionBar.selection=true;
+                cell.drawModeProbe();check(cell.builds==2&&!cell.codexCompactLayout,"进入原生多选未重建");
+                check(cell.getContentPaddingStart()==cell.messagePaddingStart,"多选没有保留原勾选槽");
+                cell.parentFragment.actionBar.selection=false;cell.checkBox=new CheckBox();cell.checkBox.checked=true;
+                cell.drawModeProbe();check(cell.builds==2,"原勾选仍显示时提前回收了槽位");
+                cell.checkBox.checked=false;cell.checkBox.progress=.5f;
+                cell.drawModeProbe();check(cell.builds==2,"勾选退场未结束就回收，文字会覆盖勾选框");
+                cell.checkBox.progress=0;cell.drawModeProbe();
+                check(cell.builds==3&&cell.codexCompactLayout,"取消多选后未重建紧凑布局");
+                for(boolean rtl:new boolean[]{false,true}){
+                    LocaleController.isRTL=rtl;check(!cell.isPointInsideAvatar(rtl?390:10,35),"无头像文字触发了头像预览");
+                    cell.codex=false;check(cell.getContentPaddingStart()==cell.messagePaddingStart,"普通 Telegram 行间距改变");
+                    check(cell.isPointInsideAvatar(rtl?390:10,35),"普通 Telegram 头像热点丢失");
+                    check(!cell.isPointInsideAvatar(rtl?10:390,35),"普通 Telegram 头像热点方向改变");cell.codex=true;
+                }
+                LocaleController.isRTL=false;
+            }
             public static void main(String[] args){
                 int failures=0;
-                for(String name:new String[]{"emptyAndPriority","statusRebuild","labelFingerprint"}){
+                for(String name:new String[]{"emptyAndPriority","statusRebuild","labelFingerprint","selectionAndAvatarHit"}){
                     try{DialogSubtitleProbe.class.getDeclaredMethod(name).invoke(null);System.out.println("PASS "+name);}
                     catch(Exception error){failures++;Throwable cause=error instanceof java.lang.reflect.InvocationTargetException?error.getCause():error;System.out.println("FAIL "+name+": "+cause.getMessage());}
                 }

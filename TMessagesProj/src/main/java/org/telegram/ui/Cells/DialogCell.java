@@ -1232,16 +1232,22 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
     private static final float BADGE_DRAWABLE_SIZE = 16;
     private static final float BADGE_DRAWABLE_OFFSET = (BADGE_SIZE - BADGE_DRAWABLE_SIZE) / 2f;
 
+    /** 沿用原行文字布局，仅对 Codex 无头像行回收前侧留白并嵌入小运行环。 */
     public void buildLayout() {
         if (isTransitionSupport) {
             return;
         }
+        final boolean compactCodexLayout = shouldUseCompactCodexLayout();
         if (isDialogCell) {
             boolean needUpdate = updateHelper.update();
-            if (!needUpdate && currentDialogFolderId == 0 && currentDialogCommunityId == 0 && encryptedChat == null) {
+            if (!needUpdate && codexCompactLayout == compactCodexLayout
+                    && currentDialogFolderId == 0 && currentDialogCommunityId == 0 && encryptedChat == null) {
                 return;
             }
         }
+        codexCompactLayout = compactCodexLayout;
+        // 保留公开原间距；仅本次 Codex 文字布局使用紧凑前距，普通行和 RTL 公式不变。
+        final int messagePaddingStart = getContentPaddingStart();
 
         if (useForceThreeLines || SharedConfig.useThreeLinesLayout || true) {
             Theme.dialogs_namePaint[0].setTextSize(dp(17));
@@ -2723,6 +2729,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             FileLog.e(e);
         }
 
+        messageString = withCodexRunningIndicator(messageString);
         try {
             CharSequence messageStringFinal;
             // Removing links and bold spans to get rid of underlining and boldness
@@ -3109,7 +3116,11 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
     }
 
+    /** Codex 行没有头像热点；普通会话仍按原左右方向判断头像长按预览。 */
     public boolean isPointInsideAvatar(float x, float y) {
+        if (hasCodexStatusAvatar()) {
+            return false;
+        }
         if (!LocaleController.isRTL) {
             return x >= 0 && x < dp(60);
         } else {
@@ -3758,93 +3769,87 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
     }
 
     private org.telegram.ui.Components.RadialProgressView codexStatusProgress;
-    private Drawable codexStatusIcon;
-    private int codexStatusIconRes;
-    private final Paint codexStatusPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private long codexStatusFrameTimeMs;
+    private boolean codexCompactLayout;
 
-    /** 只替换真实 Codex 会话的头像内容，未读和原行尺寸保持独立。 */
+    /** 仅识别真实 Codex 会话行；普通会话和归档继续使用原头像与布局。 */
     private boolean hasCodexStatusAvatar() {
         return currentDialogFolderId == 0 && com.butang.codextop.CodexRuntime.enabled()
                 && com.butang.codextop.CodexRuntime.ownsConversation(currentDialogId);
     }
 
-    /** 使用统一快照和原进度/提示图形；过期、离屏、后台及减少动画时不驱动逐帧刷新。 */
-    private void drawCodexStatusAvatar(Canvas canvas) {
-        com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
-        boolean current = "current".equals(status.validity);
-        boolean running = current && "running".equals(status.state);
-        int colorKey = Theme.key_windowBackgroundWhiteGrayText;
-        int icon = R.drawable.msg_help;
-        if ("stale".equals(status.validity) || "syncing".equals(status.validity)) {
-            icon = R.drawable.msg_recent;
-        } else if ("unavailable".equals(status.validity)) {
-            icon = R.drawable.msg_warning;
-        } else if (current) {
-            switch (status.state) {
-                case "running":
-                    colorKey = Theme.key_windowBackgroundWhiteBlueText;
-                    icon = R.drawable.msg_recent;
-                    break;
-                case "completed":
-                    colorKey = Theme.key_windowBackgroundWhiteGreenText;
-                    icon = R.drawable.msg_text_check;
-                    break;
-                case "needs_input":
-                    colorKey = Theme.key_windowBackgroundWhiteBlueText;
-                    icon = R.drawable.msg_info;
-                    break;
-                case "failed":
-                    colorKey = Theme.key_text_RedRegular;
-                    icon = R.drawable.msg_warning;
-                    break;
-                case "cancelled":
-                    icon = R.drawable.msg_cancel;
-                    break;
-            }
+    /** 正常浏览回收头像槽；原生多选和勾选退场期间保留原槽，避免勾选框覆盖文字。 */
+    private boolean shouldUseCompactCodexLayout() {
+        return hasCodexStatusAvatar()
+                && !(parentFragment != null && parentFragment.getActionBar() != null
+                    && parentFragment.getActionBar().isActionModeShowed())
+                && !(checkBox != null && (checkBox.isChecked() || checkBox.getProgress() > 0f));
+    }
+
+    /** Codex 浏览时标题与第二行从 16dp 开始，多选及其他 Telegram 行保留公开原间距。 */
+    private int getContentPaddingStart() {
+        return shouldUseCompactCodexLayout()
+                ? (useForceThreeLines || SharedConfig.useThreeLinesLayout ? 10 : 12)
+                : messagePaddingStart;
+    }
+
+    /** 草稿和真实摘要保持原内容及优先级，只在有效运行状态的第二行前留出小环位置。 */
+    private CharSequence withCodexRunningIndicator(CharSequence subtitle) {
+        if (!hasCodexStatusAvatar() || TextUtils.isEmpty(subtitle)) {
+            return subtitle;
         }
-        int color = Theme.getColor(colorKey, resourcesProvider);
-        float cx = storyParams.originalAvatarRect.centerX();
-        float cy = storyParams.originalAvatarRect.centerY();
-        float radius = storyParams.originalAvatarRect.width() / 2f;
-        codexStatusPaint.setColor(ColorUtils.setAlphaComponent(color, 24));
-        canvas.drawCircle(cx, cy, radius, codexStatusPaint);
-        boolean animate = running && attachedToWindow && visibleOnScreen && isShown()
+        com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
+        if (!"current".equals(status.validity) || !"running".equals(status.state)) {
+            return subtitle;
+        }
+        SpannableStringBuilder result = new SpannableStringBuilder(" ").append(subtitle);
+        result.setSpan(new ReplacementSpan() {
+            /** 仅预留小环和文字的间隔，不更改原文本行高或缩略图占位。 */
+            @Override
+            public int getSize(Paint paint, CharSequence text, int start, int end, Paint.FontMetricsInt fm) {
+                return dp(20);
+            }
+
+            /** 由原文字排版确定位置和方向，减少动画时保持上次圆环相位。 */
+            @Override
+            public void draw(Canvas canvas, CharSequence text, int start, int end, float x, int top, int y, int bottom, Paint paint) {
+                drawCodexRunningIndicator(canvas, x + dp(LocaleController.isRTL ? 13 : 7),
+                        y + (paint.ascent() + paint.descent()) / 2f, paint.getAlpha());
+            }
+        }, 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return result;
+    }
+
+    /** 只画 14dp 蓝环；状态失效即停止，离屏、后台和减少动画不驱动下一帧。 */
+    private void drawCodexRunningIndicator(Canvas canvas, float cx, float cy, int alpha) {
+        com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
+        if (!hasCodexStatusAvatar() || !"current".equals(status.validity) || !"running".equals(status.state)) {
+            return;
+        }
+        boolean animate = attachedToWindow && visibleOnScreen && isShown()
                 && getWindowVisibility() == VISIBLE && !ApplicationLoader.mainInterfacePaused
                 && (parentFragment == null || !parentFragment.isPaused())
                 && SharedConfig.animationsEnabled()
                 && (android.os.Build.VERSION.SDK_INT < 26 || android.animation.ValueAnimator.areAnimatorsEnabled());
-        if (animate) {
-            if (codexStatusProgress == null) {
-                codexStatusProgress = new org.telegram.ui.Components.RadialProgressView(getContext(), resourcesProvider);
-                codexStatusProgress.setSize(dp(26));
-                codexStatusProgress.setStrokeWidth(2);
-            }
-            codexStatusProgress.setProgressColor(color);
-            // 同一 View 树共享单调绘制帧时间，滚动新出现的单元格也立即对齐原圆环相位。
-            codexStatusProgress.drawIndeterminateAtTime(canvas, cx, cy, getDrawingTime());
-            postInvalidateOnAnimation();
-        } else {
-            if (codexStatusIcon == null || codexStatusIconRes != icon) {
-                codexStatusIconRes = icon;
-                codexStatusIcon = ContextCompat.getDrawable(getContext(), icon).mutate();
-            }
-            codexStatusIcon.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN));
-            // 原警示图是窄长感叹号，必须等比居中；强制正方形会把它拉伸成黑块。
-            int sourceWidth = Math.max(1, codexStatusIcon.getIntrinsicWidth());
-            int sourceHeight = Math.max(1, codexStatusIcon.getIntrinsicHeight());
-            float scale = dp(28) / (float) Math.max(sourceWidth, sourceHeight);
-            int width = Math.max(1, Math.round(sourceWidth * scale));
-            int height = Math.max(1, Math.round(sourceHeight * scale));
-            int left = Math.round(cx - width / 2f), top = Math.round(cy - height / 2f);
-            codexStatusIcon.setBounds(left, top, left + width, top + height);
-            codexStatusIcon.draw(canvas);
+        if (codexStatusProgress == null) {
+            codexStatusProgress = new org.telegram.ui.Components.RadialProgressView(getContext(), resourcesProvider);
+            codexStatusProgress.setSize(dp(14));
+            codexStatusProgress.setStrokeWidth(1.5f);
         }
+        codexStatusProgress.setProgressColor(ColorUtils.setAlphaComponent(
+                Theme.getColor(Theme.key_windowBackgroundWhiteBlueText, resourcesProvider), alpha));
+        if (animate) {
+            // 同一 View 树共享单调绘制帧时间，滚动新出现的单元格也立即对齐原圆环相位。
+            codexStatusFrameTimeMs = getDrawingTime();
+            postInvalidateOnAnimation();
+        }
+        codexStatusProgress.drawIndeterminateAtTime(canvas, cx, cy, codexStatusFrameTimeMs);
     }
 
     private GradientDrawable archiveFadeGradientDrawable;
     private int archiveFadeGradientDrawableColor;
 
-    /** 保持原列表绘制流程，仅在原头像槽绘制 Codex 任务状态。 */
+    /** 保持原列表绘制流程，Codex 行不画大头像或状态色块，第二行自行绘制小运行环。 */
     @SuppressLint("DrawAllocation")
     @Override
     protected void onDraw(Canvas canvas) {
@@ -3853,6 +3858,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
         if (!visibleOnScreen) {
             return;
+        }
+        // 原生多选开关可能只发 CHECK/REORDER；布局模式变化仍需重建，退场动画结束后回收前距。
+        if (hasCodexStatusAvatar() && codexCompactLayout != shouldUseCompactCodexLayout()) {
+            buildLayout();
         }
 
         boolean needInvalidate = false;
@@ -4772,10 +4781,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             canvas.scale(scale, scale, avatarImage.getCenterX(), avatarImage.getCenterY());
         }
 
-        if (drawAvatar && (!(isTopic && forumTopic != null && forumTopic.id == 1) || archivedChatsDrawable == null || !archivedChatsDrawable.isDraw())) {
-            if (hasCodexStatusAvatar()) {
-                drawCodexStatusAvatar(canvas);
-            } else if (drawMonoforumAvatar) {
+        if (!hasCodexStatusAvatar() && drawAvatar && (!(isTopic && forumTopic != null && forumTopic.id == 1) || archivedChatsDrawable == null || !archivedChatsDrawable.isDraw())) {
+            if (drawMonoforumAvatar) {
                 if (bubbleClip == null) {
                     bubbleClip = new PhotoBubbleClip();
                 }
@@ -4861,7 +4868,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             if (fullSeparator || currentDialogFolderId != 0 && archiveHidden && !fullSeparator2 || fullSeparator2 && !archiveHidden) {
                 left = 0;
             } else {
-                left = dp(messagePaddingStart);
+                left = dp(getContentPaddingStart());
             }
 
             if (rightFragmentOpenedProgress != 1) {
@@ -5955,7 +5962,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         }
     }
 
+    /** 保留原摘要内容生产逻辑，Codex 摘要高亮截断使用已回收头像槽的可用宽度。 */
     public SpannableStringBuilder getMessageStringFormatted(int messageFormatType, String restrictionReason, CharSequence messageNameString, boolean applyThumbs) {
+        final int messagePaddingStart = getContentPaddingStart();
         SpannableStringBuilder stringBuilder;
         MessageObject captionMessage = getCaptionMessage();
         CharSequence msgText = message != null ? message.messageText : null;
