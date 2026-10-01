@@ -344,40 +344,59 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return java.text.NumberFormat.getNumberInstance().format(duration / 1000.0) + " 秒";
     }
 
-    /** 根页和原详情复用原分组设置行，采集账号、时间、过期与缺失均明确保留。 */
+    /** 额度优先使用原文字行；窗口与重置紧邻，原采集来源、预计及过期含义完整保留。 */
     private void fillCodexUsageItems(ArrayList<UItem> items) {
-        if (!codexMyRoot()) {
-            items.add(SettingCell.Factory.of(30, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
-                    R.drawable.settings_devices, "来源电脑", getArguments().getString("codexMachineName", "电脑")).setEnabled(false));
-        }
-        items.add(UItem.asShadow(codexUsageMachineId() == null ? "选择来源电脑后显示该电脑的 Codex 额度" : "所选电脑采集时的 Codex 账号"));
-        if (codexUsageMachineId() == null) return;
-        if (codexUsage != null && codexUsage.available) {
-            items.add(SettingCell.Factory.of(31, IconBackgroundColors.BLUE.top, IconBackgroundColors.BLUE.bottom,
-                    R.drawable.settings_account, "采集账号", TextUtils.isEmpty(codexUsage.accountLabel)
-                            ? "来源未返回" : codexUsage.accountLabel).setEnabled(false));
-            items.add(SettingCell.Factory.of(32, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
-                    R.drawable.msg_info, codexUsage.isStale(System.currentTimeMillis()) ? "采集时间（已过期）" : "采集时间",
-                    codexQuotaTime(codexUsage.fetchedAtMs)).setEnabled(false));
-            items.add(UItem.asShadow(null));
+        items.add(UItem.asHeader("Codex 额度"));
+        if (codexUsageMachineId() != null && codexUsage != null && codexUsage.available) {
             int id = 40;
             java.text.NumberFormat percent = java.text.NumberFormat.getNumberInstance();
             percent.setMaximumFractionDigits(1);
+            StringBuilder resets = new StringBuilder();
             for (com.butang.codextop.AccountUsage.Meter meter : codexUsage.meters) {
-                String remaining = meter.remainingPercent == null ? "剩余比例未返回"
-                        : (meter.estimated ? "采集时预计剩余 " : "采集时剩余 ") + percent.format(meter.remainingPercent) + "%";
-                items.add(SettingCell.Factory.of(id++, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
-                        R.drawable.settings_data, meter.label, remaining + " · " + codexQuotaWindow(meter.windowDurationMs)).setEnabled(false));
-                items.add(SettingCell.Factory.of(id++, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
-                        R.drawable.msg_info, "重置时间", meter.resetsAtMs == null ? "来源未返回" : codexQuotaTime(meter.resetsAtMs)).setEnabled(false));
-                items.add(UItem.asShadow(null));
+                CharSequence remaining = "剩余比例未返回";
+                if (meter.remainingPercent != null) {
+                    String value = percent.format(meter.remainingPercent) + "%";
+                    android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(value)
+                            .append(meter.estimated ? "  采集时预计剩余" : "  采集时剩余");
+                    text.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, value.length(),
+                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    text.setSpan(new android.text.style.RelativeSizeSpan(1.375f), 0, value.length(),
+                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    remaining = text;
+                }
+                items.add(SettingCell.Factory.of(id++, 0, 0, 0, remaining,
+                        meter.label + " · " + codexQuotaWindow(meter.windowDurationMs)).setEnabled(false));
+                ++id; // 保留各窗口原编号间隔，重置说明合并到同一原说明行。
+                if (resets.length() > 0) resets.append('\n');
+                resets.append(meter.label).append(" · 重置时间：").append(meter.resetsAtMs == null
+                        ? "来源未返回" : codexQuotaTime(meter.resetsAtMs));
             }
+            // 长日期沿原说明行自然换行，各窗口不单独拆成卡片。
+            items.add(UItem.asShadow(resets));
+        }
+        if (codexMyRoot()) {
+            items.add(SettingCell.Factory.of(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
+                    ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel())
+                    .setEnabled(!codexBrowseLoading || !codexBrowseRows.isEmpty()));
+        } else {
+            items.add(SettingCell.Factory.of(30, 0, 0, 0, "来源电脑",
+                    getArguments().getString("codexMachineName", "电脑")).setEnabled(false));
+        }
+        if (codexUsageMachineId() == null) {
+            items.add(UItem.asShadow("选择来源电脑后显示该电脑的 Codex 额度"));
+            return;
+        }
+        if (codexUsage != null && codexUsage.available) {
+            items.add(SettingCell.Factory.of(31, 0, 0, 0, "采集账号", TextUtils.isEmpty(codexUsage.accountLabel)
+                    ? "来源未返回" : codexUsage.accountLabel).setEnabled(false));
+            items.add(SettingCell.Factory.of(32, 0, 0, 0,
+                    codexUsage.isStale(System.currentTimeMillis()) ? "采集时间（已过期）" : "采集时间",
+                    codexQuotaTime(codexUsage.fetchedAtMs)).setEnabled(false));
         }
         String status = codexUsageLoading ? "正在读取" : codexUsageError != null ? codexUsageError
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
-        items.add(SettingCell.Factory.of(33, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
-                R.drawable.settings_data, "刷新额度", status).setEnabled(!codexUsageLoading));
-        items.add(UItem.asShadow(null));
+        items.add(SettingCell.Factory.of(33, 0, 0, 0, "刷新额度", status).setEnabled(!codexUsageLoading));
+        items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
     }
 
 
@@ -918,7 +937,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private ArrayList<Integer> accountNumbers = new ArrayList<>();
-    /** “我的”直接展示所选电脑的额度；原电脑子页与 Telegram 设置沿原列表。 */
+    /** “我的”将真实额度前置，再列原账号与设置；电脑子页和 Telegram 原列表保持。 */
     private void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
             items.add(UItem.asSpace(ActionBar.getCurrentActionBarHeight()));
@@ -959,24 +978,19 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 items.add(UItem.asShadow(null));
                 return;
             }
-            com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
-            items.add(SettingCell.Factory.of(20, IconBackgroundColors.BLUE.top, IconBackgroundColors.BLUE.bottom,
-                    R.drawable.settings_account, "账号", TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName).setEnabled(false));
-            items.add(SettingCell.Factory.of(21, IconBackgroundColors.CYAN.top, IconBackgroundColors.CYAN.bottom,
-                    R.drawable.settings_devices, "连接状态", account.connectionLabel).setEnabled(false));
-            items.add(SettingCell.Factory.of(22, IconBackgroundColors.PURPLE.top, IconBackgroundColors.PURPLE.bottom,
-                    R.drawable.settings_language, "服务地址", account.server).setEnabled(false));
-            items.add(UItem.asShadow(null));
-            items.add(SettingCell.Factory.of(25, IconBackgroundColors.BLUE_DEEP.top, IconBackgroundColors.BLUE_DEEP.bottom,
-                    R.drawable.settings_data, "Codex 额度", codexUsageSourceLabel()).setEnabled(!codexBrowseLoading || !codexBrowseRows.isEmpty()));
             fillCodexUsageItems(items);
-            items.add(SettingCell.Factory.of(6, IconBackgroundColors.ORANGE.top, IconBackgroundColors.ORANGE.bottom,
-                    R.drawable.settings_chat, "最近会话条数", com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+            com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
+            items.add(SettingCell.Factory.of(20, 0, 0, 0, "账号",
+                    TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName).setEnabled(false));
+            items.add(SettingCell.Factory.of(21, 0, 0, 0, "连接状态", account.connectionLabel).setEnabled(false));
+            items.add(SettingCell.Factory.of(22, 0, 0, 0, "服务地址", account.server).setEnabled(false));
             items.add(UItem.asShadow(null));
-            items.add(SettingCell.Factory.of(23, IconBackgroundColors.BLUE_ALT.top, IconBackgroundColors.BLUE_ALT.bottom,
-                    R.drawable.settings_folders, "本地缓存", "已读取的聊天记录保存在本机，联网后自动更新").setEnabled(false));
-            items.add(SettingCell.Factory.of(24, IconBackgroundColors.GRAY.top, IconBackgroundColors.GRAY.bottom,
-                    R.drawable.msg_info, "版本", getVersionName()).setEnabled(false));
+            items.add(SettingCell.Factory.of(6, 0, 0, 0, "最近会话条数",
+                    com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+            items.add(UItem.asShadow(null));
+            items.add(SettingCell.Factory.of(23, 0, 0, 0, "本地缓存",
+                    "已读取的聊天记录保存在本机，联网后自动更新").setEnabled(false));
+            items.add(SettingCell.Factory.of(24, 0, 0, 0, "版本", getVersionName()).setEnabled(false));
             items.add(UItem.asShadow(null));
             return;
         }
