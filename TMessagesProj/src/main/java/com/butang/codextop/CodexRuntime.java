@@ -674,10 +674,11 @@ public final class CodexRuntime {
         return expected;
     }
 
-    /** 原失败菜单不提供无效重试；发送结果未知时只等待同身份回显。 */
+    /** 已接受或结果未知均等待同身份回显，不能从原菜单重复提交。 */
     public static boolean canRetryMessage(MessageObject message) {
         return message != null && (message.messageOwner.params == null
-                || !"true".equals(message.messageOwner.params.get("codexSendUncertain")));
+                || !"true".equals(message.messageOwner.params.get("codexSendUncertain"))
+                && !"true".equals(message.messageOwner.params.get("codexSendAccepted")));
     }
 
     /** 原输入框清空后立刻产生本地气泡；同组图片或文件收齐后只提交一个桌面输入。 */
@@ -807,6 +808,7 @@ public final class CodexRuntime {
                 }
                 traceSend("persisted", base, sendStarted);
                 if (!isAccountCurrent(epoch)) return;
+                if (stored.submissionAccepted) { finishSend(account, epoch, base, messages, remote, null, true, false, null); return; }
                 // 原请求可能已派发；即使用户点击重试也等待回显，不重复进入桌面发送。
                 if (stored.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true, null); return; }
                 // 清除旧解释必须先落盘；失败时停止本次远端工作，不能留下新失败的旧原因。
@@ -888,7 +890,10 @@ public final class CodexRuntime {
                     throw notAccepted;
                 }
                 traceSend("ack", base, sendStarted);
-                finishSend(account, epoch, base, messages, remote, connection, true, true, null);
+                // ACK事实沿原记录落盘；磁盘失败不推翻当前已接受，冷恢复仍只按已存未知等待回显。
+                try { outbox.markSubmissionAccepted(base); }
+                catch (IOException error) { android.util.Log.w("CodexBridge", "send_ack_persist_failed"); }
+                finishSend(account, epoch, base, messages, remote, connection, true, false, null);
             } catch (Exception error) {
                 if (failureCode != null && !uncertain && isAccountCurrent(epoch)) {
                     try { outbox.markFailureCode(base, failureCode); }
@@ -913,31 +918,33 @@ public final class CodexRuntime {
                         + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - started));
     }
 
-    /** 只更新仍归属于原负编号的待发气泡；成功或结果未知均抑制此前的失败解释。 */
+    /** 原账号与会话的ACK不因连接替换失效；未知使用原等待时钟，明确失败才显示重试。 */
     private static void finishSend(int account, long epoch, String base, ArrayList<MessageObject> messages,
             String remote, DesktopConnection connection, boolean success, boolean uncertain, String failureCode) {
         AndroidUtilities.runOnUIThread(() -> {
-            if (!isAccountCurrent(epoch)) return;
-            boolean accepted = success && attachmentCurrent(epoch, messages.get(0).getDialogId(), remote, connection);
+            if (!isAccountCurrent(epoch) || !remote.equals(remoteIds.get(messages.get(0).getDialogId()))) return;
             sendingBatches.remove(base);
             for (MessageObject pending : messages) {
                 String localId = pending.messageOwner.params.get("codexLocalId");
                 if (pendingMessages.get(localId) != pending) continue;
-                if (!success && !uncertain && OutboxStore.FAILURE_FILE_TOO_LARGE.equals(failureCode))
+                boolean accepted = success || "true".equals(pending.messageOwner.params.get("codexSendAccepted"));
+                if (!accepted && !uncertain && OutboxStore.FAILURE_FILE_TOO_LARGE.equals(failureCode))
                     pending.messageOwner.params.put("codexSendFailure", OutboxStore.FAILURE_FILE_TOO_LARGE);
                 else pending.messageOwner.params.remove("codexSendFailure");
-                if (uncertain) pending.messageOwner.params.put("codexSendUncertain", "true");
+                if (accepted) pending.messageOwner.params.put("codexSendAccepted", "true");
+                if (!accepted && uncertain) pending.messageOwner.params.put("codexSendUncertain", "true");
                 else pending.messageOwner.params.remove("codexSendUncertain");
-                pending.messageOwner.send_state = accepted ? MessageObject.MESSAGE_SEND_STATE_SENT : MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
+                pending.messageOwner.send_state = accepted ? MessageObject.MESSAGE_SEND_STATE_SENT
+                        : uncertain ? MessageObject.MESSAGE_SEND_STATE_SENDING : MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
                 if (isAttachmentMessage(pending)) {
                     String key = attachmentKey(pending);
                     AttachmentState previous = attachmentStates.get(key);
-                    attachmentStates.put(key, new AttachmentState(false, true, !accepted,
+                    attachmentStates.put(key, new AttachmentState(false, true, !accepted && !uncertain,
                             previous == null ? 0 : previous.transferredBytes, previous == null ? 0 : previous.totalBytes));
                 }
                 if (accepted) NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByServer,
                         pending.getId(), pending.getId(), pending.messageOwner, pending.getDialogId(), 0L, 0, false);
-                else NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageSendError, pending.getId());
+                else if (!uncertain) NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageSendError, pending.getId());
             }
             NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
         });
@@ -1398,14 +1405,10 @@ public final class CodexRuntime {
                                             if (generation != watchGeneration) return;
                                             ArrayList<org.telegram.messenger.MessageObject> incoming = new ArrayList<>();
                                             for (TranscriptWindow.Entry entry : added) {
-                                                org.telegram.messenger.MessageObject pending = entry.message.localId == null ? null
-                                                        : pendingMessages.remove(entry.message.localId);
-                                                if (org.telegram.messenger.BuildVars.DEBUG_VERSION && entry.message.outgoing) android.util.Log.i("CodexBridge", "echo_key=" + (entry.message.localId == null ? 0 : entry.message.localId.hashCode()) + " matched=" + (pending != null));
                                                 TLRPC.TL_message message = historyMessage(dialogId, entry);
-                                                if (pending != null) {
-                                                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByServer,
-                                                            pending.getId(), message.id, message, dialogId, 0L, 0, false);
-                                                } else {
+                                                boolean matched = confirmPendingEcho(account, dialogId, message);
+                                                if (org.telegram.messenger.BuildVars.DEBUG_VERSION && entry.message.outgoing) android.util.Log.i("CodexBridge", "echo_key=" + (entry.message.localId == null ? 0 : entry.message.localId.hashCode()) + " matched=" + matched);
+                                                if (!matched) {
                                                     incoming.add(historyObject(account, message));
                                                 }
                                             }
@@ -1588,6 +1591,17 @@ public final class CodexRuntime {
         }
     }
 
+    /** 历史和增量回显沿同一localId迁移原负编号气泡，只匹配同对话用户消息。 */
+    private static boolean confirmPendingEcho(int account, long dialogId, TLRPC.TL_message message) {
+        String localId = message.out && message.params != null ? message.params.get("codexLocalId") : null;
+        MessageObject pending = localId == null ? null : pendingMessages.get(localId);
+        if (pending == null || pending.getDialogId() != dialogId || pending.getId() >= 0) return false;
+        pendingMessages.remove(localId);
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messageReceivedByServer,
+                pending.getId(), message.id, message, dialogId, 0L, 0, false);
+        return true;
+    }
+
     /** 转换已有来源消息，历史和增量复用同一个原版文字模型。 */
     private static TLRPC.TL_message historyMessage(long dialogId, TranscriptWindow.Entry row) {
         TLRPC.TL_message message = new TLRPC.TL_message();
@@ -1642,10 +1656,12 @@ public final class CodexRuntime {
             if (i < item.attachments.size()) AttachmentMessages.applyPending(message, item.attachments.get(i));
             else if (i < item.selections.size()) AttachmentMessages.applySelected(message, item.selections.get(i));
             if (item.submissionUncertain) message.params.put("codexSendUncertain", "true");
+            if (item.submissionAccepted) message.params.put("codexSendAccepted", "true");
             if (!item.submissionUncertain && OutboxStore.FAILURE_FILE_TOO_LARGE.equals(item.failureCode))
                 message.params.put("codexSendFailure", OutboxStore.FAILURE_FILE_TOO_LARGE);
-            // 未取得回显不能声明已送达，也不能在恢复进程时自动执行指令。
-            message.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
+            // 真实ACK保留成功，未知只等待回显；两者都不能在恢复进程时重新提交。
+            message.send_state = item.submissionAccepted ? MessageObject.MESSAGE_SEND_STATE_SENT
+                    : item.submissionUncertain ? MessageObject.MESSAGE_SEND_STATE_SENDING : MessageObject.MESSAGE_SEND_STATE_SEND_ERROR;
             MessageObject result = new MessageObject(account, message, true, false);
             result.attachPathExists = result.mediaExists = attachmentFile(result) != null;
             pendingMessages.put(localId, result);
@@ -1762,11 +1778,12 @@ public final class CodexRuntime {
                     }
                     restored.removeIf(item -> batchEchoed(item, echoed));
                     AndroidUtilities.runOnUIThread(() -> {
-                        if (!isAccountCurrent(accountEpoch)) return;
+                        if (!isAccountCurrent(accountEpoch) || !remote.equals(remoteIds.get(dialogId))) return;
                         ArrayList<org.telegram.messenger.MessageObject> objects = new ArrayList<>();
                         for (int i = 0; i < Math.min(count, rows.size()); i++) {
                             TranscriptWindow.Entry row = rows.get(i);
                             TLRPC.TL_message message = historyMessage(dialogId, row);
+                            confirmPendingEcho(account, dialogId, message);
                             objects.add(historyObject(account, message));
                         }
                         if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge", "history type=" + loadType + " max=" + maxId + " count=" + objects.size());

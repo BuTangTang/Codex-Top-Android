@@ -110,6 +110,7 @@ public final class OutboxStoreTest {
    try{new OutboxStore.Selection("content://synthetic/file","file","file",null);throw new AssertionError("持久化内容URI");}
    catch(IllegalArgumentException expected){}
    failureCodes(root);
+   acceptedSubmission(root);
    System.out.println("OutboxStore: 重启恢复、编号幂等、选择与暂存prefix恢复、固定失败原因兼容、原子写失败、未知派发保持、账号电脑对话隔离通过");
   } finally {try(var paths=Files.walk(root)){for(var path:paths.sorted(java.util.Comparator.reverseOrder()).toArray(java.nio.file.Path[]::new))Files.delete(path);}}
  }
@@ -170,4 +171,49 @@ public final class OutboxStoreTest {
   try{store.markFailureCode(item.localId,OutboxStore.FAILURE_FILE_TOO_LARGE);throw new AssertionError("原因写入复活已删除记录");}catch(java.io.IOException expected){}
   if(Files.exists(record)||!Files.exists(path))throw new AssertionError("解释字段复活记录或误删文件");
  }
+ /** 真实成功ACK同原记录持久化；旧格式兼容且后续旧写入不能降级接受事实。 */
+ private static void acceptedSubmission(java.nio.file.Path root) throws Exception {
+  var store=new OutboxStore(root.toFile(),"accepted-server","account","machine");
+  var reopened=new OutboxStore(root.toFile(),"accepted-server","account","machine");
+  var item=new OutboxStore.Item("ack-message","thread","synthetic",-80,1200);
+  store.put(item);
+  if(reopened.get(item.localId).submissionAccepted)throw new AssertionError("旧v1记录伪造接受事实");
+  store.markSubmissionUncertain(item.localId,true);store.markSubmissionAccepted(item.localId);
+  var accepted=reopened.get(item.localId);
+  if(!accepted.submissionAccepted||accepted.submissionUncertain||accepted.failureCode!=null
+      ||!accepted.localId.equals(item.localId)||accepted.messageId!=item.messageId||!accepted.text.equals(item.text))
+      throw new AssertionError("成功ACK没有保留原身份或仍标未知");
+  store.put(item);store.markSubmissionUncertain(item.localId,true);store.markSubmissionUncertain(item.localId,false);
+  store.markFailureCode(item.localId,OutboxStore.FAILURE_FILE_TOO_LARGE);
+  if(!reopened.get(item.localId).submissionAccepted||reopened.get(item.localId).submissionUncertain||reopened.get(item.localId).failureCode!=null)
+      throw new AssertionError("原mutator降级已接受事实");
+  var fileMethod=OutboxStore.class.getDeclaredMethod("file",String.class);fileMethod.setAccessible(true);
+  var record=((java.io.File)fileMethod.invoke(store,item.localId)).toPath();
+  var raw=com.google.gson.JsonParser.parseString(Files.readString(record)).getAsJsonObject();
+  for(String malformed:new String[]{"null","{}","[]","42","\"true\"","false"}){
+   var value=raw.deepCopy();value.add("submissionAccepted",com.google.gson.JsonParser.parseString(malformed));Files.writeString(record,value.toString());
+   var restored=reopened.get(item.localId);
+   if(restored.submissionAccepted||!restored.text.equals(item.text)||restored.messageId!=item.messageId)
+       throw new AssertionError("畸形ACK值伪造成功或丢消息");
+  }
+  store.remove(item.localId);store.markSubmissionAccepted(item.localId);
+  if(store.get(item.localId)!=null)throw new AssertionError("迟到ACK复活已经回显的记录");
+  var local=root.resolve("accepted.bin");Files.write(local,new byte[]{1,2,3});
+  var choice=new OutboxStore.Selection(local.toString(),"accepted.bin","file",null);
+  var batch=OutboxStore.Item.selected("ack-batch","thread","",-82,1201,java.util.List.of(choice));store.put(batch);
+  try{store.markSubmissionAccepted(batch.localId);throw new AssertionError("未暂存批次伪造成功");}catch(IllegalArgumentException expected){}
+  var pending=AttachmentFiles.stage(local.toFile(),choice.name,choice.kind,choice.mimeType,root.resolve("accepted-staged").toFile(),batch.localId);
+  var uploaded=pending.uploaded("/synthetic/accepted.bin",pending.sizeBytes,pending.sha256);
+  store.rememberStaged(batch.localId,java.util.List.of(pending));store.rememberUploaded(batch.localId,java.util.List.of(uploaded));
+  store.markSubmissionUncertain(batch.localId,true);store.markSubmissionAccepted(batch.localId);
+  store.rememberStaged(batch.localId,java.util.List.of(pending));store.rememberUploaded(batch.localId,java.util.List.of(uploaded));
+  var restored=reopened.get(batch.localId);
+  if(!restored.submissionAccepted||restored.submissionUncertain||!restored.selections.equals(batch.selections)
+      ||!restored.attachments.equals(java.util.List.of(pending))||!restored.uploaded.get(0).path.equals(uploaded.path))
+      throw new AssertionError("附件ACK没有保留选择、暂存或上传身份");
+  for(var isolated:new OutboxStore[]{new OutboxStore(root.toFile(),"accepted-server","other","machine"),
+      new OutboxStore(root.toFile(),"accepted-server","account","other")})
+      if(isolated.get(batch.localId)!=null)throw new AssertionError("接受事实跨账号或机器串用");
+ }
+
 }
