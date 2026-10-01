@@ -13,8 +13,14 @@ public final class AccountUsageTest {
         check(usage.meters.get(1).remainingPercent == null && usage.meters.get(1).resetsAtMs == null, "Missing is not zero");
         check(!usage.isStale(199) && usage.isStale(200), "Honor source freshness boundary");
         check("source@example.test".equals(usage.accountLabel), "Use source account label only");
+        AccountUsage restored = AccountUsage.parse(usage.cacheJson());
+        check(restored.accountLabel.equals(usage.accountLabel) && restored.fetchedAtMs == usage.fetchedAtMs
+                && restored.staleAtMs == usage.staleAtMs && restored.meters.get(0).resetsAtMs == 300L
+                && restored.meters.get(1).remainingPercent == null, "Local codec keeps original account, clocks and missing fields");
         AccountUsage absent = AccountUsage.parse(json("{\"status\":\"unavailable\",\"reason\":\"account_changed\"}"));
         check(!absent.available && absent.meters.isEmpty() && absent.accountLabel == null, "Unavailable never carries previous balance");
+        try { absent.cacheJson(); throw new AssertionError("Unavailable cached as collected sample"); }
+        catch (IOException expected) { }
         rejected("{\"status\":\"available\",\"source\":{\"kind\":\"codexHome\",\"home\":\"connectedService\"},\"fetchedAtMs\":100,\"staleAtMs\":200,\"meters\":[]}");
         rejected("{\"status\":\"available\",\"source\":{\"kind\":\"codexHome\",\"home\":\"user\"},\"fetchedAtMs\":100,\"staleAtMs\":200,\"meters\":[{\"label\":\"Codex\",\"remainingPct\":101}]}");
         rejected("{\"status\":\"available\",\"source\":{\"kind\":\"codexHome\",\"home\":\"user\"},\"fetchedAtMs\":100,\"staleAtMs\":null,\"meters\":[]}");

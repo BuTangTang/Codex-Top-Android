@@ -76,6 +76,31 @@ public final class AccountUsage {
     /** 使用来源标注的有效期，不通过打开页面延长快照时效。 */
     public boolean isStale(long now) { return !available || now >= staleAtMs; }
 
+    /** 本地只保存已验证采集值的显示字段，恢复仍经过原协议校验，不保存原始响应。 */
+    JsonObject cacheJson() throws IOException {
+        if (!available) throw new IOException("不可用额度不能保存为采集快照");
+        JsonObject value = new JsonObject(), source = new JsonObject(), account = new JsonObject();
+        value.addProperty("status", "available");
+        // parse 只接受这一已有来源；缓存不扩展其他账号或托管来源。
+        source.addProperty("kind", "codexHome"); source.addProperty("home", "user");
+        value.add("source", source);
+        if (accountLabel != null) account.addProperty("accountLabel", accountLabel);
+        value.add("account", account);
+        value.addProperty("fetchedAtMs", fetchedAtMs); value.addProperty("staleAtMs", staleAtMs);
+        com.google.gson.JsonArray windows = new com.google.gson.JsonArray();
+        for (Meter meter : meters) {
+            JsonObject window = new JsonObject();
+            window.addProperty("label", meter.label);
+            window.addProperty("remainingPct", meter.remainingPercent);
+            window.addProperty("windowDurationMs", meter.windowDurationMs);
+            window.addProperty("resetAtMs", meter.resetsAtMs);
+            window.addProperty("status", meter.estimated ? "estimated" : "ok");
+            windows.add(window);
+        }
+        value.add("meters", windows);
+        return value;
+    }
+
     /** 不向用户展示原始提供方异常或本地路径。 */
     public String unavailableMessage() {
         if ("account_changed".equals(reason)) return "电脑 Codex 账号已变化，请刷新";

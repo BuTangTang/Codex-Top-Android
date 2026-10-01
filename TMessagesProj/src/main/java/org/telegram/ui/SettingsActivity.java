@@ -232,7 +232,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return codexBrowseRows.isEmpty() ? "暂无来源电脑 · 点击重试" : "请选择来源电脑";
     }
 
-    /** 自动选中来源先显示同电脑的原快照，首次无快照时才读取一次。 */
+    /** 自动选中来源先显示同电脑的原快照，缺失或过期时后台读取一次。 */
     private void selectCodexUsageMachine(com.google.gson.JsonObject row) {
         selectCodexUsageMachine(row, false);
     }
@@ -249,14 +249,32 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         ++codexUsageGeneration;
         codexUsageLoading = false;
         codexUsageError = null;
+        com.butang.codextop.CodexRuntime.selectAccountUsageMachine(machine);
         codexUsage = com.butang.codextop.CodexRuntime.cachedAccountUsage(machine);
-        if (refresh || codexUsage == null) loadCodexUsage();
+        if (refresh || codexUsage == null || codexUsage.isStale(System.currentTimeMillis())) loadCodexUsage();
         else updateCodexBrowserItems();
+    }
+
+    /** 本地恢复明确选择和采集值；过期值仍先显示，仅首次恢复按需读取一次。 */
+    private void restoreCodexUsageFromCache() {
+        if (!codexMyRoot()) return;
+        boolean selected = false;
+        if (codexUsageMachine == null) {
+            codexUsageMachine = com.butang.codextop.CodexRuntime.selectedAccountUsageMachine();
+            if (codexUsageMachine == null) return;
+            ++codexUsageGeneration;
+            codexUsageError = null;
+            selected = true;
+        }
+        com.butang.codextop.AccountUsage cached = com.butang.codextop.CodexRuntime.cachedAccountUsage(codexUsageMachine);
+        if (cached != null) codexUsage = cached;
+        if (selected && (codexUsage == null || codexUsage.isStale(System.currentTimeMillis()))) loadCodexUsage();
     }
 
     /** 缓存先提供候选及已有采集值；新鲜名单只在尚无来源且只有一台时自动选择。 */
     private void applyCodexUsageSources(com.google.gson.JsonObject snapshot, boolean cached) {
         applyCodexBrowse(snapshot);
+        restoreCodexUsageFromCache();
         if (codexUsageMachine != null) {
             for (com.google.gson.JsonElement value : codexBrowseRows) {
                 com.google.gson.JsonObject row = value.getAsJsonObject();
@@ -286,6 +304,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             if (!cached) codexBrowseLoading = false;
             codexBrowseError = error;
             if (snapshot != null) applyCodexUsageSources(snapshot, cached);
+            else restoreCodexUsageFromCache();
             updateCodexBrowserItems();
         });
         updateCodexBrowserItems();
@@ -312,7 +331,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 .setNegativeButton(getString(R.string.Cancel), null).create());
     }
 
-    /** 首次无快照或点刷新才读取；来源和代次共同拒绝切换后的迟到结果。 */
+    /** 首次无快照、过期回访或点刷新才读取；旧值保持，来源和代次拒绝迟到结果。 */
     private void loadCodexUsage() {
         final String machine = codexUsageMachineId();
         if (machine == null || codexUsageLoading) return;
@@ -322,8 +341,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         com.butang.codextop.CodexRuntime.readAccountUsage(machine, (usage, error) -> {
             if (generation != codexUsageGeneration || !TextUtils.equals(machine, codexUsageMachineId())) return;
             codexUsageLoading = false;
-            codexUsage = usage;
-            codexUsageError = error;
+            // 临时失败继续展示原采集时间；明确账号变化不能保留旧采集账号的数据。
+            if (usage != null && (usage.available || "account_changed".equals(usage.reason))
+                    || codexUsage == null || !codexUsage.available) codexUsage = usage;
+            codexUsageError = error != null ? error : usage != null && !usage.available ? usage.unavailableMessage() : null;
             updateCodexBrowserItems();
         });
         updateCodexBrowserItems();
@@ -393,7 +414,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                     codexUsage.isStale(System.currentTimeMillis()) ? "采集时间（已过期）" : "采集时间",
                     codexQuotaTime(codexUsage.fetchedAtMs)).setEnabled(false));
         }
-        String status = codexUsageLoading ? "正在读取" : codexUsageError != null ? codexUsageError
+        String status = codexUsageLoading && (codexUsage == null || !codexUsage.available) ? "正在读取" : codexUsageError != null ? codexUsageError
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
         items.add(SettingCell.Factory.of(33, 0, 0, 0, "刷新额度", status).setEnabled(!codexUsageLoading));
         items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
@@ -644,8 +665,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         } else if (codexMyRoot()) {
             com.google.gson.JsonObject cached = com.butang.codextop.CodexRuntime.cachedBrowse(null, null, false);
             if (cached != null) applyCodexUsageSources(cached, true);
-            if (codexUsageMachine != null)
-                codexUsage = com.butang.codextop.CodexRuntime.cachedAccountUsage(codexUsageMachine);
+            restoreCodexUsageFromCache();
         }
         listView = new UniversalRecyclerView(this, this::fillItems, this::onClick, this::onLongClick);
         listView.adapter.setApplyBackground(false);
@@ -798,7 +818,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return fragmentView = contentView;
     }
 
-    /** 根页首次取得来源后只重绘回访；原电脑子页仍沿既有更新入口。 */
+    /** 根页回访先显示本地值；只有缺失或过期才后台读取，原电脑子页入口保持。 */
     @Override
     public void onResume() {
         super.onResume();
@@ -806,12 +826,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         if (codexMyRoot()) {
             com.google.gson.JsonObject cached = com.butang.codextop.CodexRuntime.cachedBrowse(null, null, false);
             if (cached != null) applyCodexUsageSources(cached, true);
-            if (codexUsageMachine != null && !codexUsageLoading)
-                codexUsage = com.butang.codextop.CodexRuntime.cachedAccountUsage(codexUsageMachine);
+            restoreCodexUsageFromCache();
             if (!codexUsageSourcesRequested) loadCodexUsageSources();
+            else if (codexUsageMachine != null && (codexUsage == null || codexUsage.isStale(System.currentTimeMillis()))) loadCodexUsage();
             else updateCodexBrowserItems();
-        } else if (codexQuotaDetail()) loadCodexUsage();
-        else if (codexBrowser()) loadCodexBrowser(false);
+        } else if (codexQuotaDetail()) {
+            if (codexUsage == null || codexUsage.isStale(System.currentTimeMillis())) loadCodexUsage();
+            else updateCodexBrowserItems();
+        } else if (codexBrowser()) loadCodexBrowser(false);
     }
 
     /** 离开页面后废弃额度和浏览列表的迟到响应。 */

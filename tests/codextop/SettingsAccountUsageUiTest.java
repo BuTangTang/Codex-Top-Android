@@ -28,7 +28,7 @@ public final class SettingsAccountUsageUiTest {
             actual.append(source.getFieldByName(field).orElseThrow()).append('\n');
         for (String method : List.of("codexQuota", "codexQuotaDetail", "codexMyRoot", "codexUsageMachineId",
                 "codexUsageSourceLabel", "selectCodexUsageMachine", "applyCodexUsageSources", "loadCodexUsageSources",
-                "loadCodexUsage", "codexBrowser", "applyCodexBrowse", "onResume", "onFragmentDestroy"))
+                "loadCodexUsage", "restoreCodexUsageFromCache", "codexBrowser", "applyCodexBrowse", "onResume", "onFragmentDestroy"))
             for (var overload : source.getMethodsByName(method)) actual.append(overload).append('\n');
         Path temp = Files.createTempDirectory("codex-settings-usage-");
         try {
@@ -64,6 +64,9 @@ public final class SettingsAccountUsageUiTest {
             public record Read(String machine, BiConsumer<AccountUsage,String> callback) {}
             public static boolean active = true;
             public static JsonObject snapshot;
+            public static String selected;
+            public static String selectedAccountUsageMachine(){return selected;}
+            public static void selectAccountUsageMachine(String machine){selected=machine;}
             public static final Map<String,AccountUsage> cache = new HashMap<>();
             public static final List<Read> reads = new ArrayList<>();
             public static final List<BrowseCallback> browses = new ArrayList<>();
@@ -79,11 +82,11 @@ public final class SettingsAccountUsageUiTest {
             public static void readAccountUsage(String machine, BiConsumer<AccountUsage,String> callback) { reads.add(new Read(machine, callback)); }
             /** 模拟原 Runtime 在派发 UI 回调前已更新同来源快照的边界。 */
             public static void complete(int index, AccountUsage value, String error) {
-                Read read=reads.get(index);if(value==null)cache.remove(read.machine());else cache.put(read.machine(),value);
+                Read read=reads.get(index);if(value!=null)cache.put(read.machine(),value);
                 read.callback().accept(value,error);
             }
             /** 清空各场景的合成输入和调度记录。 */
-            public static void reset() { active=true; snapshot=null; cache.clear(); reads.clear(); browses.clear(); }
+            public static void reset() { active=true; snapshot=null; selected=null; cache.clear(); reads.clear(); browses.clear(); }
         }
         """;
 
@@ -128,7 +131,8 @@ public final class SettingsAccountUsageUiTest {
     private static final String SCENARIOS = """
             /** 使用真实模型解析仅用于区分来源的合成额度。 */
             static AccountUsage usage(int percent) throws Exception {
-                return AccountUsage.parse(JsonParser.parseString("{\\"status\\":\\"available\\",\\"source\\":{\\"kind\\":\\"codexHome\\",\\"home\\":\\"user\\"},\\"fetchedAtMs\\":100,\\"staleAtMs\\":200,\\"meters\\":[{\\"label\\":\\"synthetic\\",\\"remainingPct\\":"+percent+",\\"status\\":\\"ok\\"}]}").getAsJsonObject());
+                JsonObject value=new JsonObject();value.addProperty("status","available");JsonObject source=new JsonObject();source.addProperty("kind","codexHome");source.addProperty("home","user");value.add("source",source);
+                value.addProperty("fetchedAtMs",System.currentTimeMillis());value.addProperty("staleAtMs",System.currentTimeMillis()+60000);JsonArray meters=new JsonArray();JsonObject meter=new JsonObject();meter.addProperty("label","synthetic");meter.addProperty("remainingPct",percent);meters.add(meter);value.add("meters",meters);return AccountUsage.parse(value);
             }
             /** 构造只含来源身份的电脑行。 */
             static JsonObject machine(String id) { JsonObject row=new JsonObject();row.addProperty("id",id);row.addProperty("name","computer-"+id);return row; }
@@ -161,7 +165,7 @@ public final class SettingsAccountUsageUiTest {
                 page.onResume();page.selectCodexUsageMachine(machine("A"));check(CodexRuntime.reads.size()==1&&page.codexUsage==first,"settled quota silently reread");
                 page.loadCodexUsage();check(CodexRuntime.reads.size()==2&&page.codexUsage==first,"explicit refresh did not read or blanked cached quota");
                 CodexRuntime.complete(1,null,"synthetic unavailable");
-                check(page.codexUsage==null&&page.codexUsageError!=null&&!page.codexUsageLoading,"failed refresh retained a false current quota or loading flag");
+                check(page.codexUsage==first&&page.codexUsageError!=null&&!page.codexUsageLoading,"failed refresh removed the previous collected quota");
                 page.loadCodexUsage();check(CodexRuntime.reads.size()==3,"failed refresh could not be explicitly retried");
             }
             /** 多电脑不猜来源；A 的迟到响应不能覆盖已选择的 B 缓存或正在读取状态。 */
@@ -201,9 +205,27 @@ public final class SettingsAccountUsageUiTest {
                 check(page.codexBrowseError!=null&&!page.codexBrowseLoading&&CodexRuntime.reads.isEmpty(),"source failure invented quota or blocked retry");
                 page.loadCodexUsageSources();check(CodexRuntime.browses.size()==3,"explicit source retry did not read");
             }
+            /** 磁盘阶段可独立于电脑名单到达；恢复明确来源，临时失败保留旧值，账号变化清旧值。 */
+            static void persistedAndStale()throws Exception {
+                SettingsUsageProbe page=reset();page.onResume();AccountUsage old=usage(10);CodexRuntime.selected="B";CodexRuntime.cache.put("B",old);
+                CodexRuntime.browses.get(0).accept(null,null,true);
+                check(page.codexUsage==old&&"B".equals(page.codexUsageMachine)&&CodexRuntime.reads.isEmpty(),"local quota waited for fresh source list");
+                CodexRuntime.browses.get(0).accept(sources("A","B"),null,false);page.onResume();
+                check(page.codexUsage==old&&CodexRuntime.reads.isEmpty()&&"computer-B".equals(page.codexUsageMachineName),"fresh multi-source list lost remembered machine or reread fresh quota");
+                page=new SettingsUsageProbe();page.onResume();check(page.codexUsage==old&&"B".equals(page.codexUsageMachine)&&CodexRuntime.reads.isEmpty(),"new fragment lost cached value or selected source");
+                JsonObject expiredJson=JsonParser.parseString("{\\"status\\":\\"available\\",\\"source\\":{\\"kind\\":\\"codexHome\\",\\"home\\":\\"user\\"},\\"fetchedAtMs\\":1,\\"staleAtMs\\":2,\\"meters\\":[{\\"label\\":\\"old\\",\\"remainingPct\\":20}]}").getAsJsonObject();
+                AccountUsage expired=AccountUsage.parse(expiredJson);page=reset();CodexRuntime.selected="B";CodexRuntime.cache.put("B",expired);page.onResume();
+                check(page.codexUsage==expired&&page.codexUsageLoading&&CodexRuntime.reads.size()==1,"stale remembered quota blanked before background refresh");
+                CodexRuntime.browses.get(0).accept(sources("A","B"),null,true);CodexRuntime.browses.get(0).accept(sources("A","B"),null,false);
+                check(CodexRuntime.reads.size()==1,"local plus fresh stages duplicated stale refresh");
+                AccountUsage unavailable=AccountUsage.parse(JsonParser.parseString("{\\"status\\":\\"unavailable\\",\\"reason\\":\\"source_unavailable\\"}").getAsJsonObject());
+                CodexRuntime.reads.get(0).callback().accept(unavailable,null);check(page.codexUsage==expired&&page.codexUsageError!=null&&!page.codexUsageLoading,"temporary source failure cleared old sample");
+                page.loadCodexUsage();AccountUsage changed=AccountUsage.parse(JsonParser.parseString("{\\"status\\":\\"unavailable\\",\\"reason\\":\\"account_changed\\"}").getAsJsonObject());
+                CodexRuntime.complete(1,changed,null);check(page.codexUsage==changed&&!page.codexUsage.available,"changed source account retained old account quota");
+            }
             /** 各组只驱动真实生产方法和保存的原回调，不重写额度决策。 */
             public static void main(String[] args) throws Exception {
-                cacheAndRevisit();firstReadAndRefresh();sourceSwitch();destruction();scopesAndMissing();
+                cacheAndRevisit();firstReadAndRefresh();sourceSwitch();destruction();scopesAndMissing();persistedAndStale();
                 System.out.println("PASS SettingsAccountUsageUiTest: cache, source callbacks, revisit, same source, refresh, switch, destroy, scopes");
             }
         """;
