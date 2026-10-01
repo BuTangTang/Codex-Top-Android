@@ -602,7 +602,7 @@ public final class CodexRuntime {
         });
     }
 
-    /** 点击原附件按钮才下载；同一文件复用在途操作，完成与失败均回到原页面的主线程回调。 */
+    /** 点击才沿已有网络队列下载，避免旧页读取阻塞；同文件复用在途，结果回到主线程。 */
     public static void downloadAttachment(int account, MessageObject message, Runnable completed) {
         final long epoch = accountGeneration;
         final DesktopAttachment value = attachment(message);
@@ -619,7 +619,7 @@ public final class CodexRuntime {
         final File directory = attachmentDirectory(dialogId);
         attachmentStates.put(key, new AttachmentState(true, false, false, 0, value.sizeBytes == null ? 0 : value.sizeBytes));
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_SEND_STATE);
-        historyQueue.postRunnable(() -> {
+        Utilities.externalNetworkQueue.postRunnable(() -> {
             File ready = null;
             try {
                 File target = AttachmentFiles.target(directory, "receive\n" + value.toJson(), value.name);
