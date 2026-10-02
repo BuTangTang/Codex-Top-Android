@@ -385,6 +385,8 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                             android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                     text.setSpan(new android.text.style.RelativeSizeSpan(1.375f), 0, value.length(),
                             android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    text.setSpan(new org.telegram.ui.Components.ForegroundColorSpanThemable(Theme.key_windowBackgroundWhiteBlueText), 0, value.length(),
+                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                     remaining = text;
                 }
                 items.add(SettingCell.Factory.ofCodex(id++, 0, 0, 0, remaining,
