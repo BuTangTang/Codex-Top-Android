@@ -105,6 +105,7 @@ import android.view.ViewPropertyAnimator;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityManager;
@@ -5345,12 +5346,22 @@ public class AndroidUtilities {
     }
 
     public static boolean getLightNavigationBar(Window window) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            final View decorView = window.getDecorView();
-            final int flags = decorView.getSystemUiVisibility();
-            return BitwiseUtils.hasFlag(flags, View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        if (window == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return false;
         }
-        return false;
+        final View decorView = window.getDecorView();
+        if (decorView == null) {
+            return false;
+        }
+        // API 35 的 Codex 包以控制器里的导航栏位为准，避免读回已经不再写入的旧标志。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && com.butang.codextop.CodexRuntime.enabled()) {
+            final WindowInsetsController controller = decorView.getWindowInsetsController();
+            if (controller != null) {
+                return BitwiseUtils.hasFlag(controller.getSystemBarsAppearance(), WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+            }
+        }
+        final int flags = decorView.getSystemUiVisibility();
+        return BitwiseUtils.hasFlag(flags, View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
     }
 
     public static void setLightNavigationBar(Dialog dialog, boolean enable) {
@@ -5377,8 +5388,28 @@ public class AndroidUtilities {
     // do not use it: Use setLightNavigationBar for activity or dialog.
     public static void setLightNavigationBar(View view, boolean enable) {
         if (view != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (applyCodexNavigationBarAppearance(view, enable)) {
+                return;
+            }
             changeSetSystemUiVisibility(view, View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR, enable);
         }
+    }
+
+    /**
+     * Codex 且 API 35 以上时，只改导航栏浅色外观这一位。
+     * 视图还没挂上控制器时返回 false，调用方继续写原来的系统标志。
+     */
+    private static boolean applyCodexNavigationBarAppearance(View view, boolean enable) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM || !com.butang.codextop.CodexRuntime.enabled()) {
+            return false;
+        }
+        final WindowInsetsController controller = view.getWindowInsetsController();
+        if (controller == null) {
+            return false;
+        }
+        final int mask = WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+        controller.setSystemBarsAppearance(enable ? mask : 0, mask);
+        return true;
     }
 
     public static void setLightStatusBar(View view, boolean enable) {
