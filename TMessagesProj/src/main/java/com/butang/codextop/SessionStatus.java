@@ -189,6 +189,22 @@ public final class SessionStatus {
             return true;
         }
 
+        /**
+         * 退出清凭据失败时，只放开尚未确认、没有正文、仍可冷恢复的一次认领。
+         * 不改快照、请求顺序、已确认目标、明确无目标或已经恢复的正文。
+         */
+        public void rearmUnconfirmedGoalRestore() {
+            for (Map.Entry<Long, Entry> item : entries.entrySet()) {
+                Entry entry = item.getValue();
+                if (!entry.goalRestoreAttempted || entry.confirmedGoal) continue;
+                Goal goal = entry.snapshot.goal;
+                boolean eligible = !goal.hasValue() && ("unsupported".equals(goal.availability)
+                        || "unknown".equals(goal.availability) || "unavailable".equals(goal.availability));
+                if (!eligible) continue;
+                item.setValue(new Entry(entry.machine, entry.startedAt, entry.goalRequestedAt, entry.confirmedGoal, false, entry.snapshot));
+            }
+        }
+
         /** 合并规则只使用同一手机的请求顺序，不比较跨端墙钟。 */
         private void put(long dialogId, String machine, long startedAt, Snapshot snapshot) {
             Long disconnected = unavailableAt.get(machine);

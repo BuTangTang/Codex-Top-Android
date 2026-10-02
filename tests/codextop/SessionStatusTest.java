@@ -466,6 +466,31 @@ public final class SessionStatusTest {
         dropped.clear();
         dropped.candidate(10,"machine",candidate("running",""),70,71,true);
         check(dropped.claimGoalRestore(10,"machine"), "清空账号后不能重新认领");
+        SessionStatus.Store failedExit=new SessionStatus.Store();
+        failedExit.candidate(11,"machine",candidate("running",""),10,11,true);
+        var beforeExit=failedExit.get(11,12);
+        check(failedExit.claimGoalRestore(11,"machine")&&!failedExit.claimGoalRestore(11,"machine"), "失败退出前没有占用一次认领");
+        failedExit.rearmUnconfirmedGoalRestore();
+        var afterExit=failedExit.get(11,12);
+        check(beforeExit.state.equals(afterExit.state)&&beforeExit.validity.equals(afterExit.validity)
+                &&beforeExit.questionIds.equals(afterExit.questionIds)&&beforeExit.observedAtElapsedMs==afterExit.observedAtElapsedMs
+                &&failedExit.currentExpiry(11,"machine",12)==-1, "放开认领改了生命周期、提问或有效期");
+        check(failedExit.claimGoalRestore(11,"machine"), "未确认空槽在失败退出后不能再次认领");
+        check(offer(failedExit,11,"machine","available","退出前目标","active",null,null,null,1), "再次认领后不能接上过期正文");
+        goalField(failedExit,11,13,"validity","stale");
+        goalField(failedExit,11,13,"objective","退出前目标");
+        failedExit.rearmUnconfirmedGoalRestore();
+        goalField(failedExit,11,14,"objective","退出前目标");
+        check(!failedExit.claimGoalRestore(11,"machine"), "已恢复正文被重新打开认领");
+        SessionStatus.Store tombstone=new SessionStatus.Store();
+        tombstone.candidate(12,"machine",candidate("running",""),10,11,true);
+        check(tombstone.claimGoalRestore(12,"machine")&&offer(tombstone,12,"machine","none","","",null,null,null,-1), "明确无目标没有占住认领");
+        tombstone.rearmUnconfirmedGoalRestore();
+        check(!tombstone.claimGoalRestore(12,"machine")&&"none".equals(String.valueOf(field(goal(tombstone,12,12),"availability"))), "失败退出重新打开了明确无目标");
+        observeGoal(failedExit,13,"machine","remote",available("active","1","1","1","0"),600,601);
+        long expiry=failedExit.currentExpiry(13,"machine",602);
+        failedExit.rearmUnconfirmedGoalRestore();
+        check(expiry==failedExit.currentExpiry(13,"machine",602)&&"真实目标".equals(String.valueOf(field(goal(failedExit,13,602),"objective"))), "失败退出改写了当前目标或提问期限");
         System.out.println("SessionStatus goal cache: 冷盘available/none、身份不匹配、当前事实优先与长目标展示通过");
     }
 

@@ -18,7 +18,7 @@ public final class RuntimeGoalCacheTest {
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
         var unit = StaticJavaParser.parse(Path.of("TMessagesProj/src/main/java/com/butang/codextop/CodexRuntime.java"));
         StringBuilder extracted = new StringBuilder();
-        var names = Set.of("rememberAcceptedGoal", "scheduleGoalRestore", "goalDisplayStore", "goalCacheIdentityCurrent", "isAccountCurrent", "stopWatching", "releaseObservation", "publishDialogFacts", "candidateDirectory");
+        var names = Set.of("rememberAcceptedGoal", "scheduleGoalRestore", "goalDisplayStore", "goalCacheIdentityCurrent", "isAccountCurrent", "stopWatching", "releaseObservation", "publishDialogFacts", "candidateDirectory", "logout");
         int found = 0;
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class))
             if (names.contains(method.getNameAsString())) { extracted.append(method).append('\n'); found++; }
@@ -32,9 +32,13 @@ public final class RuntimeGoalCacheTest {
             Path messages = temporary.resolve("MessagesController.java");
             Files.writeString(user, "package org.telegram.messenger; public class UserConfig { public static int selectedAccount; }");
             Files.writeString(center, "package org.telegram.messenger; public class NotificationCenter { public static int posts; public static final int updateInterfaces=1; public static NotificationCenter getInstance(int a){return new NotificationCenter();} public void postNotificationName(int id,int mask){posts++;} }");
-            Files.writeString(messages, "package org.telegram.messenger; public class MessagesController { public static final int UPDATE_MASK_STATUS=8; }");
+            Files.writeString(messages, "package org.telegram.messenger; public class MessagesController { public static final int UPDATE_MASK_STATUS=8; public final java.util.Map<Long,Object> dialogMessage=new java.util.HashMap<>(); public static MessagesController getInstance(int account){return new MessagesController();} }");
+            Path queues = temporary.resolve("DispatchQueue.java");
+            Path runtimeLock = temporary.resolve("CodexRuntime.java");
+            Files.writeString(queues, "package org.telegram.messenger; import java.util.ArrayDeque; public class DispatchQueue { public final ArrayDeque<Runnable> tasks=new ArrayDeque<>(); public DispatchQueue(String name){} public void postRunnable(Runnable runnable){tasks.add(runnable);} public void postRunnable(Runnable runnable,long delay){tasks.add(runnable);} public void cancelRunnable(Runnable runnable){tasks.remove(runnable);} public void next(){tasks.remove().run();} public void all(){int guard=80; while(!tasks.isEmpty()){if(--guard==0)throw new AssertionError(\"queue loop\"); next();}} }");
+            Files.writeString(runtimeLock, "package com.butang.codextop; public class CodexRuntime {}");
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, "-cp", System.getProperty("java.class.path"), "-d", temporary.toString(),
-                    probe.toString(), user.toString(), center.toString(), messages.toString()) != 0)
+                    probe.toString(), user.toString(), center.toString(), messages.toString(), queues.toString(), runtimeLock.toString()) != 0)
                 throw new AssertionError("原目标缓存方法夹具编译失败");
             var urls = new java.util.ArrayList<java.net.URL>();
             urls.add(temporary.toUri().toURL());
@@ -190,6 +194,56 @@ public final class RuntimeGoalCacheTest {
                 observe(available(longObjective), 460);
                 Utilities.globalQueue.all();
                 check(longObjective.equals(statuses.get(7, 470).goal.objective) && !Files.readString(goalFile()).contains(longObjective), "超长当前目标被改写或写入磁盘");
+                Utilities.globalQueue.all(); AndroidUtilities.ui.all();
+                accountGeneration = 1; loggingOut = false; session = owner;
+                String keptAvailable = statuses.get(7, 500).goal.objective;
+                String keptStale = statuses.get(11, 500).goal.objective;
+                String keptNone = statuses.get(15, 500).goal.availability;
+                dialogMachines.put(21L, "machine"); remoteIds.put(21L, "remote-21");
+                goalDisplayStore(owner).save("machine", "remote-21", "codexHome", "user", "available", "退出前目标", "active", null, null, null, 6L, null);
+                publishDialogFacts(21, "machine", row("remote-21"), 10, 11, true);
+                check(Utilities.globalQueue.tasks.size() == 1, "失败退出前没有排队冷恢复");
+                long oldEpoch = accountGeneration;
+                failSessionClear = true;
+                int[] failed = {0}, succeeded = {0};
+                logout(() -> succeeded[0]++, error -> failed[0]++);
+                Utilities.globalQueue.next();
+                check(!statuses.get(21, 12).goal.hasValue(), "旧代次冷恢复在退出后仍写入");
+                Utilities.globalQueue.next(); AndroidUtilities.ui.next();
+                check(failed[0] == 1 && succeeded[0] == 0 && session == owner && !loggingOut, "清凭据失败没有留在原账号");
+                check(keptAvailable.equals(statuses.get(7, 500).goal.objective) && keptStale.equals(statuses.get(11, 500).goal.objective)
+                        && "none".equals(keptNone) && "none".equals(statuses.get(15, 500).goal.availability) && !statuses.get(15, 500).goal.hasValue(),
+                        "失败退出改写了已确认目标、已恢复正文或明确无目标");
+                publishDialogFacts(21, "machine", row("remote-21"), 20, 21, true);
+                check(Utilities.globalQueue.tasks.size() == 1, "同一账号下一次列表没有重新认领冷恢复");
+                Utilities.globalQueue.next(); AndroidUtilities.ui.next();
+                long expiry = statuses.currentExpiry(21, "machine", 22);
+                check("退出前目标".equals(statuses.get(21, 22).goal.objective) && "stale".equals(statuses.get(21, 22).goal.validity)
+                        && statuses.get(21, 22).goal.startedAtElapsedMs == -1 && expiry == -1, "重新认领没有按过期目标恢复");
+                scheduleGoalRestore(21, "machine", "remote-21", owner, oldEpoch);
+                Utilities.globalQueue.next();
+                check(AndroidUtilities.ui.tasks.isEmpty() && "退出前目标".equals(statuses.get(21, 23).goal.objective)
+                        && "stale".equals(statuses.get(21, 23).goal.validity) && statuses.currentExpiry(21, "machine", 23) == expiry,
+                        "旧代次迟到回调覆盖了目标或授予当前有效");
+                dialogMachines.put(22L, "machine"); remoteIds.put(22L, "remote-22");
+                goalDisplayStore(owner).save("machine", "remote-22", "codexHome", "user", "available", "读盘后退出", "paused", null, null, null, 7L, null);
+                publishDialogFacts(22, "machine", row("remote-22"), 10, 11, true);
+                Utilities.globalQueue.next();
+                failSessionClear = true;
+                logout(() -> succeeded[0]++, error -> failed[0]++);
+                Utilities.globalQueue.next(); AndroidUtilities.ui.next(); AndroidUtilities.ui.next();
+                check(!statuses.get(22, 12).goal.hasValue() && failed[0] == 2, "读完磁盘后的旧界面回调在失败退出后仍写入");
+                publishDialogFacts(22, "machine", row("remote-22"), 30, 31, true);
+                Utilities.globalQueue.next(); AndroidUtilities.ui.next();
+                check("读盘后退出".equals(statuses.get(22, 32).goal.objective) && "stale".equals(statuses.get(22, 32).goal.validity), "读盘后的失败退出没有允许下一次列表恢复");
+                failSessionClear = false;
+                int[] cleared = {0}, clearFailed = {0};
+                logout(() -> cleared[0]++, error -> clearFailed[0]++);
+                for (int turn = 0; turn < 8 && cleared[0] == 0; turn++) {
+                    Utilities.globalQueue.all(); dialogQueue.all(); sendQueue.all(); approvalQueue.all(); transcriptQueue.all();
+                    historyQueue.all(); statusQueue.all(); prefetchQueue.all(); AndroidUtilities.ui.all();
+                }
+                check(cleared[0] == 1 && clearFailed[0] == 0 && session == null && !statuses.get(21, 40).goal.hasValue(), "成功退出没有清空原展示");
                 System.out.println("RuntimeGoalCache: FIFO、返回后仍落地、身份撤销、冷盘优先顺序、写失败和长目标通过");
             }
             static JsonObject row(String remote) {
@@ -224,34 +278,36 @@ public final class RuntimeGoalCacheTest {
         import org.telegram.messenger.MessagesController;
         import org.telegram.messenger.NotificationCenter;
         public final class RuntimeGoalCacheProbe {
-            static boolean loggingOut;
+            static boolean loggingOut, failSessionClear, sessionRestored, listRefreshScheduled, loading, connectedComputersPrefetching, cachedDialogsRead;
             static PasswordLogin.Session session;
-            static long accountGeneration = 1, watchGeneration = 1, watchedDialog;
+            static DesktopConnection desktop;
+            static long accountGeneration = 1, watchGeneration = 1, watchedDialog, accountUsageRestoredEpoch = -1;
+            static String accountUsageMachine, preferredMachine, loadError;
+            static final Object dialogIdentityLock = new Object();
+            static Object dialogIdentities;
             static final Map<Long, String> dialogMachines = new HashMap<>(), remoteIds = new HashMap<>(), linkedSessions = new HashMap<>(), dialogTitles = new HashMap<>(), dialogDirectories = new HashMap<>();
+            static final Map<String, DesktopConnection> desktopConnections = new HashMap<>();
+            static final Map<String, Object> accountUsageSnapshots = new HashMap<>(), accountUsageReads = new HashMap<>(), browseSnapshots = new HashMap<>(), machineNames = new HashMap<>();
+            static final Map<Long, Object> histories = new HashMap<>(), pendingMessages = new HashMap<>(), attachmentGroups = new HashMap<>(), attachmentStates = new HashMap<>(), attachmentCallbacks = new HashMap<>(), sendingBatches = new HashMap<>(), prefetchedRevisions = new HashMap<>();
+            static final java.util.Set<Long> prefetching = new HashSet<>();
+            static final java.util.List<Object> dialogs = new ArrayList<>();
             static final SessionStatus.Store statuses = new SessionStatus.Store();
-            static final Queue statusQueue = new Queue();
+            static final org.telegram.messenger.DispatchQueue statusQueue = new org.telegram.messenger.DispatchQueue("status"), dialogQueue = new org.telegram.messenger.DispatchQueue("dialog"), sendQueue = new org.telegram.messenger.DispatchQueue("send"), approvalQueue = new org.telegram.messenger.DispatchQueue("approval"), transcriptQueue = new org.telegram.messenger.DispatchQueue("transcript"), historyQueue = new org.telegram.messenger.DispatchQueue("history"), prefetchQueue = new org.telegram.messenger.DispatchQueue("prefetch");
             static Runnable statusPoll;
             static DesktopConnection observationOwner;
             static long observationDialog, observationRenewAt;
             static String observationSession, observationLease;
-            static final class Queue {
-                final ArrayDeque<Runnable> tasks = new ArrayDeque<>();
-                void postRunnable(Runnable runnable) { tasks.add(runnable); }
-                void postRunnable(Runnable runnable, long delay) { tasks.add(runnable); }
-                void cancelRunnable(Runnable runnable) { tasks.remove(runnable); }
-                void next() { tasks.remove().run(); }
-                void all() { int guard = 80; while (!tasks.isEmpty()) { if (--guard == 0) throw new AssertionError("queue loop"); next(); } }
-            }
-            static final class Utilities { static final Queue globalQueue = new Queue(); }
-            static final class AndroidUtilities { static final Queue ui = new Queue(); static void runOnUIThread(Runnable runnable) { ui.postRunnable(runnable); } }
+            static final class Utilities { static final org.telegram.messenger.DispatchQueue globalQueue = new org.telegram.messenger.DispatchQueue("global"); }
+            static final class AndroidUtilities { static final org.telegram.messenger.DispatchQueue ui = new org.telegram.messenger.DispatchQueue("ui"); static void runOnUIThread(Runnable runnable) { ui.postRunnable(runnable); } }
             static final class DesktopConnection {
                 static String kind = "codexHome", home = "user";
                 static JsonObject userCodexSource() { JsonObject source = new JsonObject(); source.addProperty("kind", kind); source.addProperty("home", home); return source; }
                 void stopObserving(String sessionId, String leaseId) {}
+                void close() {}
             }
-            static final class PasswordLogin { static final class Session { String server = "server", accountId = "account"; } }
+            static final class PasswordLogin { static final class Session { String server = "server", accountId = "account"; void close() {} } }
             static final class ApplicationLoader { static Context applicationContext; }
             static final class Context { final File root; Context(File root) { this.root = root; } File getNoBackupFilesDir() { return root; } }
-            static final class DispatchQueue { DispatchQueue(String name) {} }
+            static final class SessionStore { SessionStore(Context ignored) {} void clear() throws java.io.IOException { if (failSessionClear) throw new java.io.IOException("synthetic clear failure"); } }
         """;
 }

@@ -153,6 +153,7 @@ public final class CodexRuntime {
             try { new SessionStore(ApplicationLoader.applicationContext).clear(); }
             catch (Exception error) {
                 AndroidUtilities.runOnUIThread(() -> {
+                    statuses.rearmUnconfirmedGoalRestore();
                     loggingOut = false;
                     listRefreshScheduled = false;
                     loading = false;
