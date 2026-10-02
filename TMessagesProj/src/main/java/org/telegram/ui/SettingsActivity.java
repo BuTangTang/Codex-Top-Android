@@ -387,7 +387,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                             android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                     remaining = text;
                 }
-                items.add(SettingCell.Factory.of(id++, 0, 0, 0, remaining,
+                items.add(SettingCell.Factory.ofCodex(id++, 0, 0, 0, remaining,
                         meter.label + " · " + codexQuotaWindow(meter.windowDurationMs)).setEnabled(false));
                 ++id; // 保留各窗口原编号间隔，重置说明合并到同一原说明行。
                 if (resets.length() > 0) resets.append('\n');
@@ -398,11 +398,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             items.add(UItem.asShadow(resets));
         }
         if (codexMyRoot()) {
-            items.add(SettingCell.Factory.of(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
+            items.add(SettingCell.Factory.ofCodex(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
                     ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel())
                     .setEnabled(!codexBrowseLoading || !codexBrowseRows.isEmpty()));
         } else {
-            items.add(SettingCell.Factory.of(30, 0, 0, 0, "来源电脑",
+            items.add(SettingCell.Factory.ofCodex(30, 0, 0, 0, "来源电脑",
                     getArguments().getString("codexMachineName", "电脑")).setEnabled(false));
         }
         if (codexUsageMachineId() == null) {
@@ -410,15 +410,15 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             return;
         }
         if (codexUsage != null && codexUsage.available) {
-            items.add(SettingCell.Factory.of(31, 0, 0, 0, "采集账号", TextUtils.isEmpty(codexUsage.accountLabel)
+            items.add(SettingCell.Factory.ofCodex(31, 0, 0, 0, "采集账号", TextUtils.isEmpty(codexUsage.accountLabel)
                     ? "来源未返回" : codexUsage.accountLabel).setEnabled(false));
-            items.add(SettingCell.Factory.of(32, 0, 0, 0,
+            items.add(SettingCell.Factory.ofCodex(32, 0, 0, 0,
                     codexUsage.isStale(System.currentTimeMillis()) ? "采集时间（已过期）" : "采集时间",
                     codexQuotaTime(codexUsage.fetchedAtMs)).setEnabled(false));
         }
         String status = codexUsageLoading && (codexUsage == null || !codexUsage.available) ? "正在读取" : codexUsageError != null ? codexUsageError
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
-        items.add(SettingCell.Factory.of(33, 0, 0, 0, "刷新额度", status).setEnabled(!codexUsageLoading));
+        items.add(SettingCell.Factory.ofCodex(33, 0, 0, 0, "刷新额度", status, SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(!codexUsageLoading));
         items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
     }
 
@@ -977,7 +977,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 boolean computers = getArguments().getString("codexMachine") == null;
                 boolean conversations = codexConversations();
                 if (!computers && !conversations) {
-                    items.add(SettingCell.Factory.of(8, IconBackgroundColors.BLUE_DEEP.top,
+                    items.add(SettingCell.Factory.ofCodex(8, IconBackgroundColors.BLUE_DEEP.top,
                             IconBackgroundColors.BLUE_DEEP.bottom, R.drawable.settings_chat, "所有对话", "查看此电脑的对话"));
                 }
                 for (int i = 0; i < codexBrowseRows.size(); i++) {
@@ -992,15 +992,16 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                                     ? row.get("title").getAsString() : "未命名对话") : row.get("name").getAsString(), subtitle));
                 }
                 if ((!codexBrowseLoaded && codexBrowseLoading) || codexBrowseError != null || codexBrowseRows.isEmpty() || codexBrowseIncomplete) {
-                    items.add(SettingCell.Factory.of(9, IconBackgroundColors.BLUE_DEEP.top,
-                            IconBackgroundColors.BLUE_DEEP.bottom, 0,
-                            !codexBrowseLoaded && codexBrowseLoading ? "正在加载" : codexBrowseError != null ? codexBrowseError
-                                    : codexBrowseIncomplete ? "部分对话尚未读取" : conversations ? "当前页暂无匹配对话" : "暂无项目或电脑",
-                            !codexBrowseLoaded && codexBrowseLoading ? "" : "点击刷新"));
+                    boolean loading = !codexBrowseLoaded && codexBrowseLoading;
+                    CharSequence browseTitle = loading ? "正在加载" : codexBrowseError != null ? codexBrowseError
+                            : codexBrowseIncomplete ? "部分对话尚未读取" : conversations ? "当前页暂无匹配对话" : "暂无项目或电脑";
+                    items.add(SettingCell.Factory.ofCodex(9, IconBackgroundColors.BLUE_DEEP.top,
+                            IconBackgroundColors.BLUE_DEEP.bottom, 0, browseTitle, loading ? "" : "点击刷新",
+                            !loading && codexBrowseError != null ? SettingCell.Factory.CODEX_TITLE_TWO : 0));
                 }
                 // 分页失败时上方已有原游标重试入口，避免同时展示两个相同操作。
                 if (conversations && codexBrowseCursor != null && codexBrowseError == null) {
-                    items.add(SettingCell.Factory.of(10, IconBackgroundColors.BLUE_DEEP.top,
+                    items.add(SettingCell.Factory.ofCodex(10, IconBackgroundColors.BLUE_DEEP.top,
                             IconBackgroundColors.BLUE_DEEP.bottom, 0, "加载更多对话", ""));
                 }
                 items.add(UItem.asShadow(null));
@@ -1008,17 +1009,17 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
             fillCodexUsageItems(items);
             com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
-            items.add(SettingCell.Factory.of(20, 0, 0, 0, "账号",
+            items.add(SettingCell.Factory.ofCodex(20, 0, 0, 0, "账号",
                     TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName).setEnabled(false));
-            items.add(SettingCell.Factory.of(21, 0, 0, 0, "连接状态", account.connectionLabel).setEnabled(false));
-            items.add(SettingCell.Factory.of(22, 0, 0, 0, "服务地址", account.server).setEnabled(false));
+            items.add(SettingCell.Factory.ofCodex(21, 0, 0, 0, "连接状态", account.connectionLabel).setEnabled(false));
+            items.add(SettingCell.Factory.ofCodex(22, 0, 0, 0, "服务地址", account.server).setEnabled(false));
             items.add(UItem.asShadow(null));
-            items.add(SettingCell.Factory.of(6, 0, 0, 0, "最近会话条数",
+            items.add(SettingCell.Factory.ofCodex(6, 0, 0, 0, "最近会话条数",
                     com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
             items.add(UItem.asShadow(null));
-            items.add(SettingCell.Factory.of(23, 0, 0, 0, "本地缓存",
-                    "已读取的聊天记录保存在本机，联网后自动更新").setEnabled(false));
-            items.add(SettingCell.Factory.of(24, 0, 0, 0, "版本", getVersionName()).setEnabled(false));
+            items.add(SettingCell.Factory.ofCodex(23, 0, 0, 0, "本地缓存",
+                    "已读取的聊天记录保存在本机，联网后自动更新", SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(false));
+            items.add(SettingCell.Factory.ofCodex(24, 0, 0, 0, "版本", getVersionName()).setEnabled(false));
             items.add(UItem.asShadow(null));
             return;
         }
@@ -1617,6 +1618,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         private final TextView subtitleView;
         private final TextView valueView;
         private final boolean mini;
+        private boolean codexMeasure;
 
         public SettingCell(Context context, Theme.ResourcesProvider resourcesProvider) {
             this(context, resourcesProvider, false);
@@ -1671,6 +1673,26 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
         private boolean twoLines;
 
+        /** 每次绑定先回到普通行；只有带 Codex 标记的行才限制行数。 */
+        private void setCodexLines(boolean codex, boolean titleTwo, boolean subtitleTwo) {
+            codexMeasure = codex && !mini;
+            limitLines(titleView, codex, titleTwo);
+            limitLines(subtitleView, codex, subtitleTwo);
+        }
+
+        private static void limitLines(TextView view, boolean codex, boolean two) {
+            if (!codex) {
+                view.setSingleLine(false);
+                view.setMaxLines(Integer.MAX_VALUE);
+                view.setEllipsize(null);
+                return;
+            }
+            if (two) view.setSingleLine(false);
+            view.setMaxLines(two ? 2 : 1);
+            if (!two) view.setSingleLine(true);
+            view.setEllipsize(TextUtils.TruncateAt.END);
+        }
+
         public void set(
             int iconColorTop, int iconColorBottom, int icon,
             CharSequence title,
@@ -1696,10 +1718,16 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
         @Override
         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-            super.onMeasure(
-                MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.EXACTLY),
-                MeasureSpec.makeMeasureSpec(dp(mini ? 44 : twoLines ? 60 : 50), MeasureSpec.EXACTLY)
-            );
+            int width = MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.EXACTLY);
+            if (mini || !codexMeasure) {
+                super.onMeasure(width, MeasureSpec.makeMeasureSpec(dp(mini ? 44 : twoLines ? 60 : 50), MeasureSpec.EXACTLY));
+                return;
+            }
+            super.onMeasure(width, MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+            int floor = dp(twoLines ? 60 : 50);
+            if (getMeasuredHeight() < floor) {
+                super.onMeasure(width, MeasureSpec.makeMeasureSpec(floor, MeasureSpec.EXACTLY));
+            }
         }
 
         public static class Background extends Drawable {
@@ -1762,14 +1790,35 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
             @Override
             public void bindView(View view, UItem item, boolean divider, UniversalAdapter adapter, UniversalRecyclerView listView) {
+                SettingCell cell = (SettingCell) view;
+                cell.setCodexLines(false, false, false);
+                if ((item.flags & CODEX_ROW) != 0) {
+                    cell.setCodexLines(true, (item.flags & CODEX_TITLE_TWO) != 0, (item.flags & CODEX_SUBTITLE_TWO) != 0);
+                }
                 int iconColorTop    = (int) item.longValue;
                 int iconColorBottom = (int) (item.longValue >>> 32);
-                ((SettingCell) view).set(
+                cell.set(
                     iconColorTop, iconColorBottom, item.iconResId,
                     item.text,
                     item.subtext,
                     item.textValue
                 );
+            }
+
+            /** 这三个高位原先没有被本 Factory 使用，避免和间距位或别的列表项撞车。 */
+            public static final int CODEX_ROW = 1 << 16;
+            public static final int CODEX_TITLE_TWO = 1 << 17;
+            public static final int CODEX_SUBTITLE_TWO = 1 << 18;
+
+            /** Codex 行单独标记；id、副标题、value 和点击仍由原 of 写入。 */
+            public static UItem ofCodex(int id, int iconColorTop, int iconColorBottom, int icon, CharSequence title, CharSequence subtitle) {
+                return ofCodex(id, iconColorTop, iconColorBottom, icon, title, subtitle, 0);
+            }
+
+            public static UItem ofCodex(int id, int iconColorTop, int iconColorBottom, int icon, CharSequence title, CharSequence subtitle, int lineFlags) {
+                UItem item = of(id, iconColorTop, iconColorBottom, icon, title, subtitle);
+                item.flags |= CODEX_ROW | (lineFlags & (CODEX_TITLE_TWO | CODEX_SUBTITLE_TWO));
+                return item;
             }
 
             public static UItem of(int id, int iconColorTop, int iconColorBottom, int icon, CharSequence title) {
@@ -1795,6 +1844,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 UItem item = of(1000, iconColorTop, iconColorBottom, icon, title, subtitle);
                 item.object2 = key;
                 item.object = row;
+                item.flags |= CODEX_ROW;
                 return item;
             }
 

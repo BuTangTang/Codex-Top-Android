@@ -29,7 +29,9 @@ public final class SettingsBrowserIconsTest {
                 .findAll(ClassOrInterfaceDeclaration.class).stream()
                 .filter(value -> value.getNameAsString().equals("Factory")).findFirst().orElseThrow();
         actual.append("static class SettingCell {static class Factory extends FactoryBase {");
-        for (String method : List.of("of", "ofBrowse", "equals", "contentsEquals"))
+        for (String field : List.of("CODEX_ROW", "CODEX_TITLE_TWO", "CODEX_SUBTITLE_TWO"))
+            actual.append(factory.getFieldByName(field).orElseThrow());
+        for (String method : List.of("of", "ofCodex", "ofBrowse", "equals", "contentsEquals"))
             for (var overload : factory.getMethodsByName(method)) actual.append(overload);
         actual.append("}} void fill(ArrayList<UItem> items) {").append(branch).append("}");
         Path model = Path.of("TMessagesProj/src/main/java/com/butang/codextop");
@@ -67,7 +69,7 @@ public final class SettingsBrowserIconsTest {
             static class R {static class drawable {static final int settings_data=1,settings_chat=2,settings_devices=3,settings_folders=4;}}
             static class IconBackgroundColors {static final IconBackgroundColors BLUE_DEEP=new IconBackgroundColors();int top=10,bottom=20;}
             static class TextUtils {static boolean equals(CharSequence a,CharSequence b){return Objects.equals(a,b);}}
-            static class UItem {int id,iconResId;long longValue;CharSequence text,subtext,textValue;Object object,object2;
+            static class UItem {int id,iconResId,flags;long longValue;CharSequence text,subtext,textValue;Object object,object2;
                 static UItem ofFactory(Class<?> factory){return new UItem();}static UItem asShadow(Object ignored){UItem i=new UItem();i.id=-1;return i;}}
             static class FactoryBase {public boolean equals(UItem a,UItem b){return a.id==b.id;}
                 public boolean contentsEquals(UItem a,UItem b){return equals(a,b)&&Objects.equals(a.text,b.text);}}
@@ -105,6 +107,10 @@ public final class SettingsBrowserIconsTest {
                 p.codexBrowseError=null;p.codexBrowseCursor=null;check("当前页暂无匹配对话".equals(item(items(p),9).text),"empty page semantics changed");
                 p.codexBrowseIncomplete=true;p.codexBrowseRows.add(row("r"));check("部分对话尚未读取".equals(item(items(p),9).text),"incomplete page indication lost");
                 p.codexBrowseIncomplete=false;check(items(p).stream().noneMatch(i->i.id==9||i.id==10),"settled page gained placeholder");
+                BrowserIconsProbe marked=page(true,true);JsonObject kept=row("kept");marked.codexBrowseRows.add(kept);marked.codexBrowseLoaded=true;marked.codexBrowseError="synthetic error";
+                ArrayList<UItem> markedRows=items(marked);UItem error=item(markedRows,9);UItem entity=item(markedRows,1000);
+                check((error.flags&SettingCell.Factory.CODEX_ROW)!=0&&(error.flags&SettingCell.Factory.CODEX_TITLE_TWO)!=0,"browse error lost title mark");
+                check(entity.object==kept&&"conversations:kept".equals(entity.object2),"browse error page dropped stable key");
             }
             /** 非 Codex 或非浏览设置页没有进入这些实体分支。 */
             static void scope(){BrowserIconsProbe p=page(false,false);CodexRuntime.active=false;check(items(p).isEmpty(),"ordinary Telegram entered Codex browser");CodexRuntime.active=true;p.args.clear();check(items(p).isEmpty(),"quota root entered browser branch");}
