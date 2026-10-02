@@ -25784,6 +25784,7 @@ public class ChatActivity extends BaseFragment implements
     private void processNewMessages(ArrayList<MessageObject> arr) {
         processNewMessages(arr, true);
     }
+    /** 沿原新消息合并；Codex历史本人消息保留阅读位置，本机刚发送与Telegram保持原滚动。 */
     private void processNewMessages(ArrayList<MessageObject> arr, final boolean animatedFromBottom) {
         FileLog.d("processNewMessages " + arr.size() + " messages");
 
@@ -26342,7 +26343,8 @@ public class ChatActivity extends BaseFragment implements
                 if (obj.isOut() && !(obj.messageOwner.action instanceof TLRPC.TL_messageActionTodoCompletions || obj.messageOwner.action instanceof TLRPC.TL_messageActionTodoAppendTasks) && !obj.messageOwner.from_scheduled) {
                     removeUnreadPlane(true);
                     hideInfoView();
-                    hasFromMe = true;
+                    // 同批本机刚发送的资格不能被后续历史项覆盖，原排期及待办守卫保持不变。
+                    hasFromMe = hasFromMe || !com.butang.codextop.CodexRuntime.ownsConversation(dialog_id) || obj.wasJustSent;
                 }
 
                 if (!MessageObject.isEphemeralMessageId(messageId)) {
