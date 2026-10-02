@@ -21,12 +21,14 @@ public final class CodexPixelPalette {
      * 每次新建数组，本类不保留也不会写入主题。
      */
     public static SparseIntArray light() {
-        return create(
-                0xFFFFFFFF, 0xFFFFFFFF, 0xFFEAF4FC, 0xFFEAF4FC, 0xFFFFFFFF, 0xFFE4F2FC,
+        SparseIntArray colors = create(
+                0xFFFFFFFF, 0xFFFFFFFF, 0xFFEAF4FC, 0xFFEAF4FC, 0xFFFFFFFF, 0xFFB7DBF6,
                 0xFF1A1D21, 0xFF5E686F, 0xFF1868A8, 0xFF1565C0, 0xFF1257A8,
                 0xFF1C7A30, 0xFFC62828, 0xFFC62828,
                 0xFFD0DEEC, 0x0F000000, 0x1D000010, 0x241868A8,
-                0xFFE7F3FC, 0xFFDCEEF8, 0xFF1A1D21);
+                0xFFE7F1FA, 0xFF9CC8EE, 0xFF1A1D21);
+        paintChat(colors, 0xFFF4F7FB, 0xFF3E4850, 0xFF0C4578, 0xFF1A1D21);
+        return colors;
     }
 
     /**
@@ -35,12 +37,14 @@ public final class CodexPixelPalette {
      * 蓝色重点在深底上用亮蓝，白字填充仍用同一档深蓝。每次新建数组，不应用、不保存。
      */
     public static SparseIntArray dark() {
-        return create(
-                0xFF141D28, 0xFF202834, 0xFF141D28, 0xFF202834, 0xFF202834, 0xFF243447,
+        SparseIntArray colors = create(
+                0xFF141D28, 0xFF202834, 0xFF141D28, 0xFF202834, 0xFF1C2633, 0xFF12304C,
                 0xFFF4F7FA, 0xFF9AA8B6, 0xFF64B5EF, 0xFF1565C0, 0xFF1257A8,
                 0xFF61BD67, 0xFFF08A90, 0xFFC62828,
                 0xFF314052, 0x1AFFFFFF, 0x24FFFFFF, 0x3364B5EF,
-                0xFF2A3C4C, 0xFF2B3E52, 0xFF9AA8B6);
+                0xFF243244, 0xFF0E2840, 0xFF9AA8B6);
+        paintChat(colors, 0xFF121820, 0xFFD5DEE6, 0xFFD6ECFF, 0xFFF4F7FA);
+        return colors;
     }
 
     /**
@@ -73,8 +77,7 @@ public final class CodexPixelPalette {
                 Theme.key_chats_menuBackground);
         paint(colors, wash,
                 Theme.key_windowBackgroundGray,
-                Theme.key_dialogBackgroundGray,
-                Theme.key_chat_wallpaper);
+                Theme.key_dialogBackgroundGray);
         paint(colors, field,
                 Theme.key_dialogSearchBackground,
                 Theme.key_graySection,
@@ -103,6 +106,12 @@ public final class CodexPixelPalette {
                 Theme.key_chat_outReplyMediaMessageText,
                 Theme.key_chat_outReplyMediaMessageSelectedText,
                 Theme.key_chat_outFileNameText,
+                Theme.key_chat_inReplyNameText,
+                Theme.key_chat_inReplyMessageText,
+                Theme.key_chat_inReplyMediaMessageText,
+                Theme.key_chat_inReplyMediaMessageSelectedText,
+                Theme.key_chat_inSiteNameText,
+                Theme.key_chat_inFileNameText,
                 Theme.key_chat_messagePanelText,
                 Theme.key_actionBarDefaultTitle,
                 Theme.key_actionBarDefaultIcon,
@@ -128,10 +137,6 @@ public final class CodexPixelPalette {
                 Theme.key_chat_messagePanelIcons,
                 Theme.key_graySectionText,
                 Theme.key_dialogTextGray2,
-                Theme.key_chat_inTimeText,
-                Theme.key_chat_outTimeText,
-                Theme.key_chat_outFileInfoText,
-                Theme.key_chat_outFileInfoSelectedText,
                 Theme.key_dialogSearchHint,
                 Theme.key_dialogSearchIcon,
                 Theme.key_emptyListPlaceholder,
@@ -155,12 +160,7 @@ public final class CodexPixelPalette {
                 Theme.key_glass_tabSelectedText,
                 Theme.key_chat_topPanelLine,
                 Theme.key_chat_replyPanelIcons,
-                Theme.key_chat_replyPanelName,
-                Theme.key_chat_messageLinkIn,
-                Theme.key_chat_messageLinkOut,
-                Theme.key_chat_outForwardedNameText,
-                Theme.key_chat_outReplyLine,
-                Theme.key_chat_outReplyLine2);
+                Theme.key_chat_replyPanelName);
         paint(colors, accentFill,
                 Theme.key_chats_unreadCounter,
                 Theme.key_chats_actionBackground,
@@ -227,6 +227,35 @@ public final class CodexPixelPalette {
         paint(colors, outgoingSelected, Theme.key_chat_outBubbleSelected);
         paint(colors, tabIdle, Theme.key_glass_tabUnselected);
         return colors;
+    }
+
+    /** 壁纸、气泡上的时间和文件说明、链接与回复线单独着色，不改全局辅助色和强调色。 */
+    private static void paintChat(SparseIntArray colors, int wallpaper, int auxiliary, int link, int ink) {
+        paint(colors, wallpaper, Theme.key_chat_wallpaper);
+        paint(colors, auxiliary,
+                Theme.key_chat_inTimeText,
+                Theme.key_chat_outTimeText,
+                Theme.key_chat_inTimeSelectedText,
+                Theme.key_chat_outTimeSelectedText,
+                Theme.key_chat_inFileInfoText,
+                Theme.key_chat_inFileInfoSelectedText,
+                Theme.key_chat_outFileInfoText,
+                Theme.key_chat_outFileInfoSelectedText);
+        paint(colors, link,
+                Theme.key_chat_messageLinkIn,
+                Theme.key_chat_messageLinkOut,
+                Theme.key_chat_inForwardedNameText,
+                Theme.key_chat_outForwardedNameText,
+                Theme.key_chat_inReplyLine,
+                Theme.key_chat_outReplyLine,
+                Theme.key_chat_outReplyLine2);
+        paint(colors, ink,
+                Theme.key_chat_inReplyNameText,
+                Theme.key_chat_inReplyMessageText,
+                Theme.key_chat_inReplyMediaMessageText,
+                Theme.key_chat_inReplyMediaMessageSelectedText,
+                Theme.key_chat_inSiteNameText,
+                Theme.key_chat_inFileNameText);
     }
 
     /** 把同一个颜色写入一组 Theme.key。键必须各不相同，否则后写的值会盖住先写的值。 */

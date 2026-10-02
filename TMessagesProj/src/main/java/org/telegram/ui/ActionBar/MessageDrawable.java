@@ -82,6 +82,8 @@ public class MessageDrawable extends Drawable {
             {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff},
             {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}
     };
+    /** 与气泡九宫格同一索引。0 表示这一格没有描边。 */
+    private int[][] outlineColor = new int[4][4];
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MEDIA = 1;
@@ -317,6 +319,7 @@ public class MessageDrawable extends Drawable {
         return shadowDrawable;
     }
 
+    /** 按原气泡形状和颜色复用九宫格；文字描边仅在缓存成功重建后记入同一索引。 */
     public Drawable getBackgroundDrawable() {
         int newRad;
         if (overrideRoundRadius != 0) {
@@ -355,7 +358,8 @@ public class MessageDrawable extends Drawable {
 
         boolean drawWithShadow = gradientShader == null && !isSelected && !isCrossfadeBackground;
         int shadowColor = getColor(isOut ? Theme.key_chat_outBubbleShadow : Theme.key_chat_inBubbleShadow);
-        if (lastDrawWithShadow != drawWithShadow || currentBackgroundDrawableRadius[idx2][idx] != newRad || (drawWithShadow && shadowDrawableColor[idx] != shadowColor) || backgroundDrawableColor[idx2][idx] != color) {
+        int outline = textOutlineColor();
+        if (lastDrawWithShadow != drawWithShadow || currentBackgroundDrawableRadius[idx2][idx] != newRad || (drawWithShadow && shadowDrawableColor[idx] != shadowColor) || backgroundDrawableColor[idx2][idx] != color || outlineColor[idx2][idx] != outline) {
             currentBackgroundDrawableRadius[idx2][idx] = newRad;
             try {
                 Bitmap bitmap = Bitmap.createBitmap(dp(50), dp(40), Bitmap.Config.ARGB_8888);
@@ -393,8 +397,18 @@ public class MessageDrawable extends Drawable {
                 shadowPaint.setColor(color);
                 setBounds(0, 0, bitmap.getWidth(), bitmap.getHeight());
                 draw(canvas, shadowPaint);
+                if (outline != 0) {
+                    shadowPaint.setStyle(Paint.Style.STROKE);
+                    shadowPaint.setStrokeWidth(AndroidUtilities.dpf2(isOut ? 1.5f : 1f));
+                    shadowPaint.setColor(outline);
+                    draw(canvas, shadowPaint);
+                }
 
-                backgroundDrawable[idx2][idx] = new NinePatchDrawable(bitmap, getByteBuffer(bitmap.getWidth() / 2 - 1, bitmap.getWidth() / 2 + 1, bitmap.getHeight() / 2 - 1, bitmap.getHeight() / 2 + 1, color).array(), new Rect(), null);
+                NinePatchDrawable patch = new NinePatchDrawable(bitmap, getByteBuffer(bitmap.getWidth() / 2 - 1, bitmap.getWidth() / 2 + 1, bitmap.getHeight() / 2 - 1, bitmap.getHeight() / 2 + 1, color).array(), new Rect(), null);
+                patch.setAlpha(alpha);
+                backgroundDrawable[idx2][idx] = patch;
+                // 重建失败时保留旧描边标记，让下一次取缓存继续尝试本次主题变化。
+                outlineColor[idx2][idx] = outline;
                 setBounds(backupRect);
             } catch (Throwable ignore) {
 
@@ -403,6 +417,18 @@ public class MessageDrawable extends Drawable {
         lastDrawWithShadow = drawWithShadow;
         backgroundDrawableColor[idx2][idx] = color;
         return backgroundDrawable[idx2][idx];
+    }
+
+    /** 只给 Codex 包里正在显示的 Day/Night 文字气泡加边。媒体、预览和其它主题返回 0。 */
+    private int textOutlineColor() {
+        if (currentType != TYPE_TEXT || !com.butang.codextop.CodexRuntime.enabled()) return 0;
+        Theme.ThemeInfo active = Theme.getActiveTheme();
+        if (active == null) return 0;
+        boolean night = "Night".equals(active.name);
+        if (!night && !"Day".equals(active.name)) return 0;
+        if (!isOut) return night ? 0xFF314052 : 0xFFC3D2E2;
+        if (isSelected) return night ? 0xFF7EB6E4 : 0xFF3E7EB4;
+        return night ? 0xFF4C8EC4 : 0xFF5B93C4;
     }
 
     public Drawable getTransitionDrawable(int color) {

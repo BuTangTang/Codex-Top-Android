@@ -33,6 +33,11 @@ public final class CodexPixelThemeTest {
         String migrationType = themeUnit.findAll(com.github.javaparser.ast.body.ClassOrInterfaceDeclaration.class).stream()
                 .filter(type -> type.getNameAsString().equals("CodexPixelThemeMigration"))
                 .findFirst().orElseThrow(() -> new AssertionError("缺少一次性迁移结果")).toString();
+        String bubbleSource = Files.readString(root.resolve("TMessagesProj/src/main/java/org/telegram/ui/ActionBar/MessageDrawable.java"));
+        int stroke = bubbleSource.indexOf("Paint.Style.STROKE");
+        int genericDraw = bubbleSource.indexOf("public void draw(Canvas canvas, Paint paintToUse)");
+        check(stroke > 0 && genericDraw > stroke, "描边进入了通用 draw");
+        check(bubbleSource.contains("getActiveTheme()") && bubbleSource.contains("currentType != TYPE_TEXT") && bubbleSource.contains("outlineColor"), "文字描边没有限定当前 Day/Night");
         checkOrder(themeSource, themeUnit, tabsSource, glassSource, chatSource, commit, copy, wallpaper);
         Path temp = Files.createTempDirectory("codex-pixel-theme-");
         Path sentinel = temp.resolve("wallpaper.jpg");
@@ -44,12 +49,20 @@ public final class CodexPixelThemeTest {
             Files.writeString(temp.resolve("CodexPixelThemeProbe.java"), PROBE);
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", temp.toString(),
                     temp.resolve("SparseIntArray.java").toString(),
+                    temp.resolve("Rect.java").toString(),
+                    temp.resolve("Bitmap.java").toString(),
+                    temp.resolve("Shader.java").toString(),
+                    temp.resolve("BitmapShader.java").toString(),
+                    temp.resolve("Paint.java").toString(),
+                    temp.resolve("Canvas.java").toString(),
                     temp.resolve("Drawable.java").toString(),
                     temp.resolve("ColorDrawable.java").toString(),
                     temp.resolve("SharedPreferences.java").toString(),
                     temp.resolve("Build.java").toString(),
+                    temp.resolve("AndroidUtilities.java").toString(),
                     temp.resolve("Theme.java").toString(),
                     root.resolve("TMessagesProj/src/main/java/com/butang/codextop/CodexPixelPalette.java").toString(),
+                    root.resolve("TMessagesProj/src/main/java/com/butang/codextop/CodexPixelWallpaper.java").toString(),
                     temp.resolve("CodexPixelThemeProbe.java").toString()) != 0) {
                 throw new AssertionError("主题决策夹具编译失败");
             }
@@ -169,6 +182,7 @@ public final class CodexPixelThemeTest {
                 import android.graphics.drawable.ColorDrawable;
                 import android.content.SharedPreferences;
                 import android.os.Build;
+                import org.telegram.messenger.AndroidUtilities;
                 public class Theme {
                 public static final int AUTO_NIGHT_TYPE_NONE=0;
                 public static final int AUTO_NIGHT_TYPE_SCHEDULED=1;
@@ -187,6 +201,7 @@ public final class CodexPixelThemeTest {
 
     /** 写出最小平台类型。偏好提交、颜色数组和纯色 Drawable 是这里要观察的边界。 */
     private static void writeStubs(Path temp, Path palette) throws Exception {
+        Files.writeString(temp.resolve("AndroidUtilities.java"), "package org.telegram.messenger; public class AndroidUtilities { public static float density=1f; }");
         Files.writeString(temp.resolve("SparseIntArray.java"), """
                 package android.util;
                 public class SparseIntArray {
@@ -203,7 +218,41 @@ public final class CodexPixelThemeTest {
                     public int size(){return count;}
                 }
                 """);
-        Files.writeString(temp.resolve("Drawable.java"), "package android.graphics.drawable; public class Drawable {}");
+        Files.writeString(temp.resolve("Rect.java"), "package android.graphics; public class Rect { public Rect(){} }");
+        Files.writeString(temp.resolve("Bitmap.java"), """
+                package android.graphics;
+                public class Bitmap {
+                    public enum Config { ARGB_8888 }
+                    public static Bitmap createBitmap(int width,int height,Config config){return new Bitmap();}
+                }
+                """);
+        Files.writeString(temp.resolve("Shader.java"), "package android.graphics; public class Shader { public enum TileMode { CLAMP, REPEAT } }");
+        Files.writeString(temp.resolve("BitmapShader.java"), "package android.graphics; public class BitmapShader extends Shader { public BitmapShader(Bitmap bitmap,Shader.TileMode x,Shader.TileMode y){} }");
+        Files.writeString(temp.resolve("Paint.java"), """
+                package android.graphics;
+                public class Paint {
+                    public static final int ANTI_ALIAS_FLAG=1;
+                    public Paint(){}
+                    public Paint(int flags){}
+                    public void setColor(int color){}
+                    public void setAlpha(int alpha){}
+                    public void setShader(Shader shader){}
+                }
+                """);
+        Files.writeString(temp.resolve("Canvas.java"), """
+                package android.graphics;
+                public class Canvas {
+                    public Canvas(Bitmap bitmap){}
+                    public void drawRect(float left,float top,float right,float bottom,Paint paint){}
+                    public void drawRect(Rect rect,Paint paint){}
+                }
+                """);
+        Files.writeString(temp.resolve("Drawable.java"), """
+                package android.graphics.drawable;
+                import android.graphics.Canvas;
+                import android.graphics.Rect;
+                public class Drawable { private final Rect bounds=new Rect(); public Rect getBounds(){return bounds;} public void draw(Canvas canvas){} public int getAlpha(){return 255;} }
+                """);
         Files.writeString(temp.resolve("ColorDrawable.java"), """
                 package android.graphics.drawable;
                 public class ColorDrawable extends Drawable {
@@ -393,6 +442,10 @@ public final class CodexPixelThemeTest {
                     Theme.copyCodexPixelPalette(blue,null,true,true);
                     check(blue.size()==0,"普通主题或关闭 Codex 时写入了像素色");
                     check(light.get(Theme.key_chats_unreadCounterText)==0xFFFFFFFF&&dark.get(Theme.key_chats_unreadCounterText)==0xFFFFFFFF,"ON_FILL 不再是白色");
+                    check(light.get(Theme.key_windowBackgroundGray)==0xFFEAF4FC&&dark.get(Theme.key_windowBackgroundGray)==0xFF141D28,"设置分组底色被改成聊天壁纸");
+                    check(light.get(Theme.key_chat_wallpaper)==0xFFF4F7FB&&dark.get(Theme.key_chat_wallpaper)==0xFF121820,"聊天壁纸没有单独使用纸面色");
+                    check(light.get(Theme.key_windowBackgroundWhiteGrayText)==0xFF5E686F&&dark.get(Theme.key_windowBackgroundWhiteGrayText)==0xFF9AA8B6,"全局辅助色被改成气泡辅助色");
+                    check(light.get(Theme.key_windowBackgroundWhiteBlueText)==0xFF1868A8&&dark.get(Theme.key_windowBackgroundWhiteBlueText)==0xFF64B5EF,"全局强调色被改成聊天链接色");
                 }
                 /** Day 资源里这些键是白或浅蓝；覆盖后必须换成色表对应组，并在真实气泡和回复着色上达到 4.5。 */
                 static void foreground(){
@@ -419,37 +472,30 @@ public final class CodexPixelThemeTest {
                     colors.put(Theme.key_chat_messageLinkIn,DAY_LINK_IN);
                 }
                 static void assertForeground(SparseIntArray colors,SparseIntArray palette,boolean dark){
-                    int accent=palette.get(Theme.key_windowBackgroundWhiteBlueText);
+                    int chatLink=palette.get(Theme.key_chat_messageLinkOut);
                     int ink=palette.get(Theme.key_chat_messageTextOut);
-                    int secondary=palette.get(Theme.key_chat_outTimeText);
+                    int auxiliary=palette.get(Theme.key_chat_outTimeText);
                     int out=colors.get(Theme.key_chat_outBubble),outSel=colors.get(Theme.key_chat_outBubbleSelected);
                     int in=colors.get(Theme.key_chat_inBubble),inSel=colors.get(Theme.key_chat_inBubbleSelected);
                     int line=colors.get(Theme.key_chat_outReplyLine);
-                    contrast(colors.get(Theme.key_chat_messageLinkIn),in,"收到链接/普通气泡");
-                    contrast(colors.get(Theme.key_chat_messageLinkIn),inSel,"收到链接/选中气泡");
-                    contrast(colors.get(Theme.key_chat_messageLinkOut),out,"发出链接/普通气泡");
-                    contrast(colors.get(Theme.key_chat_messageLinkOut),outSel,"发出链接/选中气泡");
-                    contrast(colors.get(Theme.key_chat_outForwardedNameText),out,"转发名/普通气泡");
-                    contrast(colors.get(Theme.key_chat_outForwardedNameText),outSel,"转发名/选中气泡");
-                    contrast(line,out,"回复线/普通气泡");
-                    contrast(line,outSel,"回复线/选中气泡");
-                    contrast(colors.get(Theme.key_chat_outReplyLine2),out,"回复线2/普通气泡");
-                    contrast(colors.get(Theme.key_chat_outReplyLine2),outSel,"回复线2/选中气泡");
+                    int inLine=colors.get(Theme.key_chat_inReplyLine);
+                    int[] bubbles=new int[]{in,inSel,out,outSel};
+                    int[] tones=new int[]{ink,auxiliary,chatLink,line,inLine};
+                    for(int bubble:bubbles)for(int tone:tones)contrast(tone,bubble,"气泡上的正文、辅助色或链接");
+                    int inReply=replyBackground(inLine,in,dark),inReplySel=replyBackground(inLine,inSel,dark);
+                    int reply=replyBackground(line,out,dark),replySel=replyBackground(line,outSel,dark);
+                    int[] sheets=new int[]{inReply,inReplySel,reply,replySel};
+                    for(int sheet:sheets)for(int tone:tones)contrast(tone,sheet,"回复叠色上的正文、辅助色或链接");
                     contrast(colors.get(Theme.key_chat_outFileNameText),out,"文件名/普通气泡");
                     contrast(colors.get(Theme.key_chat_outFileNameText),outSel,"文件名/选中气泡");
-                    contrast(colors.get(Theme.key_chat_outFileInfoText),out,"文件说明/普通气泡");
-                    contrast(colors.get(Theme.key_chat_outFileInfoText),outSel,"文件说明/选中气泡");
-                    contrast(colors.get(Theme.key_chat_outFileInfoSelectedText),out,"选中文件说明/普通气泡");
-                    contrast(colors.get(Theme.key_chat_outFileInfoSelectedText),outSel,"选中文件说明/选中气泡");
-                    int reply=replyBackground(line,out,dark),replySel=replyBackground(line,outSel,dark);
-                    int[] replyText=new int[]{Theme.key_chat_outReplyNameText,Theme.key_chat_outReplyMessageText,Theme.key_chat_outSiteNameText,Theme.key_chat_outReplyMediaMessageText,Theme.key_chat_outReplyMediaMessageSelectedText};
-                    for(int key:replyText){
-                        contrast(colors.get(key),reply,"回复块/普通合成底");
-                        contrast(colors.get(key),replySel,"回复块/选中合成底");
-                    }
-                    check(colors.get(Theme.key_chat_messageLinkIn)==accent&&colors.get(Theme.key_chat_messageLinkOut)==accent&&colors.get(Theme.key_chat_outForwardedNameText)==accent&&line==accent&&colors.get(Theme.key_chat_outReplyLine2)==accent,"链接、转发名或回复线没有使用 accentText");
-                    check(colors.get(Theme.key_chat_outReplyNameText)==ink&&colors.get(Theme.key_chat_outSiteNameText)==ink&&colors.get(Theme.key_chat_outReplyMessageText)==ink&&colors.get(Theme.key_chat_outFileNameText)==ink&&colors.get(Theme.key_chat_outReplyMediaMessageText)==ink&&colors.get(Theme.key_chat_outReplyMediaMessageSelectedText)==ink,"回复名、正文、媒体说明或站点名没有使用 ink");
-                    check(colors.get(Theme.key_chat_outFileInfoText)==secondary&&colors.get(Theme.key_chat_outFileInfoSelectedText)==secondary,"文件说明没有使用 secondary");
+                    contrast(colors.get(Theme.key_chat_inFileNameText),in,"收到文件名/普通气泡");
+                    contrast(colors.get(Theme.key_chat_inFileNameText),inSel,"收到文件名/选中气泡");
+                    check(colors.get(Theme.key_chat_messageLinkIn)==chatLink&&colors.get(Theme.key_chat_messageLinkOut)==chatLink&&colors.get(Theme.key_chat_inForwardedNameText)==chatLink&&colors.get(Theme.key_chat_outForwardedNameText)==chatLink&&line==chatLink&&inLine==chatLink&&colors.get(Theme.key_chat_outReplyLine2)==chatLink,"聊天链接、转发名或回复线没有使用同一聊天色");
+                    check(chatLink!=palette.get(Theme.key_windowBackgroundWhiteBlueText),"聊天链接色覆盖了全局强调色");
+                    check(colors.get(Theme.key_chat_outReplyNameText)==ink&&colors.get(Theme.key_chat_outSiteNameText)==ink&&colors.get(Theme.key_chat_outReplyMessageText)==ink&&colors.get(Theme.key_chat_outFileNameText)==ink&&colors.get(Theme.key_chat_outReplyMediaMessageText)==ink&&colors.get(Theme.key_chat_outReplyMediaMessageSelectedText)==ink,"发出回复名、正文、媒体说明或站点名没有使用 ink");
+                    check(colors.get(Theme.key_chat_inReplyNameText)==ink&&colors.get(Theme.key_chat_inReplyMessageText)==ink&&colors.get(Theme.key_chat_inReplyMediaMessageText)==ink&&colors.get(Theme.key_chat_inReplyMediaMessageSelectedText)==ink&&colors.get(Theme.key_chat_inSiteNameText)==ink&&colors.get(Theme.key_chat_inFileNameText)==ink,"收到回复名、正文、媒体说明、站点名或文件名没有使用 ink");
+                    check(colors.get(Theme.key_chat_inTimeText)==auxiliary&&colors.get(Theme.key_chat_inTimeSelectedText)==auxiliary&&colors.get(Theme.key_chat_outTimeSelectedText)==auxiliary&&colors.get(Theme.key_chat_inFileInfoText)==auxiliary&&colors.get(Theme.key_chat_inFileInfoSelectedText)==auxiliary&&colors.get(Theme.key_chat_outFileInfoText)==auxiliary&&colors.get(Theme.key_chat_outFileInfoSelectedText)==auxiliary,"聊天时间或文件说明没有使用聊天辅助色");
+                    check(auxiliary!=palette.get(Theme.key_windowBackgroundWhiteGrayText),"聊天辅助色覆盖了全局辅助色");
                 }
                 /** 与 ReplyMessageLine 相同：线条色乘 10% 浅色或 12% 深色后盖在气泡上。 */
                 static int replyBackground(int line,int bubble,boolean dark){

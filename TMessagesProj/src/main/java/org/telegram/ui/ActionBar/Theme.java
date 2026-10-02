@@ -4472,13 +4472,13 @@ public class Theme {
         }
     }
 
-    /** 像素 Day/Night 用当前壁纸色生成平涂背景，不读取、不写入、不删除墙纸文件。 */
+    /** 像素 Day/Night 按当前壁纸色和屏幕密度生成静态纸面，不读取、不写入、不删除墙纸文件。 */
     static BackgroundDrawableSettings codexPixelWallpaper(String themeName, SparseIntArray colors, boolean codexPackage) {
         if (!codexPackage || (!"Day".equals(themeName) && !"Night".equals(themeName)) || colors == null || colors.indexOfKey(key_chat_wallpaper) < 0) {
             return null;
         }
         BackgroundDrawableSettings settings = new BackgroundDrawableSettings();
-        settings.wallpaper = new ColorDrawable(colors.get(key_chat_wallpaper));
+        settings.wallpaper = new com.butang.codextop.CodexPixelWallpaper(colors.get(key_chat_wallpaper), AndroidUtilities.density);
         settings.isWallpaperMotion = Boolean.FALSE;
         settings.isPatternWallpaper = Boolean.FALSE;
         settings.isCustomTheme = Boolean.TRUE;
