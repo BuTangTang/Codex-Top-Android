@@ -23,12 +23,14 @@ public final class SettingsAccountUsageUiTest {
                 .getClassByName("SettingsActivity").orElseThrow();
         StringBuilder actual = new StringBuilder();
         for (String field : List.of("codexBrowseRows", "codexBrowseError", "codexBrowseLoading", "codexBrowseGeneration",
-                "codexBrowseCursor", "codexBrowseLoaded", "codexBrowseIncomplete", "codexUsage", "codexUsageError",
-                "codexUsageLoading", "codexUsageGeneration", "codexUsageMachine", "codexUsageMachineName", "codexUsageSourcesRequested"))
+                "codexBrowseCursor", "codexBrowseRequestCursor", "codexBrowseLoaded", "codexBrowseIncomplete", "codexUsage", "codexUsageError",
+                "codexUsageLoading", "codexUsageGeneration", "codexUsageMachine", "codexUsageMachineName", "codexUsageSourcesRequested",
+                "codexBrowseRequested"))
             actual.append(source.getFieldByName(field).orElseThrow()).append('\n');
         for (String method : List.of("codexQuota", "codexQuotaDetail", "codexMyRoot", "codexUsageMachineId",
                 "codexUsageSourceLabel", "selectCodexUsageMachine", "applyCodexUsageSources", "loadCodexUsageSources",
-                "loadCodexUsage", "restoreCodexUsageFromCache", "codexBrowser", "applyCodexBrowse", "onResume", "onFragmentDestroy"))
+                "loadCodexUsage", "restoreCodexUsageFromCache", "codexBrowser", "codexConversations", "applyCodexBrowse",
+                "loadCodexBrowser", "onResume", "onFragmentDestroy"))
             for (var overload : source.getMethodsByName(method)) actual.append(overload).append('\n');
         Path temp = Files.createTempDirectory("codex-settings-usage-");
         try {
@@ -70,6 +72,7 @@ public final class SettingsAccountUsageUiTest {
             public static final Map<String,AccountUsage> cache = new HashMap<>();
             public static final List<Read> reads = new ArrayList<>();
             public static final List<BrowseCallback> browses = new ArrayList<>();
+            public static final List<String> cursors = new ArrayList<>();
             /** 返回合成开关，不读取应用或账号。 */
             public static boolean enabled() { return active; }
             /** 返回指定来源的合成快照，不复制产品缓存规则。 */
@@ -77,7 +80,9 @@ public final class SettingsAccountUsageUiTest {
             /** 返回合成名单；测试决定回调派发时序。 */
             public static JsonObject cachedBrowse(String machine, Object roots, boolean conversations) { return snapshot; }
             /** 暂存异步边界，绝不自动触发第二次读取。 */
-            public static void browseComputers(String machine, BrowseCallback callback) { browses.add(callback); }
+            public static void browseComputers(String machine, BrowseCallback callback) { cursors.add(null); browses.add(callback); }
+            /** 记录项目会话原入口的游标，不合并分页。 */
+            public static void browseConversations(int account, String machine, ArrayList<String> roots, String cursor, BrowseCallback callback) { cursors.add(cursor); browses.add(callback); }
             /** 记录实际设置方法发起的读取及原回调。 */
             public static void readAccountUsage(String machine, BiConsumer<AccountUsage,String> callback) { reads.add(new Read(machine, callback)); }
             /** 模拟原 Runtime 在派发 UI 回调前已更新同来源快照的边界。 */
@@ -86,7 +91,7 @@ public final class SettingsAccountUsageUiTest {
                 read.callback().accept(value,error);
             }
             /** 清空各场景的合成输入和调度记录。 */
-            public static void reset() { active=true; snapshot=null; selected=null; cache.clear(); reads.clear(); browses.clear(); }
+            public static void reset() { active=true; snapshot=null; selected=null; cache.clear(); reads.clear(); browses.clear(); cursors.clear(); }
         }
         """;
 
@@ -105,6 +110,8 @@ public final class SettingsAccountUsageUiTest {
                 boolean getBoolean(String key, boolean fallback) { return containsKey(key) ? (Boolean)get(key) : fallback; }
                 /** 对应原 Bundle 的字符串读取。 */
                 String getString(String key) { return (String)get(key); }
+                /** 对应原 Bundle 的字符串列表读取。 */
+                ArrayList<String> getStringArrayList(String key) { Object value=get(key); return value instanceof ArrayList ? (ArrayList<String>)value : null; }
             }
             static final class TextUtils {
                 /** 平台文字比较边界。 */
@@ -117,13 +124,11 @@ public final class SettingsAccountUsageUiTest {
                 /** 只计生命周期注销，不构造通知逻辑。 */
                 void removeObserver(Object owner, int event) {}
             }
-            final Args args = new Args(); Object listView = new Object(); int renders, browserLoads;
+            final Args args = new Args(); Object listView = new Object(); int currentAccount, renders;
             /** 仅提供平台参数容器。 */
             Args getArguments() { return args; }
             /** 原适配器重绘作为观测边界，不镜像列表布局。 */
             void updateCodexBrowserItems() { renders++; }
-            /** 非额度电脑页的旧入口只记录调用。 */
-            void loadCodexBrowser(boolean next) { browserLoads++; }
             /** 注销通知的无副作用边界。 */
             NotificationCenter getNotificationCenter() { return new NotificationCenter(); }
         """;
@@ -198,7 +203,7 @@ public final class SettingsAccountUsageUiTest {
                 SettingsUsageProbe page=reset();CodexRuntime.active=false;page.onResume();
                 check(CodexRuntime.browses.isEmpty()&&CodexRuntime.reads.isEmpty()&&page.renders==0,"ordinary Telegram entered Codex quota path");
                 page=reset();page.args.put("codexComputerBrowser",true);page.onResume();
-                check(page.browserLoads==1&&CodexRuntime.browses.isEmpty()&&CodexRuntime.reads.isEmpty(),"computer browser changed to quota root");
+                check(CodexRuntime.browses.size()==1&&CodexRuntime.reads.isEmpty()&&page.codexUsageMachine==null,"computer browser changed to quota root");
                 page=reset();page.onResume();CodexRuntime.browses.get(0).accept(sources(),null,false);
                 check(page.codexUsageMachine==null&&!page.codexBrowseLoading&&CodexRuntime.reads.isEmpty(),"empty source list invented quota or retained loading");
                 page.loadCodexUsageSources();CodexRuntime.browses.get(1).accept(null,"synthetic source unavailable",false);
@@ -223,9 +228,40 @@ public final class SettingsAccountUsageUiTest {
                 page.loadCodexUsage();AccountUsage changed=AccountUsage.parse(JsonParser.parseString("{\\"status\\":\\"unavailable\\",\\"reason\\":\\"account_changed\\"}").getAsJsonObject());
                 CodexRuntime.complete(1,changed,null);check(page.codexUsage==changed&&!page.codexUsage.available,"changed source account retained old account quota");
             }
+            /** 缓存已展示不等于已请求；同一页返回不再发浏览，显式刷新和分页仍走原入口。 */
+            static void browserReturn() {
+                SettingsUsageProbe page=reset();page.args.put("codexComputerBrowser",true);
+                JsonObject cached=sources("A");page.applyCodexBrowse(cached);
+                check(page.codexBrowseLoaded&&page.codexBrowseRows.size()==1,"cached computer page did not keep its row before resume");
+                page.onResume();
+                check(CodexRuntime.browses.size()==1&&page.codexBrowseRows==cached.getAsJsonArray("rows"),"first cached resume skipped the background read or cleared rows");
+                int renders=page.renders;page.onResume();
+                check(CodexRuntime.browses.size()==1&&page.renders>renders,"in-flight resume issued another browse or skipped the adapter");
+                CodexRuntime.browses.get(0).accept(sources("A","B"),null,false);
+                check(page.codexBrowseRows.size()==2&&!page.codexBrowseLoading,"fresh computer page did not replace the cached rows");
+                renders=page.renders;page.onResume();
+                check(CodexRuntime.browses.size()==1&&page.renders>renders,"return after success issued another browse");
+                page.loadCodexBrowser(false);
+                check(CodexRuntime.browses.size()==2,"explicit refresh did not use the original browse");
+                page=reset();page.args.put("codexComputerBrowser",true);page.onResume();
+                check(CodexRuntime.browses.size()==1&&page.codexBrowseRows.size()==0,"first empty page skipped the browse");
+                page.onResume();check(CodexRuntime.browses.size()==1,"in-flight empty page resume issued another browse");
+                JsonObject kept=sources("kept");page.applyCodexBrowse(kept);
+                CodexRuntime.browses.get(0).accept(null,"synthetic browse failed",false);
+                check(page.codexBrowseRows==kept.getAsJsonArray("rows")&&page.codexBrowseError!=null&&!page.codexBrowseLoading,"failed browse cleared old rows");
+                page.onResume();check(CodexRuntime.browses.size()==1,"return after failure issued another browse");
+                page.loadCodexBrowser(false);check(CodexRuntime.browses.size()==2,"manual retry after failure did not browse");
+                page=reset();page.args.put("codexComputerBrowser",true);page.args.put("codexConversations",true);page.args.put("codexMachine","machine");
+                JsonObject paged=sources("thread");paged.addProperty("nextCursor","page-2");page.applyCodexBrowse(paged);page.onResume();
+                check(CodexRuntime.browses.size()==1&&CodexRuntime.cursors.get(0)==null,"first conversation page sent a cursor");
+                CodexRuntime.browses.get(0).accept(paged,null,false);page.loadCodexBrowser(true);
+                check(CodexRuntime.browses.size()==2&&"page-2".equals(CodexRuntime.cursors.get(1)),"next page did not use the original cursor");
+                page=reset();CodexRuntime.active=false;page.args.put("codexComputerBrowser",true);page.onResume();
+                check(CodexRuntime.browses.isEmpty()&&page.renders==0,"ordinary Telegram started a Codex browse");
+            }
             /** 各组只驱动真实生产方法和保存的原回调，不重写额度决策。 */
             public static void main(String[] args) throws Exception {
-                cacheAndRevisit();firstReadAndRefresh();sourceSwitch();destruction();scopesAndMissing();persistedAndStale();
+                cacheAndRevisit();firstReadAndRefresh();sourceSwitch();destruction();scopesAndMissing();persistedAndStale();browserReturn();
                 System.out.println("PASS SettingsAccountUsageUiTest: cache, source callbacks, revisit, same source, refresh, switch, destroy, scopes");
             }
         """;

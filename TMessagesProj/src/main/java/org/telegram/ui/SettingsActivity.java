@@ -201,6 +201,8 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     private String codexUsageMachine;
     private String codexUsageMachineName;
     private boolean codexUsageSourcesRequested;
+    /** 本页是否已经发起过浏览；先展示缓存不等于已经请求。 */
+    private boolean codexBrowseRequested;
 
     /** 保留原额度子页的参数兼容，根页直接沿原设置行展示额度。 */
     private boolean codexQuota() {
@@ -435,6 +437,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     /** 原入口先接收本地快照，再静默更新；分页结果已由 Runtime 合并，页面不清空已有行。 */
     private void loadCodexBrowser(boolean nextPage) {
         if (!codexBrowser() || codexBrowseLoading) return;
+        codexBrowseRequested = true;
         codexBrowseLoading = true;
         codexBrowseError = null;
         codexBrowseRequestCursor = nextPage ? codexBrowseCursor : null;
@@ -818,7 +821,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return fragmentView = contentView;
     }
 
-    /** 根页回访先显示本地值；只有缺失或过期才后台读取，原电脑子页入口保持。 */
+    /** 根页回访先显示本地值；电脑子页首次仍后台读一次，同一页返回只更新原列表。 */
     @Override
     public void onResume() {
         super.onResume();
@@ -833,7 +836,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         } else if (codexQuotaDetail()) {
             if (codexUsage == null || codexUsage.isStale(System.currentTimeMillis())) loadCodexUsage();
             else updateCodexBrowserItems();
-        } else if (codexBrowser()) loadCodexBrowser(false);
+        } else if (codexBrowser()) {
+            if (!codexBrowseRequested) loadCodexBrowser(false);
+            else updateCodexBrowserItems();
+        }
     }
 
     /** 离开页面后废弃额度和浏览列表的迟到响应。 */
