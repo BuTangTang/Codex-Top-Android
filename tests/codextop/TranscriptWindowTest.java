@@ -65,6 +65,7 @@ public final class TranscriptWindowTest {
         } catch (IOException expected) { }
         attachmentSnapshotsAndEchoes();
         missingTailRecovery();
+        latestPageMissingCachedAnchor();
         emptyProjectedHistory();
         System.out.println("TranscriptWindow: 重叠去重、旧页顺序、完整性与游标校验通过");
     }
@@ -172,6 +173,27 @@ public final class TranscriptWindowTest {
                 || partial.before(0, 10).get(1).id != secondId
                 || !partial.before(0, 10).get(0).message.id.equals("bundle:attachment:2"))
             throw new AssertionError("附件恢复把锚点前成员移到末尾或改变展开身份");
+    }
+
+    /** 旧缓存停在 A，最新页只有 B、C：必须拒绝且不改旧历史，同一页再试仍不前进。 */
+    private static void latestPageMissingCachedAnchor() throws Exception {
+        TranscriptWindow window = new TranscriptWindow();
+        window.prepend(page(item("a"), true, "older-a", null));
+        window = TranscriptWindow.restore(window.snapshot());
+        var before = window.snapshot();
+        int idA = window.before(0, 1).get(0).id;
+        var latest = page(item("b") + "," + item("c"), true, "toward-a", "live-tail");
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                window.recoverTail(latest);
+                throw new AssertionError("第" + attempt + "次缺锚点最新页被接受");
+            } catch (IOException error) {
+                if (error.getMessage() == null || !error.getMessage().contains("最新页缺少缓存连续锚点")) throw error;
+            }
+            if (!before.equals(window.snapshot()) || window.tailCursor != null || !window.needsTailBootstrap()
+                    || window.before(0, 1).get(0).id != idA || !window.before(0, 1).get(0).message.id.equals("a"))
+                throw new AssertionError("缺锚点后旧A、编号或历史游标被改写");
+        }
     }
 
     /** 空投影仍保留真实双向游标；四页预算用尽后保持待续，重开可从旧游标继续。 */

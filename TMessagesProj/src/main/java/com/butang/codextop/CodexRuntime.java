@@ -1583,7 +1583,7 @@ public final class CodexRuntime {
                 + " type=" + cause.getClass().getSimpleName() + " reason=" + reason);
     }
 
-    /** 原聊天页跟随尾部游标并发布真实列表摘要；停止后的旧响应不再投递到页面。 */
+    /** 原聊天页跟随尾部游标并发布真实列表摘要；停止后的旧响应不再投递到页面。缺锚点只在本轮内存沿旧游标补页。 */
     public static void watchConversation(int account, long dialogId) {
         if (loggingOut || !loggedIn() || !ownsConversation(dialogId)) return;
         final long accountEpoch = accountGeneration;
@@ -1593,14 +1593,26 @@ public final class CodexRuntime {
         String remote = remoteIds.get(dialogId);
         Utilities.globalQueue.postRunnable(new Runnable() {
             private int consecutiveTailPages;
+            private TranscriptTailRecovery tailGap;
+            /** 释放本次观察的桥接页；连接、历史或代际变化后不能继续用于别的会话。 */
+            private void releaseTailGap() {
+                if (tailGap != null) {
+                    tailGap.release();
+                    tailGap = null;
+                }
+            }
             /** 跟随增量，旧缓存缺尾游标先连续恢复；失败延后重试，不清空已有正文。 */
             @Override public void run() {
-                if (generation != watchGeneration) return;
+                if (generation != watchGeneration) {
+                    releaseTailGap();
+                    return;
+                }
                 long delay = 2000;
                 try {
                     TranscriptWindow history = histories.get(dialogId);
                     DesktopConnection connection = dialogConnection(dialogId);
                     if (connection == null) {
+                        releaseTailGap();
                         // 离线冷启没有实时连接；回到网络后自动重建，不要求退出聊天手动刷新。
                         AndroidUtilities.runOnUIThread(() -> {
                             if (generation == watchGeneration) refreshDialogs(account);
@@ -1608,37 +1620,65 @@ public final class CodexRuntime {
                         delay = 5000;
                     } else if (history != null && history.loaded) {
                         final boolean bootstrap = history.needsTailBootstrap();
+                        if (tailGap != null && (!bootstrap || !tailGap.matches(connection, history, generation)))
+                            releaseTailGap();
                         final String previousCursor = history.tailCursor;
                         final String previousOlderCursor = history.cursor;
+                        final String bridgeCursor = tailGap == null ? null : tailGap.resumeCursor();
                         final Runnable next = this;
                         // 网络等待离开本地历史队列；同一观察轮只在请求结束后安排下一次。
                         transcriptQueue.postRunnable(() -> {
                             JsonObject page = null;
                             try {
                                 if (generation == watchGeneration && connection == dialogConnection(dialogId))
-                                    page = bootstrap ? connection.transcript(remote) : connection.readAfter(remote, previousCursor);
+                                    page = !bootstrap ? connection.readAfter(remote, previousCursor)
+                                            : bridgeCursor == null ? connection.transcript(remote)
+                                            : connection.transcript(remote, bridgeCursor);
                             } catch (Exception error) {
                                 logTranscriptFailure(bootstrap ? "tail_recovery_request" : "tail_request", error, null);
                                 /* 保留原记录，按失败间隔重试。 */
                             }
                             final JsonObject received = page;
                             Utilities.globalQueue.postRunnable(() -> {
-                                if (generation != watchGeneration) return;
+                                if (generation != watchGeneration) {
+                                    releaseTailGap();
+                                    return;
+                                }
                                 long nextDelay = 5000;
                                 try {
                                     // 返回期间可能换电脑连接或被预取推进游标，旧响应不能回写。
-                                    if (received != null && connection == dialogConnection(dialogId)
+                                    boolean sameWatch = received != null && connection == dialogConnection(dialogId)
                                             && histories.get(dialogId) == history
                                             && java.util.Objects.equals(previousCursor, history.tailCursor)
-                                            && (!bootstrap || java.util.Objects.equals(previousOlderCursor, history.cursor))) {
-                                        ArrayList<TranscriptWindow.Entry> added = bootstrap ? history.recoverTail(received) : history.append(received);
-                                        if (bootstrap || !added.isEmpty() || !java.util.Objects.equals(previousCursor, history.tailCursor))
+                                            && (!bootstrap || java.util.Objects.equals(previousOlderCursor, history.cursor));
+                                    // 网络失败保留已走到的旧游标；身份变化则丢掉暂态页，不能把缺页的B、C先发给界面。
+                                    if (received != null && !sameWatch) releaseTailGap();
+                                    ArrayList<TranscriptWindow.Entry> added = null;
+                                    boolean publish = false;
+                                    if (sameWatch && bootstrap && TranscriptTailRecovery.required(history)
+                                            && (bridgeCursor != null || !TranscriptTailRecovery.containsAnchor(history, received))) {
+                                        if (tailGap == null) tailGap = TranscriptTailRecovery.start(history, connection, generation);
+                                        JsonObject ready = tailGap.accept(received, bridgeCursor);
+                                        if (ready == null) nextDelay = tailGap.continueNow() ? 0 : 2000;
+                                        else {
+                                            added = history.recoverTail(ready);
+                                            releaseTailGap();
+                                            publish = true;
+                                        }
+                                    } else if (sameWatch) {
+                                        releaseTailGap();
+                                        added = bootstrap ? history.recoverTail(received) : history.append(received);
+                                        publish = true;
+                                    }
+                                    if (publish) {
+                                        final ArrayList<TranscriptWindow.Entry> delivered = added;
+                                        if (bootstrap || !delivered.isEmpty() || !java.util.Objects.equals(previousCursor, history.tailCursor))
                                             saveHistory(dialogId, remote, history);
                                         publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
                                         AndroidUtilities.runOnUIThread(() -> {
                                             if (generation != watchGeneration) return;
                                             ArrayList<org.telegram.messenger.MessageObject> incoming = new ArrayList<>();
-                                            for (TranscriptWindow.Entry entry : added) {
+                                            for (TranscriptWindow.Entry entry : delivered) {
                                                 TLRPC.TL_message message = historyMessage(dialogId, entry);
                                                 boolean matched = confirmPendingEcho(account, dialogId, message);
                                                 if (org.telegram.messenger.BuildVars.DEBUG_VERSION && entry.message.outgoing) android.util.Log.i("CodexBridge", "echo_key=" + (entry.message.localId == null ? 0 : entry.message.localId.hashCode()) + " matched=" + matched);
@@ -1666,6 +1706,7 @@ public final class CodexRuntime {
                                 } catch (Exception error) {
                                     logTranscriptFailure(bootstrap ? "tail_recovery_merge" : "tail_merge", error, received);
                                     consecutiveTailPages = 0; /* 无效增量不清空已有正文。 */
+                                    releaseTailGap();
                                 }
                                 if (generation == watchGeneration) Utilities.globalQueue.postRunnable(next, nextDelay);
                             });

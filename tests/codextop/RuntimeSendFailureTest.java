@@ -39,15 +39,18 @@ public final class RuntimeSendFailureTest {
             var compile = new ArrayList<String>();
             compile.addAll(java.util.List.of("-cp", System.getProperty("java.class.path"), "-d", temporary.toString(), probe.toString()));
             for (String model : new String[]{"DesktopAttachment", "TranscriptText", "TranscriptStore", "AttachmentFiles",
-                    "OutboxStore", "BulkTransferCrypto", "AttachmentTransfer", "TranscriptWindow"})
+                    "OutboxStore", "BulkTransferCrypto", "AttachmentTransfer", "TranscriptWindow", "TranscriptTailRecovery"})
                 compile.add(source.resolve(model + ".java").toString());
             String[] stubs = {
                 "package org.telegram.messenger; public class UserConfig {public int lastSendMessageId=-1; private static final UserConfig INSTANCE=new UserConfig(); /** 只返回合成账号。 */ public static UserConfig getInstance(int a){return INSTANCE;} /** 分配合成负编号。 */ public int getNewMessageId(){return --lastSendMessageId;} /** 不写真实账号。 */ public void saveConfig(boolean b){} }",
                 "package org.telegram.messenger; public class MediaDataController {/** 只返回平台替身。 */ public static MediaDataController getInstance(int a){return new MediaDataController();} /** 不接触真实草稿。 */ public void cleanDraft(long d,int m,boolean b){} }",
                 "package org.telegram.messenger; public class FileLoader {/** 读取合成文件名。 */ public static String getDocumentFileName(com.butang.codextop.RuntimeSendFailureProbe.Doc d){return d.name;} }",
-                "package android.os; public class SystemClock {/** 使用本机单调时钟替代Android计时。 */ public static long elapsedRealtime(){return System.nanoTime()/1000000;} }"
+                "package android.os; public class SystemClock {/** 使用本机单调时钟替代Android计时。 */ public static long elapsedRealtime(){return System.nanoTime()/1000000;} }",
+                "package org.telegram.messenger; public class BuildVars {public static final boolean DEBUG_VERSION=false;}",
+                "package android.util; public class Log {/** 不输出合成诊断。 */ public static int w(String tag,String message){return 0;} /** 不输出合成跟随记录。 */ public static int i(String tag,String message){return 0;} }",
+                "package android.widget; public class Toast {public static final int LENGTH_SHORT=0; /** 只替代提示边界，不创建真实界面。 */ public static Toast makeText(Object context,CharSequence text,int duration){return new Toast();} /** 不显示真实系统提示。 */ public void show(){} }"
             };
-            String[] files = {"UserConfig", "MediaDataController", "FileLoader", "SystemClock"};
+            String[] files = {"UserConfig", "MediaDataController", "FileLoader", "SystemClock", "BuildVars", "Log", "Toast"};
             for (int i = 0; i < files.length; i++) {
                 Path file = temporary.resolve(files[i] + ".java"); Files.writeString(file, stubs[i]); compile.add(file.toString());
             }
