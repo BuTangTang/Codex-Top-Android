@@ -149,11 +149,17 @@ public final class CodexPixelThemeTest {
         if (!ok) throw new AssertionError(message);
     }
 
+    /** 桩键取色表与探针的并集，缺字段时仍能编译，避免把编译失败当成对比度 RED。 */
+    private static void collectThemeKeys(LinkedHashSet<String> keys, String source) {
+        Matcher matcher = Pattern.compile("Theme\\.(key_[A-Za-z0-9_]+)").matcher(source);
+        while (matcher.find()) keys.add(matcher.group(1));
+    }
+
     /** 为真实色表生成同名颜色键，不复制主题实现。 */
     private static String themeShell(Path palette) throws Exception {
         LinkedHashSet<String> keys = new LinkedHashSet<>();
-        Matcher matcher = Pattern.compile("Theme\\.(key_[A-Za-z0-9_]+)").matcher(Files.readString(palette));
-        while (matcher.find()) keys.add(matcher.group(1));
+        collectThemeKeys(keys, Files.readString(palette));
+        collectThemeKeys(keys, PROBE);
         StringBuilder keysText = new StringBuilder();
         keysText.append("public static int colorsCount;\n");
         for (String key : keys) keysText.append("public static final int ").append(key).append("=colorsCount++;\n");
@@ -264,8 +270,9 @@ public final class CodexPixelThemeTest {
                     persist();
                     storeFailures();
                     palette();
+                    foreground();
                     wallpaper();
-                    System.out.println("PASS CodexPixelThemeTest: migration, day/night palette, flat wallpaper");
+                    System.out.println("PASS CodexPixelThemeTest: migration, day/night palette, flat wallpaper, foreground contrast");
                 }
                 static void plan(){
                     Theme.CodexPixelThemeMigration manual=Theme.planCodexPixelThemeMigration(true,false,Theme.AUTO_NIGHT_TYPE_NONE,true);
@@ -385,6 +392,96 @@ public final class CodexPixelThemeTest {
                     Theme.copyCodexPixelPalette(blue,"Day",false,false);
                     Theme.copyCodexPixelPalette(blue,null,true,true);
                     check(blue.size()==0,"普通主题或关闭 Codex 时写入了像素色");
+                    check(light.get(Theme.key_chats_unreadCounterText)==0xFFFFFFFF&&dark.get(Theme.key_chats_unreadCounterText)==0xFFFFFFFF,"ON_FILL 不再是白色");
+                }
+                /** Day 资源里这些键是白或浅蓝；覆盖后必须换成色表对应组，并在真实气泡和回复着色上达到 4.5。 */
+                static void foreground(){
+                    SparseIntArray day=new SparseIntArray();
+                    seedDayChrome(day);
+                    Theme.copyCodexPixelPalette(day,"Day",false,true);
+                    assertForeground(day,com.butang.codextop.CodexPixelPalette.light(),false);
+                    SparseIntArray night=new SparseIntArray();
+                    seedDayChrome(night);
+                    Theme.copyCodexPixelPalette(night,"Night",true,true);
+                    assertForeground(night,com.butang.codextop.CodexPixelPalette.dark(),true);
+                    SparseIntArray plain=new SparseIntArray();
+                    seedDayChrome(plain);
+                    Theme.copyCodexPixelPalette(plain,"Blue",false,true);
+                    Theme.copyCodexPixelPalette(plain,"Day",false,false);
+                    check(plain.get(Theme.key_chat_messageLinkOut)==DAY_WHITE&&plain.get(Theme.key_chat_messageLinkIn)==DAY_LINK_IN&&plain.get(Theme.key_chat_outFileInfoText)==DAY_PALE,"普通蓝主题或关闭 Codex 写入了新的前景键");
+                }
+                static final int DAY_WHITE=0xFFFFFFFF,DAY_PALE=0xFFC7E6FF,DAY_LINK_IN=0xFF127ACA;
+                static void seedDayChrome(SparseIntArray colors){
+                    int[] white=new int[]{Theme.key_chat_messageLinkOut,Theme.key_chat_outForwardedNameText,Theme.key_chat_outSiteNameText,Theme.key_chat_outReplyLine,Theme.key_chat_outReplyLine2,Theme.key_chat_outReplyNameText,Theme.key_chat_outReplyMessageText,Theme.key_chat_outFileNameText};
+                    for(int key:white)colors.put(key,DAY_WHITE);
+                    int[] pale=new int[]{Theme.key_chat_outReplyMediaMessageText,Theme.key_chat_outReplyMediaMessageSelectedText,Theme.key_chat_outFileInfoText,Theme.key_chat_outFileInfoSelectedText};
+                    for(int key:pale)colors.put(key,DAY_PALE);
+                    colors.put(Theme.key_chat_messageLinkIn,DAY_LINK_IN);
+                }
+                static void assertForeground(SparseIntArray colors,SparseIntArray palette,boolean dark){
+                    int accent=palette.get(Theme.key_windowBackgroundWhiteBlueText);
+                    int ink=palette.get(Theme.key_chat_messageTextOut);
+                    int secondary=palette.get(Theme.key_chat_outTimeText);
+                    int out=colors.get(Theme.key_chat_outBubble),outSel=colors.get(Theme.key_chat_outBubbleSelected);
+                    int in=colors.get(Theme.key_chat_inBubble),inSel=colors.get(Theme.key_chat_inBubbleSelected);
+                    int line=colors.get(Theme.key_chat_outReplyLine);
+                    contrast(colors.get(Theme.key_chat_messageLinkIn),in,"收到链接/普通气泡");
+                    contrast(colors.get(Theme.key_chat_messageLinkIn),inSel,"收到链接/选中气泡");
+                    contrast(colors.get(Theme.key_chat_messageLinkOut),out,"发出链接/普通气泡");
+                    contrast(colors.get(Theme.key_chat_messageLinkOut),outSel,"发出链接/选中气泡");
+                    contrast(colors.get(Theme.key_chat_outForwardedNameText),out,"转发名/普通气泡");
+                    contrast(colors.get(Theme.key_chat_outForwardedNameText),outSel,"转发名/选中气泡");
+                    contrast(line,out,"回复线/普通气泡");
+                    contrast(line,outSel,"回复线/选中气泡");
+                    contrast(colors.get(Theme.key_chat_outReplyLine2),out,"回复线2/普通气泡");
+                    contrast(colors.get(Theme.key_chat_outReplyLine2),outSel,"回复线2/选中气泡");
+                    contrast(colors.get(Theme.key_chat_outFileNameText),out,"文件名/普通气泡");
+                    contrast(colors.get(Theme.key_chat_outFileNameText),outSel,"文件名/选中气泡");
+                    contrast(colors.get(Theme.key_chat_outFileInfoText),out,"文件说明/普通气泡");
+                    contrast(colors.get(Theme.key_chat_outFileInfoText),outSel,"文件说明/选中气泡");
+                    contrast(colors.get(Theme.key_chat_outFileInfoSelectedText),out,"选中文件说明/普通气泡");
+                    contrast(colors.get(Theme.key_chat_outFileInfoSelectedText),outSel,"选中文件说明/选中气泡");
+                    int reply=replyBackground(line,out,dark),replySel=replyBackground(line,outSel,dark);
+                    int[] replyText=new int[]{Theme.key_chat_outReplyNameText,Theme.key_chat_outReplyMessageText,Theme.key_chat_outSiteNameText,Theme.key_chat_outReplyMediaMessageText,Theme.key_chat_outReplyMediaMessageSelectedText};
+                    for(int key:replyText){
+                        contrast(colors.get(key),reply,"回复块/普通合成底");
+                        contrast(colors.get(key),replySel,"回复块/选中合成底");
+                    }
+                    check(colors.get(Theme.key_chat_messageLinkIn)==accent&&colors.get(Theme.key_chat_messageLinkOut)==accent&&colors.get(Theme.key_chat_outForwardedNameText)==accent&&line==accent&&colors.get(Theme.key_chat_outReplyLine2)==accent,"链接、转发名或回复线没有使用 accentText");
+                    check(colors.get(Theme.key_chat_outReplyNameText)==ink&&colors.get(Theme.key_chat_outSiteNameText)==ink&&colors.get(Theme.key_chat_outReplyMessageText)==ink&&colors.get(Theme.key_chat_outFileNameText)==ink&&colors.get(Theme.key_chat_outReplyMediaMessageText)==ink&&colors.get(Theme.key_chat_outReplyMediaMessageSelectedText)==ink,"回复名、正文、媒体说明或站点名没有使用 ink");
+                    check(colors.get(Theme.key_chat_outFileInfoText)==secondary&&colors.get(Theme.key_chat_outFileInfoSelectedText)==secondary,"文件说明没有使用 secondary");
+                }
+                /** 与 ReplyMessageLine 相同：线条色乘 10% 浅色或 12% 深色后盖在气泡上。 */
+                static int replyBackground(int line,int bubble,boolean dark){
+                    int tint=multAlpha(line|0xFF000000,dark?0.12f:0.10f);
+                    float sa=((tint>>>24)&255)/255f;
+                    int r=(int)(((tint>>>16)&255)*sa+((bubble>>>16)&255)*(1f-sa));
+                    int g=(int)(((tint>>>8)&255)*sa+((bubble>>>8)&255)*(1f-sa));
+                    int b=(int)((tint&255)*sa+(bubble&255)*(1f-sa));
+                    return 0xFF000000|(r<<16)|(g<<8)|b;
+                }
+                static int multAlpha(int color,float multiply){
+                    if(multiply==1f)return color;
+                    int alpha=(int)(((color>>>24)&255)*multiply);
+                    if(alpha<0)alpha=0;
+                    if(alpha>255)alpha=255;
+                    return (alpha<<24)|(color&0x00FFFFFF);
+                }
+                static void contrast(int foreground,int background,String where){
+                    double ratio=contrastRatio(foreground,background);
+                    check(ratio>=4.5,where+" 对比 "+ratio+" 低于 4.5");
+                }
+                static double contrastRatio(int foreground,int background){
+                    double hi=luminance(foreground),lo=luminance(background);
+                    if(hi<lo){double swap=hi;hi=lo;lo=swap;}
+                    return (hi+0.05)/(lo+0.05);
+                }
+                static double luminance(int color){
+                    return 0.2126*channel((color>>>16)&255)+0.7152*channel((color>>>8)&255)+0.0722*channel(color&255);
+                }
+                static double channel(int value){
+                    double c=value/255.0;
+                    return c<=0.04045?c/12.92:Math.pow((c+0.055)/1.055,2.4);
                 }
                 static void wallpaper(){
                     SparseIntArray colors=new SparseIntArray();
