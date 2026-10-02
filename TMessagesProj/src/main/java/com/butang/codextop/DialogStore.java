@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.function.BooleanSupplier;
 
 /** 保存最近列表及其电脑归属；缓存仅用于浏览，不证明电脑在线。 */
 public final class DialogStore {
@@ -46,13 +47,25 @@ public final class DialogStore {
         validate(snapshot);
         writeJson(file, snapshot);
     }
-    /** 浏览缓存沿用临时文件加原子替换；失败不会先删除上一份快照。 */
+    /** 原调用不查守卫，写入和替换行为与以前相同。 */
     static void writeJson(File file, JsonObject snapshot) throws IOException {
+        writeJson(file, snapshot, null);
+    }
+
+    /**
+     * 仍是原来的一次原子写入。守卫只在写临时文件前、以及临时文件写完后、原子替换前各看一次。
+     * 这不是跨线程身份锁，也不保证检查之后到替换完成之间的文件系统或整段队列。
+     * 守卫拒绝时返回 false，原文件保留，临时文件由 finally 清掉。
+     */
+    static boolean writeJson(File file, JsonObject snapshot, BooleanSupplier stillCurrent) throws IOException {
         Files.createDirectories(file.getParentFile().toPath());
         File temporary = new File(file.getPath() + ".tmp");
         try {
+            if (stillCurrent != null && !stillCurrent.getAsBoolean()) return false;
             Files.write(temporary.toPath(), snapshot.toString().getBytes(StandardCharsets.UTF_8));
+            if (stillCurrent != null && !stillCurrent.getAsBoolean()) return false;
             Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            return true;
         } finally { Files.deleteIfExists(temporary.toPath()); }
     }
 }

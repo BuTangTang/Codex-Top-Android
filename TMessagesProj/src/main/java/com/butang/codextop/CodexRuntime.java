@@ -1270,6 +1270,65 @@ public final class CodexRuntime {
                 "codex-account-usage"), owner.server, owner.accountId);
     }
 
+    static {
+        SessionStatus.onConfirmedGoal(CodexRuntime::rememberAcceptedGoal);
+    }
+
+    /** 目标投影单独放在 codex-goals，避免和额度目录里的 scope.json 撞名。 */
+    private static GoalDisplayStore goalDisplayStore(PasswordLogin.Session owner) {
+        return new GoalDisplayStore(new File(ApplicationLoader.applicationContext.getNoBackupFilesDir(),
+                "codex-goals"), owner.server, owner.accountId);
+    }
+
+    /** 入队时记下的身份仍有效。linked 还未知时不因此拒绝；已经知道的值变了就拒绝。 */
+    private static boolean goalCacheIdentityCurrent(long epoch, PasswordLogin.Session owner, long dialogId,
+            String machine, String remote, String linked, String sourceKind, String sourceHome) {
+        if (session != owner || !isAccountCurrent(epoch)) return false;
+        if (!java.util.Objects.equals(machine, dialogMachines.get(dialogId))
+                || !java.util.Objects.equals(remote, remoteIds.get(dialogId))) return false;
+        if (linked != null && !linked.equals(linkedSessions.get(dialogId))) return false;
+        JsonObject source = DesktopConnection.userCodexSource();
+        return sourceKind.equals(source.get("kind").getAsString()) && sourceHome.equals(source.get("home").getAsString());
+    }
+
+    /** 界面已经接受的不可变目标进入原全局队列。返回页面后不再要求当前还停在这个对话。 */
+    private static void rememberAcceptedGoal(long dialogId, String machine, String remote, SessionStatus.Goal goal) {
+        final long epoch = accountGeneration;
+        final PasswordLogin.Session owner = session;
+        final String linked = linkedSessions.get(dialogId);
+        JsonObject source = DesktopConnection.userCodexSource();
+        final String sourceKind = source.get("kind").getAsString();
+        final String sourceHome = source.get("home").getAsString();
+        Utilities.globalQueue.postRunnable(() -> {
+            if (!goalCacheIdentityCurrent(epoch, owner, dialogId, machine, remote, linked, sourceKind, sourceHome)) return;
+            try {
+                goalDisplayStore(owner).save(machine, remote, sourceKind, sourceHome, goal.availability, goal.objective,
+                        goal.status, goal.tokenBudget, goal.tokensUsed, goal.timeUsedSeconds, goal.updatedAt,
+                        () -> goalCacheIdentityCurrent(epoch, owner, dialogId, machine, remote, linked, sourceKind, sourceHome));
+            } catch (java.io.IOException error) { /* 原子写失败保留原文件和已经接受的内存事实。 */ }
+        });
+    }
+
+    /** 绑定之后把上次目标填进尚未确认的槽。磁盘任务不读取内存状态，界面线程才写回事实。 */
+    private static void scheduleGoalRestore(long dialogId, String machine, String remote, PasswordLogin.Session owner, long epoch) {
+        final String linked = linkedSessions.get(dialogId);
+        JsonObject source = DesktopConnection.userCodexSource();
+        final String sourceKind = source.get("kind").getAsString();
+        final String sourceHome = source.get("home").getAsString();
+        Utilities.globalQueue.postRunnable(() -> {
+            if (!goalCacheIdentityCurrent(epoch, owner, dialogId, machine, remote, linked, sourceKind, sourceHome)) return;
+            GoalDisplayStore.Record record = goalDisplayStore(owner).find(machine, remote, sourceKind, sourceHome);
+            if (record == null) return;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!goalCacheIdentityCurrent(epoch, owner, dialogId, machine, remote, linked, sourceKind, sourceHome)) return;
+                if (!statuses.offerCachedGoal(dialogId, machine, record.availability, record.objective, record.status,
+                        record.tokenBudget, record.tokensUsed, record.timeUsedSeconds, record.updatedAt)) return;
+                NotificationCenter.getInstance(org.telegram.messenger.UserConfig.selectedAccount)
+                        .postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
+            });
+        });
+    }
+
     /** 原通用队列先恢复本地；回调仍经账号代次检查，不能覆盖已到达的新采集或明确选择。 */
     private static void restoreAccountUsageCache(PasswordLogin.Session owner, long epoch) {
         if (!isAccountCurrent(epoch) || session != owner || accountUsageRestoredEpoch == epoch) return;
@@ -2210,6 +2269,12 @@ public final class CodexRuntime {
     private static void publishDialogFacts(long dialogId, String machine, JsonObject candidate,
             long startedAt, long receivedAt, boolean cached) {
         statuses.candidate(dialogId, machine, candidate, startedAt, receivedAt, cached);
+        com.google.gson.JsonElement remoteValue = candidate.get("remoteSessionId");
+        String remote = remoteValue != null && remoteValue.isJsonPrimitive() && remoteValue.getAsJsonPrimitive().isString()
+                ? remoteValue.getAsString() : "";
+        PasswordLogin.Session owner = session;
+        if (owner != null && !remote.isEmpty() && statuses.claimGoalRestore(dialogId, machine))
+            scheduleGoalRestore(dialogId, machine, remote, owner, accountGeneration);
         String title = candidate.has("title") && candidate.get("title").isJsonPrimitive()
                 ? candidate.get("title").getAsString() : "未命名对话";
         if (cached) {

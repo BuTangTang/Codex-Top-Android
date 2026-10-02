@@ -9,6 +9,7 @@ public final class SessionStatusTest {
             return;
         }
         goalFacts();
+        cacheFacts();
         check("{\"ok\":true,\"machineOnline\":true,\"runnerActive\":true,\"activity\":\"running\"}", "状态未知");
         check("{\"ok\":true,\"machineOnline\":false}", "电脑离线");
         String base = "{\"ok\":true,\"machineOnline\":true,\"observation\":";
@@ -331,6 +332,121 @@ public final class SessionStatusTest {
         goalField(store,5,2002,"availability","unsupported");
         store.clear();goalField(store,5,2003,"availability","unsupported");
         System.out.println("SessionStatus goal: 原STATUS独立15秒、LIST不续期、unknown/none/缺失、严格安全整数与来源通过");
+    }
+
+    /** 冷盘只填尚未被当前 available/none 确认的目标槽，不改请求顺序、提问身份或生命周期。 */
+    private static void cacheFacts() throws Exception {
+        SessionStatus.Store store=new SessionStatus.Store();
+        store.candidate(1,"machine",candidate("running",""),10,11,true);
+        var before=store.get(1,12);
+        check(offer(store,1,"machine","available","磁盘目标","active",1L,null,2L,9), "未触碰目标拒绝上次可用目标");
+        goalField(store,1,13,"availability","available");
+        goalField(store,1,13,"validity","stale");
+        goalField(store,1,13,"objective","磁盘目标");
+        goalField(store,1,13,"startedAtElapsedMs",-1L);
+        Object cached=goal(store,1,13);
+        String label=String.valueOf(field(cached,"label"));
+        check(label.contains("上次")&&label.contains("目标进行中")&&label.contains("目标信息暂不可用"), "上次目标缺少失效原因");
+        var after=store.get(1,13);
+        check(before.state.equals(after.state)&&before.questionIds.equals(after.questionIds)&&before.observedAtElapsedMs==after.observedAtElapsedMs
+                &&!"current".equals(after.goal.validity), "冷盘改写生命周期、提问或把缓存标成当前");
+        store.candidate(1,"machine",candidate("completed",""),1000,1010,false);
+        goalField(store,1,20000,"validity","stale");
+        goalField(store,1,20000,"startedAtElapsedMs",-1L);
+        goalField(store,1,20000,"objective","磁盘目标");
+        store.candidate(2,"machine",candidate("running",""),10,11,true);
+        check(offer(store,2,"machine","none","","",null,null,null,-1), "未触碰目标拒绝上次明确无目标");
+        goalField(store,2,12,"availability","none");
+        goalField(store,2,12,"validity","stale");
+        goalField(store,2,12,"objective","");
+        goalField(store,2,12,"startedAtElapsedMs",-1L);
+        check(String.valueOf(field(goal(store,2,12),"label")).contains("没有目标"), "上次无目标被写成可用目标");
+        check(!offer(store,2,"other","available","别的电脑","active",null,null,null,1), "其他电脑缓存写入本对话");
+        SessionStatus.Store live=new SessionStatus.Store();
+        observeGoal(live,3,"machine","remote","{\"availability\":\"unknown\"}",100,110);
+        check(offer(live,3,"machine","available","上次目标","paused",null,4L,null,8), "未知事实之前的冷盘不能补上次目标");
+        goalField(live,3,113,"objective","上次目标");
+        goalField(live,3,113,"validity","stale");
+        goalField(live,3,113,"startedAtElapsedMs",-1L);
+        check(String.valueOf(field(goal(live,3,113),"label")).contains("目标未知"), "冷盘丢掉本次未知原因");
+        observeGoal(live,3,"machine","remote",available("active","1","1","1","0").replace("真实目标","更早目标"),99,120);
+        goalField(live,3,121,"objective","上次目标");
+        observeGoal(live,3,"machine","remote",available("active","1","1","1","0").replace("真实目标","新的当前目标"),101,130);
+        goalField(live,3,131,"objective","新的当前目标");
+        goalField(live,3,131,"validity","current");
+        var response=JsonParser.parseString("{\"ok\":true,\"machineOnline\":true,\"observation\":{\"v\":1,\"source\":\"desktop\",\"turnId\":\"turn\",\"state\":\"needs_input\",\"requests\":[{\"requestId\":\"q1\",\"kind\":\"user_action_request\"}]},\"goal\":{\"availability\":\"unknown\"}}").getAsJsonObject();
+        live.observation(4,"machine","remote",response,100,111);
+        var pending=live.get(4,112);
+        check(offer(live,4,"machine","available","上次目标","paused",null,4L,null,8), "待回复槽拒绝上次目标");
+        var restored=live.get(4,112);
+        check(pending.state.equals(restored.state)&&pending.pendingKind.equals(restored.pendingKind)&&pending.validity.equals(restored.validity)
+                &&pending.source.equals(restored.source)&&pending.turnId.equals(restored.turnId)&&pending.label.equals(restored.label)
+                &&pending.eventAtMs==restored.eventAtMs&&pending.checkedAtMs==restored.checkedAtMs
+                &&pending.observedAtElapsedMs==restored.observedAtElapsedMs&&pending.questionIds.equals(restored.questionIds)
+                &&pending.questionIds.contains("q1")&&"needs_input".equals(restored.state), "冷盘改写了同一待回复槽的原字段");
+        goalField(live,4,112,"objective","上次目标");
+        goalField(live,4,112,"validity","stale");
+        goalField(live,4,112,"startedAtElapsedMs",-1L);
+        observeGoal(live,5,"machine","remote","{\"availability\":\"none\",\"source\":\"desktop\"}",200,201);
+        observeGoal(live,5,"machine","remote","{\"availability\":\"unknown\"}",210,211);
+        check(!offer(live,5,"machine","available","旧磁盘目标","active",null,null,null,1), "none之后的unknown仍接受旧磁盘目标");
+        goalField(live,5,212,"objective","");
+        goalField(live,5,212,"availability","unknown");
+        observeGoal(live,6,"machine","remote",available("active","1","1","1","0"),300,301);
+        check(!offer(live,6,"machine","available","迟到磁盘","paused",null,null,null,1), "当前目标被迟到磁盘覆盖");
+        goalField(live,6,302,"objective","真实目标");
+        goalField(live,6,302,"status","active");
+        observeGoal(live,7,"machine","remote","{\"availability\":\"none\",\"source\":\"desktop\"}",400,401);
+        check(!offer(live,7,"machine","available","迟到磁盘","active",null,null,null,1), "明确无目标被迟到磁盘复活");
+        goalField(live,7,402,"availability","none");
+        live.candidate(8,"machine",candidate("running",""),10,11,true);
+        live.unavailable("machine",12);
+        check(offer(live,8,"machine","available","断连前上次","blocked",null,null,null,3), "断连未知槽拒绝上次目标");
+        check(String.valueOf(field(goal(live,8,13),"label")).contains("连接暂不可用")
+                &&"stale".equals(String.valueOf(field(goal(live,8,13),"validity"))), "断连冷盘缺少实际不可用原因");
+        StringBuilder longGoal=new StringBuilder();
+        for(int i=0;i<10001;i++)longGoal.append('长');
+        observeGoal(live,9,"machine","remote",available("active","1","1","1","0").replace("真实目标",longGoal.toString()),500,501);
+        goalField(live,9,502,"objective",longGoal.toString());
+        goalField(live,9,502,"validity","current");
+        SessionStatus.Store once=new SessionStatus.Store();
+        once.candidate(10,"machine",candidate("running",""),10,11,true);
+        check(once.claimGoalRestore(10,"machine")&&!once.claimGoalRestore(10,"machine"), "第一次冷恢复没有认领或重复认领");
+        observeGoal(once,10,"machine","remote","{\"availability\":\"unknown\"}",20,21);
+        check(!once.claimGoalRestore(10,"machine"), "未知合并清掉了冷恢复认领");
+        once.listFailed("machine",40);
+        check(!once.claimGoalRestore(10,"machine"), "列表失败重新认领冷恢复");
+        once.candidate(10,"machine",candidate("completed",""),1000,1010,false);
+        check(!once.claimGoalRestore(10,"machine"), "再次列表重新认领冷恢复");
+        check(offer(once,10,"machine","available","只读一次","active",null,null,null,1), "已认领的未确认槽不能接受第一次冷盘");
+        goalField(once,10,20000,"validity","stale");
+        goalField(once,10,20000,"startedAtElapsedMs",-1L);
+        goalField(once,10,20000,"objective","只读一次");
+        once.candidate(10,"machine",candidate("running",""),3000,3010,false);
+        check(!once.claimGoalRestore(10,"machine"), "恢复后的列表再次读盘");
+        goalField(once,10,40000,"validity","stale");
+        goalField(once,10,40000,"startedAtElapsedMs",-1L);
+        goalField(once,10,40000,"objective","只读一次");
+        SessionStatus.Store dropped=new SessionStatus.Store();
+        dropped.candidate(10,"machine",candidate("running",""),10,11,true);
+        check(dropped.claimGoalRestore(10,"machine"), "断连前不能认领");
+        dropped.unavailable("machine",50);
+        check(!dropped.claimGoalRestore(10,"machine"), "断连清掉冷恢复认领并导致重读");
+        dropped.candidate(10,"other-machine",candidate("running",""),60,61,false);
+        check(dropped.claimGoalRestore(10,"other-machine")&&!dropped.claimGoalRestore(10,"other-machine"), "换电脑没有重新开始一次冷恢复");
+        dropped.clear();
+        dropped.candidate(10,"machine",candidate("running",""),70,71,true);
+        check(dropped.claimGoalRestore(10,"machine"), "清空账号后不能重新认领");
+        System.out.println("SessionStatus goal cache: 冷盘available/none、身份不匹配、当前事实优先与长目标展示通过");
+    }
+
+    /** 布尔结果失败直接抛出真实边界。 */
+    private static void check(boolean value,String reason) { if(!value) throw new AssertionError(reason); }
+
+    /** 调用原Store的冷盘入口；修复前缺少该方法即失败。 */
+    private static boolean offer(SessionStatus.Store store,long id,String machine,String availability,String objective,String status,Long budget,Long tokens,Long seconds,long updated) throws Exception {
+        return (boolean)SessionStatus.Store.class.getMethod("offerCachedGoal",long.class,String.class,String.class,String.class,String.class,Long.class,Long.class,Long.class,long.class)
+                .invoke(store,id,machine,availability,objective,status,budget,tokens,seconds,updated);
     }
 
     /** 只构造协议输入，不复制生产目标判定。 */

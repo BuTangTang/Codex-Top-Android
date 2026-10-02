@@ -354,14 +354,20 @@ public final class DesktopConnection implements AutoCloseable {
         return AccountUsage.parse(rpc("daemon.directSessions.accountUsage.read", params).getAsJsonObject("result"));
     }
 
+    /** 用户 Codex 来源只有这一处。状态请求和目标缓存都用它，不另猜家目录。 */
+    static JsonObject userCodexSource() {
+        JsonObject source = new JsonObject();
+        source.addProperty("kind", "codexHome");
+        source.addProperty("home", "user");
+        return source;
+    }
+
     /** 构造已支持的用户 Codex 来源，不新增源路径猜测。 */
     private JsonObject base(String remoteSessionId) {
         JsonObject params = new JsonObject();
         params.addProperty("machineId", machineId);
         params.addProperty("providerId", "codex");
-        JsonObject source = new JsonObject();
-        source.addProperty("kind", "codexHome"); source.addProperty("home", "user");
-        params.add("source", source);
+        params.add("source", userCodexSource());
         if (remoteSessionId != null) params.addProperty("remoteSessionId", remoteSessionId);
         return params;
     }

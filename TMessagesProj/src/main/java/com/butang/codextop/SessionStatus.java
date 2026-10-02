@@ -75,6 +75,16 @@ public final class SessionStatus {
         }
     }
 
+    /** 当前 available 或 none 被接受后通知原运行时入队，不在这里保存第二份事实。 */
+    public interface ConfirmedGoal {
+        void accepted(long dialogId, String machine, String remote, Goal goal);
+    }
+
+    private static volatile ConfirmedGoal confirmedGoal;
+
+    /** 由 CodexRuntime 安装一次。测试可换成同一个入队方法。 */
+    public static void onConfirmedGoal(ConfirmedGoal listener) { confirmedGoal = listener; }
+
     /** 仅由界面线程读写；本机 dialogId 已由账号及电脑身份 owner 隔离。 */
     public static final class Store {
         private final Map<Long, Entry> entries = new HashMap<>();
@@ -84,14 +94,20 @@ public final class SessionStatus {
         private static final class Entry {
             final String machine;
             final long startedAt, goalRequestedAt;
+            final boolean confirmedGoal, goalRestoreAttempted;
             final Snapshot snapshot;
             /** 合并本机请求顺序与来源归属，不存消息正文。 */
             Entry(String machine, long startedAt, Snapshot snapshot) {
-                this(machine,startedAt,-1,snapshot);
+                this(machine,startedAt,-1,false,false,snapshot);
             }
             /** 原Entry同时保留目标响应排序边界，不另建缓存或轮询owner。 */
             Entry(String machine, long startedAt, long goalRequestedAt, Snapshot snapshot) {
-                this.machine=machine; this.startedAt=startedAt; this.goalRequestedAt=goalRequestedAt; this.snapshot=snapshot;
+                this(machine,startedAt,goalRequestedAt,false,false,snapshot);
+            }
+            /** 确认过当前目标后，迟到磁盘不能再填这个槽。冷恢复只认领一次。 */
+            Entry(String machine, long startedAt, long goalRequestedAt, boolean confirmedGoal, boolean goalRestoreAttempted, Snapshot snapshot) {
+                this.machine=machine; this.startedAt=startedAt; this.goalRequestedAt=goalRequestedAt;
+                this.confirmedGoal=confirmedGoal; this.goalRestoreAttempted=goalRestoreAttempted; this.snapshot=snapshot;
             }
         }
 
@@ -121,14 +137,56 @@ public final class SessionStatus {
             Snapshot snapshot=previous!=null&&startedAt<previous.startedAt?previous.snapshot:responseSnapshot(response,receivedAt);
             long stateStartedAt=previous!=null&&startedAt<previous.startedAt?previous.startedAt:startedAt;
             long goalRequestedAt=previous==null?-1:previous.goalRequestedAt;
+            boolean confirmed=previous!=null&&previous.confirmedGoal;
+            boolean goalRestoreAttempted=previous!=null&&previous.goalRestoreAttempted;
             Goal goal=previous==null?snapshot.goal:previous.snapshot.goal;
+            Goal accepted=null;
             if(startedAt>=goalRequestedAt) {
                 Goal observed=goalSnapshot(response,remote,startedAt);
+                boolean currentFact="current".equals(observed.validity)
+                        &&("available".equals(observed.availability)||"none".equals(observed.availability));
                 if(!"current".equals(observed.validity)&&goal.hasValue())
                     observed=goal.invalid(observed.availability,observed.validity,observed.label);
                 goal=observed; goalRequestedAt=startedAt;
+                if(currentFact) { confirmed=true; accepted=goal; }
             }
-            entries.put(dialogId,new Entry(machine,stateStartedAt,goalRequestedAt,snapshot.withGoal(goal)));
+            entries.put(dialogId,new Entry(machine,stateStartedAt,goalRequestedAt,confirmed,goalRestoreAttempted,snapshot.withGoal(goal)));
+            if(accepted!=null&&SessionStatus.confirmedGoal!=null)
+                SessionStatus.confirmedGoal.accepted(dialogId,machine,remote,accepted);
+        }
+
+        /**
+         * 只把上次目标放进还没有当前 available/none 的槽。
+         * 不改请求顺序、提问身份和生命周期；新的当前事实之后返回 false。
+         */
+        public boolean offerCachedGoal(long dialogId, String machine, String availability, String objective, String status,
+                Long tokenBudget, Long tokensUsed, Long timeUsedSeconds, long updatedAt) {
+            Entry entry=entries.get(dialogId);
+            if(entry==null||!entry.machine.equals(machine)||entry.confirmedGoal) return false;
+            Goal current=entry.snapshot.goal;
+            boolean untouched=!current.hasValue()&&("unsupported".equals(current.availability)
+                    ||"unknown".equals(current.availability)||"unavailable".equals(current.availability));
+            if(!untouched) return false;
+            Goal remembered=remembered(availability,objective,status,tokenBudget,tokensUsed,timeUsedSeconds,updatedAt,current.label);
+            if(remembered==null) return false;
+            entries.put(dialogId,new Entry(entry.machine,entry.startedAt,entry.goalRequestedAt,false,entry.goalRestoreAttempted,
+                    entry.snapshot.withGoal(remembered)));
+            return true;
+        }
+
+        /**
+         * 只为绑定后的第一个未确认槽认领一次冷恢复。
+         * 认领记在原条目上，随后的合并保留它；换电脑或清空账号才会重新开始。
+         */
+        public boolean claimGoalRestore(long dialogId, String machine) {
+            Entry entry=entries.get(dialogId);
+            if(entry==null||!entry.machine.equals(machine)||entry.goalRestoreAttempted||entry.confirmedGoal) return false;
+            Goal current=entry.snapshot.goal;
+            boolean untouched=!current.hasValue()&&("unsupported".equals(current.availability)
+                    ||"unknown".equals(current.availability)||"unavailable".equals(current.availability));
+            if(!untouched) return false;
+            entries.put(dialogId,new Entry(entry.machine,entry.startedAt,entry.goalRequestedAt,entry.confirmedGoal,true,entry.snapshot));
+            return true;
         }
 
         /** 合并规则只使用同一手机的请求顺序，不比较跨端墙钟。 */
@@ -137,10 +195,10 @@ public final class SessionStatus {
             Entry previous = entries.get(dialogId);
             if (disconnected != null && startedAt <= disconnected) return;
             if (previous != null && startedAt < previous.startedAt) return;
-            if(previous!=null&&previous.machine.equals(machine))
-                snapshot=snapshot.withGoal(previous.snapshot.goal);
-            entries.put(dialogId, new Entry(machine, startedAt,
-                    previous!=null&&previous.machine.equals(machine)?previous.goalRequestedAt:-1,snapshot));
+            boolean same=previous!=null&&previous.machine.equals(machine);
+            if(same) snapshot=snapshot.withGoal(previous.snapshot.goal);
+            entries.put(dialogId, new Entry(machine, startedAt, same?previous.goalRequestedAt:-1,
+                    same&&previous.confirmedGoal, same&&previous.goalRestoreAttempted, snapshot));
         }
 
         /** LIST 失败只失效尚未被更新观察替代的条目，不建立整机断连边界。 */
@@ -148,7 +206,7 @@ public final class SessionStatus {
             for (Map.Entry<Long, Entry> item : entries.entrySet()) {
                 Entry entry = item.getValue();
                 if (entry.machine.equals(machine) && entry.startedAt <= startedAt)
-                    item.setValue(new Entry(machine, startedAt, entry.goalRequestedAt,
+                    item.setValue(new Entry(machine, startedAt, entry.goalRequestedAt, entry.confirmedGoal, entry.goalRestoreAttempted,
                             entry.snapshot.invalid("unavailable", "状态暂不可用")));
             }
         }
@@ -158,7 +216,7 @@ public final class SessionStatus {
             unavailableAt.put(machine, Math.max(now, unavailableAt.getOrDefault(machine, -1L)));
             for (Map.Entry<Long, Entry> item : entries.entrySet()) {
                 Entry entry = item.getValue();
-                if (entry.machine.equals(machine)) item.setValue(new Entry(machine, entry.startedAt, entry.goalRequestedAt,
+                if (entry.machine.equals(machine)) item.setValue(new Entry(machine, entry.startedAt, entry.goalRequestedAt, entry.confirmedGoal, entry.goalRestoreAttempted,
                         entry.snapshot.invalid("unavailable", "连接暂不可用").withGoal(
                                 entry.snapshot.goal.invalid(entry.snapshot.goal.availability,"unavailable","连接暂不可用"))));
             }
@@ -180,6 +238,18 @@ public final class SessionStatus {
 
         /** 账号退出清空展示事实和断连边界，不让下一账号继承状态。 */
         public void clear() { entries.clear(); unavailableAt.clear(); }
+    }
+
+    /** 磁盘目标永远不是当前事实，时钟用 -1，文案同时带上次状态和这次不可用原因。 */
+    private static Goal remembered(String availability, String objective, String status, Long tokenBudget, Long tokensUsed,
+            Long timeUsedSeconds, long updatedAt, String reason) {
+        String known="none".equals(availability)?"没有目标":goalLabel(status);
+        if(known==null||reason==null||reason.isEmpty()) return null;
+        if("available".equals(availability)) {
+            if(objective==null||objective.isEmpty()) return null;
+        } else if(!"none".equals(availability)||objective!=null&&!objective.isEmpty()) return null;
+        return new Goal(availability,"stale","desktop","",objective==null?"":objective,status==null?"":status,
+                tokenBudget,tokensUsed,timeUsedSeconds,updatedAt,-1,"上次："+known+" · "+reason);
     }
 
     /** 无事实、明确没有目标及旧daemon缺字段保持不同，不把解析失败伪装成none。 */

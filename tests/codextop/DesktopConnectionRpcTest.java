@@ -22,7 +22,7 @@ public final class DesktopConnectionRpcTest {
         StringBuilder methods = new StringBuilder();
         int extracted = 0;
         var names=Set.of("rpc","candidates","base","isConnected","failPending","close",
-                "attachmentUploadMaxBytes","clearAttachmentUploadLimit","status");
+                "attachmentUploadMaxBytes","clearAttachmentUploadLimit","status","userCodexSource");
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
             if (names.contains(method.getNameAsString())) { methods.append(method).append('\n'); extracted++; }
         }
@@ -166,6 +166,10 @@ public final class DesktopConnectionRpcTest {
                 try{goalResponse=(JsonObject)goalProbe.getClass().getMethod("status",String.class,String.class,boolean.class).invoke(goalProbe,"synthetic-remote","synthetic-linked",true);}
                 catch(NoSuchMethodException absent){goalResponse=goalProbe.status("synthetic-remote","synthetic-linked");}
                 JsonObject goalParams=JsonParser.parseString(goalProbe.socket.request.getString("params").substring(Crypto.PREFIX.length())).getAsJsonObject();
+                JsonObject descriptor=userCodexSource();
+                check(goalParams.getAsJsonObject("source").equals(descriptor)&&descriptor.size()==2
+                        &&"codexHome".equals(descriptor.get("kind").getAsString())&&"user".equals(descriptor.get("home").getAsString()),
+                        "STATUS与缓存没有共用原来源描述");
                 check(goalParams.has("includeGoal")&&goalParams.get("includeGoal").getAsBoolean(),"当前STATUS没有显式目标opt-in");
                 check(goalProbe.socket.emitted==2&&"synthetic-remote".equals(goalParams.get("remoteSessionId").getAsString())
                         &&"synthetic-linked".equals(goalParams.get("sessionId").getAsString())&&goalParams.getAsJsonObject("source").get("kind").getAsString().equals("codexHome"),"目标读取增加RPC或丢失原身份");
