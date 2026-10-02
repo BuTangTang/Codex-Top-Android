@@ -35,14 +35,20 @@ public final class RuntimeQuestionRefreshTest {
             Path probe = temporary.resolve("QuestionRefreshProbe.java"), prefs = temporary.resolve("SharedPreferences.java");
             Files.writeString(probe, FIXTURE + methods + SCENARIOS + (hasRefresh ? REFRESH_SCENARIOS : "") + "\n}");
             Files.writeString(prefs, "package android.content; public interface SharedPreferences {boolean contains(String k);String getString(String k,String d);Editor edit();interface Editor {Editor putString(String k,String v);Editor remove(String k);boolean commit();}}");
+            Files.writeString(temporary.resolve("UserConfig.java"), "package org.telegram.messenger; public class UserConfig { public static int selectedAccount; }");
+            Files.writeString(temporary.resolve("SystemClock.java"), "package android.os; public final class SystemClock { public static long elapsed; private SystemClock() {} public static long elapsedRealtime() { return elapsed; } }");
             ArrayList<String> compile = new ArrayList<>(java.util.List.of("-cp", System.getProperty("java.class.path"),
                     "-d", temporary.toString(), probe.toString(), prefs.toString(),
+                    temporary.resolve("UserConfig.java").toString(), temporary.resolve("SystemClock.java").toString(),
                     source.resolve("DesktopQuestion.java").toString(), source.resolve("SessionStatus.java").toString()));
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(String[]::new)) != 0)
                 throw new AssertionError("真实提问方法夹具编译失败");
             try (var loader = new URLClassLoader(new java.net.URL[]{temporary.toUri().toURL()}, RuntimeQuestionRefreshTest.class.getClassLoader())) {
                 Class<?> type = loader.loadClass("com.butang.codextop.QuestionRefreshProbe");
-                for (String method : hasRefresh ? new String[]{"main", "refreshScenarios"} : new String[]{"main"}) {
+                for (String method : hasRefresh ? new String[]{"main", "refreshScenarios", "staleScenarios", "linkedScenarios",
+                        "readIdentityScenarios", "identityScenarios", "openBootstrapScenarios", "deadlineScenarios",
+                        "knownLinkedScenarios"}
+                        : new String[]{"main"}) {
                     try { type.getMethod(method, String[].class).invoke(null, (Object) new String[0]); }
                     catch (java.lang.reflect.InvocationTargetException error) { throw new AssertionError("真实提问生命周期回归失败", error.getCause()); }
                 }
@@ -70,22 +76,24 @@ public final class RuntimeQuestionRefreshTest {
                 public boolean contains(String k){return values.containsKey(k);}public String getString(String k,String d){return values.getOrDefault(k,d);}
                 public Editor edit(){return new Editor(){String key,value;boolean remove;
                     public Editor putString(String k,String v){key=k;value=v;return this;}public Editor remove(String k){key=k;remove=true;return this;}
-                    public boolean commit(){if(!writable)return false;if(remove)values.remove(key);else values.put(key,value);return true;}};}
+                    public boolean commit(){if(!writable)return false;if(remove)values.remove(key);else values.put(key,value);if(onCommit!=null)onCommit.run();return true;}};}
             }
             static final class Context {final Preferences prefs=new Preferences();android.content.SharedPreferences getSharedPreferences(String n,int mode){return prefs;}}
             static final class ApplicationLoader {static final Context applicationContext=new Context();}
             static final class DesktopConnection {
-                final String machineId="machine";int reads,sends;Runnable onRead;String result="unknown";JsonObject snapshot;
-                ArrayList<DesktopQuestion> readQuestions(String linked)throws Exception{reads++;if(onRead!=null)onRead.run();return DesktopQuestion.read(snapshot);}
-                JsonObject openConversation(String remote){JsonObject j=new JsonObject();j.addProperty("sessionId","linked");return j;}
+                final String machineId="machine";int reads,sends,opens;Runnable onRead,onOpen;String result="unknown",openedId,lastReadLinked;JsonObject snapshot;
+                static String sourceKind="codexHome",sourceHome="user";
+                ArrayList<DesktopQuestion> readQuestions(String linked)throws Exception{reads++;lastReadLinked=linked;if(onRead!=null)onRead.run();return DesktopQuestion.read(snapshot);}
+                JsonObject openConversation(String remote){opens++;if(onOpen!=null)onOpen.run();JsonObject j=new JsonObject();j.addProperty("sessionId",openedId==null?"linked":openedId);return j;}
                 JsonObject answerQuestions(String linked,DesktopQuestion request,String operation,Map<String,String> answers)throws Exception{sends++;JsonObject r=new JsonObject();r.addProperty("status",result);return r;}
+                static JsonObject userCodexSource(){JsonObject s=new JsonObject();s.addProperty("kind",sourceKind);s.addProperty("home",sourceHome);return s;}
                 static class RpcNotDispatchedException extends Exception {}
             }
             static PasswordLogin.Session session;static boolean loggingOut;static long accountGeneration,watchGeneration,watchedDialog;
             static final Map<String,DesktopConnection> desktopConnections=new HashMap<>();
             static final Map<Long,String> dialogMachines=new HashMap<>(),remoteIds=new HashMap<>(),linkedSessions=new HashMap<>();
-            static DesktopConnection desktop;static final SessionStatus.Store statuses=new SessionStatus.Store();static long now;
-            static SessionStatus.Snapshot status(long id){return statuses.get(id,now);}
+            static DesktopConnection desktop;static final SessionStatus.Store statuses=new SessionStatus.Store();static long now;static Runnable onCommit;
+            static SessionStatus.Snapshot status(long id){return statuses.get(id,android.os.SystemClock.elapsedRealtime());}
         """;
 
     private static final String SCENARIOS = """
@@ -103,9 +111,15 @@ public final class RuntimeQuestionRefreshTest {
                 JsonObject response=new JsonObject(),o=new JsonObject();response.addProperty("ok",true);response.addProperty("machineOnline",true);response.add("observation",o);
                 o.addProperty("v",1);o.addProperty("source","desktop");o.addProperty("state",state);o.addProperty("turnId",turn);
                 JsonArray requests=new JsonArray();for(String id:ids){JsonObject r=new JsonObject();r.addProperty("requestId",id);r.addProperty("kind","user_action_request");requests.add(r);}o.add("requests",requests);
-                now+=10;statuses.observation(1,"machine",response,now,now);
+                now+=10;android.os.SystemClock.elapsed=now;statuses.observation(1,"machine",response,now,now);
             }
-            static void reset(){session=new PasswordLogin.Session();accountGeneration++;watchGeneration++;watchedDialog=1;loggingOut=false;now=0;statuses.clear();
+            static void observeAt(long started,long received,String state,String turn,String... ids){
+                JsonObject response=new JsonObject(),o=new JsonObject();response.addProperty("ok",true);response.addProperty("machineOnline",true);response.add("observation",o);
+                o.addProperty("v",1);o.addProperty("source","desktop");o.addProperty("state",state);o.addProperty("turnId",turn);
+                JsonArray requests=new JsonArray();for(String id:ids){JsonObject r=new JsonObject();r.addProperty("requestId",id);r.addProperty("kind","user_action_request");requests.add(r);}o.add("requests",requests);
+                now=received;android.os.SystemClock.elapsed=received;statuses.observation(1,"machine",response,started,received);
+            }
+            static void reset(){session=new PasswordLogin.Session();accountGeneration++;watchGeneration++;watchedDialog=1;loggingOut=false;now=0;android.os.SystemClock.elapsed=0;onCommit=null;org.telegram.messenger.UserConfig.selectedAccount=0;DesktopConnection.sourceKind="codexHome";DesktopConnection.sourceHome="user";statuses.clear();
                 approvalQueue.tasks.clear();ui.tasks.clear();desktopConnections.clear();dialogMachines.clear();remoteIds.clear();linkedSessions.clear();
                 ApplicationLoader.applicationContext.prefs.values.clear();desktop=new DesktopConnection();desktop.snapshot=snapshot("pending",false);
                 desktopConnections.put("machine",desktop);dialogMachines.put(1L,"machine");remoteIds.put(1L,"remote");linkedSessions.put(1L,"linked");observation("needs_input","turn","a","b");}
@@ -157,6 +171,92 @@ public final class RuntimeQuestionRefreshTest {
                 reset();review=read();request=review.requests.get(0);observation("running","turn");callbacks[0]=0;
                 refreshQuestions(review,request,(r,e)->callbacks[0]++);approvalQueue.all();accountGeneration++;ui.all();check(callbacks[0]==0,"refresh crossed account generation");
                 System.out.println("QuestionRefresh: 同状态零请求、部分/全答/失效、未知恢复、读途中变化与刷新迟到通过");
+            }
+            public static void staleScenarios(String[] ignored)throws Exception{
+                reset();now=16000;android.os.SystemClock.elapsed=16000;QuestionReview review=read();DesktopQuestion request=review.requests.get(0);
+                check("stale".equals(status(1).validity),"合成状态没有过期");
+                boolean refresh=refreshQuestions(review,request,(r,e)->{});
+                answerQuestions(review,request,Map.of("a","one","b","two"),(outcome,message)->{});pump();
+                check(refresh&&desktop.sends==0,"RED：过期STATUS初读表单refresh=false，仍实际派发回答");
+            }
+            public static void linkedScenarios(String[] ignored)throws Exception{
+                reset();QuestionReview review=read();DesktopQuestion request=review.requests.get(0);
+                linkedSessions.put(1L,"new-linked");
+                answerQuestions(review,request,Map.of("a","one","b","two"),(outcome,message)->{});pump();
+                check(desktop.sends==0,"RED：同连接linked更换后原表单仍实际派发到旧linked");
+            }
+            public static void readIdentityScenarios(String[] ignored)throws Exception{
+                reset();QuestionReview[] result={null};
+                desktop.onRead=()->remoteIds.put(1L,"other-remote");
+                readQuestions(1,(r,e)->result[0]=r);pump();
+                check(result[0]==null,"RED：原读题回包在同连接remote更换后仍进入当前表单");
+            }
+            public static void identityScenarios(String[] ignored)throws Exception{
+                reset();QuestionReview review=read();DesktopQuestion request=review.requests.get(0);
+                desktopConnections.put("other",desktop);dialogMachines.put(1L,"other");
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"换电脑后仍派发到原连接对象");
+                reset();review=read();request=review.requests.get(0);remoteIds.put(1L,"other-remote");
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"换remote后仍派发");
+                reset();review=read();request=review.requests.get(0);DesktopConnection.sourceKind="other";
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"换来源kind后仍派发");
+                reset();review=read();request=review.requests.get(0);DesktopConnection.sourceHome="other";
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"换来源home后仍派发");
+                reset();review=read();request=review.requests.get(0);org.telegram.messenger.UserConfig.selectedAccount=1;
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"换selectedAccount后仍派发");
+                reset();review=read();request=review.requests.get(0);session=new PasswordLogin.Session();
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"换账号对象后仍派发");
+            }
+            public static void openBootstrapScenarios(String[] ignored)throws Exception{
+                reset();linkedSessions.remove(1L);desktop.openedId="opened-original";
+                QuestionReview review=read();
+                check(desktop.opens==1&&"opened-original".equals(linkedSessions.get(1L))&&"opened-original".equals(desktop.lastReadLinked)&&review.current(),"原null bootstrap没有按open结果读题");
+                reset();linkedSessions.remove(1L);desktop.openedId="opened-original";
+                desktop.onOpen=()->linkedSessions.put(1L,"raced-other");
+                QuestionReview[] raced={null};int reads=desktop.reads;
+                readQuestions(1,(r,e)->raced[0]=r);pump();
+                check(raced[0]==null&&desktop.reads==reads&&"raced-other".equals(linkedSessions.get(1L)),"RED bootstrap: read adopted raced-other despite original open returned opened-original");
+                reset();linkedSessions.remove(1L);desktop.openedId="same-linked";
+                desktop.onOpen=()->linkedSessions.put(1L,"same-linked");
+                review=read();
+                check(review!=null&&review.current()&&"same-linked".equals(desktop.lastReadLinked),"竞态写入与open相同的linked没有完成读题");
+                reset();linkedSessions.remove(1L);
+                QuestionReview[] migrated={null};reads=desktop.reads;
+                readQuestions(1,(r,e)->migrated[0]=r);linkedSessions.put(1L,"new-linked");pump();
+                check(migrated[0]==null&&desktop.reads==reads&&desktop.opens==0,"入队前出现的新linked被bootstrap迁移");
+            }
+            public static void knownLinkedScenarios(String[] ignored)throws Exception{
+                reset();QuestionReview known=read();
+                check(known.current()&&"linked".equals(desktop.lastReadLinked),"已知非空linked没有按原值读题");
+                reset();QuestionReview[] changed={null};int reads=desktop.reads;
+                readQuestions(1,(r,e)->changed[0]=r);linkedSessions.put(1L,"new-linked");pump();
+                check(changed[0]==null&&(desktop.reads==reads||!"new-linked".equals(desktop.lastReadLinked)),"RED knownlinked: read-entry linked changed before queue; snapshot published from new-linked");
+                reset();linkedSessions.put(1L,"");reads=desktop.reads;QuestionReview[] empty={null};
+                readQuestions(1,(r,e)->empty[0]=r);pump();
+                check(desktop.reads==reads&&(empty[0]==null||!empty[0].current()),"RED emptylinked: empty known linked read and authorized review.current");
+            }
+            public static void deadlineScenarios(String[] ignored)throws Exception{
+                reset();statuses.clear();observeAt(100,14999,"needs_input","turn","a","b");
+                QuestionReview review=read();DesktopQuestion request=review.requests.get(0);
+                android.os.SystemClock.elapsed=15100;
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0,"队列执行时已过请求起点期限仍派发");
+                reset();statuses.clear();observeAt(100,100,"needs_input","turn","a","b");
+                review=read();request=review.requests.get(0);
+                onCommit=()->android.os.SystemClock.elapsed=15100;
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(desktop.sends==0&&!review.alreadyIssued(request),"写意图后跨过期限仍派发或留下意图");
+                observeAt(200,200,"needs_input","turn","a","b");
+                int reads=desktop.reads;
+                boolean same=refreshQuestions(review,request,(r,e)->{});
+                android.os.SystemClock.elapsed=15100;
+                answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
+                check(!same&&desktop.reads==reads&&desktop.sends==1,"相同current没有零RPC更新期限");
             }
         """;
 }

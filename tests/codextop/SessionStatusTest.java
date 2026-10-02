@@ -39,6 +39,7 @@ public final class SessionStatusTest {
         pendingQuestionIdentities();
         listAndConversationShareFacts();
         expirationAndRecovery();
+        currentExpiryFollowsRequestStart();
         listFailureDoesNotDisconnectNewerObservations();
         invalidLabelsKeepLastKnownFact();
         System.out.println("SessionStatus: 生命周期事实、缺失身份、未知协议和连接状态区分通过");
@@ -158,6 +159,34 @@ public final class SessionStatusTest {
         oldProducer.getAsJsonObject("details").remove("codexObservation");
         store.candidate(1, "machine", oldProducer, 700, 710, false);
         snapshot(store, 1, 711, "needs_input", "unknown", "current");
+    }
+
+    /** 提问许可的到期时刻只从原请求起点计算，接收时刻不能把它推迟。 */
+    private static void currentExpiryFollowsRequestStart() {
+        SessionStatus.Store store = new SessionStatus.Store();
+        var response = JsonParser.parseString("{\"ok\":true,\"machineOnline\":true,\"observation\":{\"v\":1,\"source\":\"desktop\",\"turnId\":\"t\",\"state\":\"running\"}}").getAsJsonObject();
+        store.observation(1, "machine", "remote", response, 100, 14999);
+        if (store.currentExpiry(1, "machine", 15099) != 15100L || !"current".equals(store.get(1, 15099).validity))
+            throw new AssertionError("请求起点100在15099仍应有效，到期时刻是15100");
+        if (store.currentExpiry(1, "machine", 15100) != -1L || !"stale".equals(store.get(1, 15100).validity))
+            throw new AssertionError("15100必须按请求起点过期，不能按接收时刻再加15秒");
+        store.clear();
+        store.observation(1, "machine", "remote", response, 100, 15101);
+        if (store.currentExpiry(1, "machine", 15101) != -1L || !"stale".equals(store.get(1, 15101).validity))
+            throw new AssertionError("15101才到达的慢响应不能在到达时重新获得有效期");
+        if (store.currentExpiry(9, "machine", 100) != -1L) throw new AssertionError("缺失事实给出了期限");
+        store.observation(1, "machine", "remote", response, 200, 210);
+        if (store.currentExpiry(1, "other", 210) != -1L) throw new AssertionError("错电脑仍给出期限");
+        if (store.currentExpiry(1, "machine", 199) != -1L) throw new AssertionError("时钟倒退仍给出期限");
+        store.candidate(2, "machine", JsonParser.parseString("{\"remoteSessionId\":\"cached\"}").getAsJsonObject(), -1, -1, true);
+        if (store.currentExpiry(2, "machine", 10) != -1L) throw new AssertionError("缓存事实给出了期限");
+        store.unavailable("machine", 220);
+        if (store.currentExpiry(1, "machine", 221) != -1L) throw new AssertionError("离线事实给出了期限");
+        var unknown = JsonParser.parseString("{\"ok\":true,\"machineOnline\":true,\"observation\":{\"v\":1,\"state\":\"unknown\"}}").getAsJsonObject();
+        store.observation(3, "other", "remote", unknown, 300, 310);
+        if (store.currentExpiry(3, "other", 310) != -1L) throw new AssertionError("未知事实给出了期限");
+        store.observation(4, "machine", "remote", response, Long.MAX_VALUE - 1000, Long.MAX_VALUE - 1000);
+        if (store.currentExpiry(4, "machine", Long.MAX_VALUE - 1000) != -1L) throw new AssertionError("期限相加溢出仍给出时刻");
     }
 
     /** 15秒交界、慢回包、缓存恢复、断连、换账号均不得延长旧事实。 */

@@ -222,6 +222,21 @@ public final class SessionStatus {
             }
         }
 
+        /**
+         * 只读原请求起点加 15 秒的到期时刻，供界面交给提问队列。
+         * 缺失、缓存、未知、离线、错电脑、时钟倒退、到期或相加溢出都返回 -1；不改条目，也不用接收时刻续期。
+         */
+        public long currentExpiry(long dialogId, String machine, long now) {
+            Entry entry = entries.get(dialogId);
+            if (entry == null || machine == null || !machine.equals(entry.machine)) return -1;
+            if (entry.startedAt < 0 || now < entry.startedAt) return -1;
+            if (!"current".equals(entry.snapshot.validity)) return -1;
+            if (entry.startedAt > Long.MAX_VALUE - FRESHNESS_MS) return -1;
+            long expiry = entry.startedAt + FRESHNESS_MS;
+            if (now >= expiry) return -1;
+            return expiry;
+        }
+
         /** 有效期从请求开始计时；列表恰好15秒刷新或后台深睡都不能延长旧事实。 */
         public Snapshot get(long dialogId, long now) {
             Entry entry = entries.get(dialogId);

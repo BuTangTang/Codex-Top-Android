@@ -1083,20 +1083,25 @@ public final class CodexRuntime {
     /** 当前问题弹窗持有一次读取的来源，迟到结果不会进入另一个账号或页面。 */
     public static final class QuestionReview {
         public final ArrayList<DesktopQuestion> requests;
+        private final PasswordLogin.Session account;
         private final long epoch, generation, dialogId;
+        private final int selectedAccount;
         private final DesktopConnection connection;
-        private final String linked;
+        private final String machine, remote, sourceKind, sourceHome, linked;
         private final android.content.SharedPreferences issued;
         private SessionStatus.Snapshot observation;
-        private boolean refreshing;
+        private long expiry = -1, expiryStart = -1;
+        private boolean refreshing, invalidNotified;
 
-        /** 固定原题所属连接与页面，提交意图只保存无正文的身份。 */
-        private QuestionReview(long epoch, long generation, long dialogId, DesktopConnection connection,
-                String linked, ArrayList<DesktopQuestion> requests, android.content.SharedPreferences issued,
-                SessionStatus.Snapshot observation) {
-            this.epoch = epoch; this.generation = generation; this.dialogId = dialogId;
-            this.connection = connection; this.linked = linked; this.requests = requests; this.issued = issued;
-            this.observation = observation;
+        /** 固定原题所属账号、页面、电脑、remote、连接、来源和 linked。期限单独保存，不参与误关表单。 */
+        private QuestionReview(PasswordLogin.Session account, long epoch, int selectedAccount, long generation,
+                long dialogId, String machine, String remote, DesktopConnection connection, String sourceKind,
+                String sourceHome, String linked, ArrayList<DesktopQuestion> requests,
+                android.content.SharedPreferences issued, SessionStatus.Snapshot observation) {
+            this.account = account; this.epoch = epoch; this.selectedAccount = selectedAccount;
+            this.generation = generation; this.dialogId = dialogId; this.machine = machine; this.remote = remote;
+            this.connection = connection; this.sourceKind = sourceKind; this.sourceHome = sourceHome;
+            this.linked = linked; this.requests = requests; this.issued = issued; this.observation = observation;
         }
 
         /** 同账号、电脑、会话和题目修订共享一个提交标识。 */
@@ -1112,8 +1117,45 @@ public final class CodexRuntime {
             return isAccountCurrent(epoch) && generation == watchGeneration && dialogId == watchedDialog;
         }
 
-        /** 用户回答只能交给显示原题时的同一连接。 */
-        public boolean current() { return pageCurrent() && dialogConnection(dialogId) == connection; }
+        /**
+         * 只核对读取时固定的身份。过期不在这里，避免原表单被误关。
+         * linked 为空只用于打开前的引导；已经记下的值变了就不再是原题。
+         */
+        static boolean identityCurrent(PasswordLogin.Session account, long epoch, int selectedAccount, long generation,
+                long dialogId, String machine, String remote, DesktopConnection connection, String sourceKind,
+                String sourceHome, String linked, boolean linkedRequired) {
+            if (session != account || !isAccountCurrent(epoch)) return false;
+            if (org.telegram.messenger.UserConfig.selectedAccount != selectedAccount) return false;
+            if (generation != watchGeneration || dialogId != watchedDialog) return false;
+            if (machine == null || remote == null || machine.isEmpty() || remote.isEmpty()) return false;
+            if (!machine.equals(dialogMachines.get(dialogId)) || !remote.equals(remoteIds.get(dialogId))) return false;
+            if (connection == null || dialogConnection(dialogId) != connection) return false;
+            com.google.gson.JsonObject source = DesktopConnection.userCodexSource();
+            if (source == null || source.get("kind") == null || source.get("home") == null
+                    || !sourceKind.equals(source.get("kind").getAsString())
+                    || !sourceHome.equals(source.get("home").getAsString())) return false;
+            if (!linkedRequired) return true;
+            return linked != null && !linked.isEmpty() && linked.equals(linkedSessions.get(dialogId));
+        }
+
+        /** 用户回答只能交给显示原题时的同一身份；过期由期限单独拒绝。 */
+        public boolean current() {
+            return identityCurrent(account, epoch, selectedAccount, generation, dialogId, machine, remote, connection,
+                    sourceKind, sourceHome, linked, true);
+        }
+
+        /** 队列上只比较入队时的到期时刻，不再读取界面状态库。 */
+        private static boolean fresh(long expiry, long expiryStart) {
+            if (expiry < 0 || expiryStart < 0) return false;
+            long elapsed = android.os.SystemClock.elapsedRealtime();
+            return elapsed >= expiryStart && elapsed < expiry;
+        }
+
+        /** 界面线程记下当前期限。相同的 current 观察只更新这张票，不另读题。 */
+        private void adoptExpiry(long expiry) {
+            this.expiry = expiry;
+            this.expiryStart = expiry < 0 ? -1 : expiry - SessionStatus.FRESHNESS_MS;
+        }
 
         /** 只比较本题组在原STATUS中的待答身份，不因采集时间或其它审批变化重复读题。 */
         private String observationKey(SessionStatus.Snapshot snapshot, DesktopQuestion request) {
@@ -1127,7 +1169,7 @@ public final class CodexRuntime {
         }
     }
 
-    /** 仅已打开的原表单调用；相关STATUS变化才合并一次读题，未知只停止编辑而不伪报已答。 */
+    /** 仅已打开的原表单调用；先看事实是否仍有效，再按身份去重。未知只停止编辑而不伪报已答。 */
     public static boolean refreshQuestions(QuestionReview review, DesktopQuestion request,
             java.util.function.BiConsumer<QuestionReview, String> callback) {
         if (!review.current()) {
@@ -1135,13 +1177,25 @@ public final class CodexRuntime {
             return true;
         }
         SessionStatus.Snapshot observed = status(review.dialogId);
-        if (review.refreshing || review.observationKey(observed, request).equals(review.observationKey(review.observation, request)))
-            return false;
-        review.observation = observed;
-        if (!"current".equals(observed.validity)) {
+        long expiry = statuses.currentExpiry(review.dialogId, review.machine, android.os.SystemClock.elapsedRealtime());
+        boolean fresh = "current".equals(observed.validity) && QuestionReview.fresh(expiry, expiry < 0 ? -1 : expiry - SessionStatus.FRESHNESS_MS);
+        if (!fresh) {
+            boolean same = review.observationKey(observed, request).equals(review.observationKey(review.observation, request));
+            review.observation = observed;
+            review.adoptExpiry(-1);
+            if (same && review.invalidNotified) return false;
+            review.invalidNotified = true;
             callback.accept(null, "暂时无法核对问题状态，回答已保留。");
             return true;
         }
+        review.invalidNotified = false;
+        if (review.refreshing || review.observationKey(observed, request).equals(review.observationKey(review.observation, request))) {
+            review.observation = observed;
+            review.adoptExpiry(expiry);
+            return false;
+        }
+        review.observation = observed;
+        review.adoptExpiry(expiry);
         review.refreshing = true;
         readQuestions(review.dialogId, (loaded, error) -> {
             review.refreshing = false;
@@ -1159,35 +1213,62 @@ public final class CodexRuntime {
     /** 沿已有控制队列按需读题，不把题目或保密回答写入普通历史缓存。 */
     public static void readQuestions(long dialogId, java.util.function.BiConsumer<QuestionReview, String> callback) {
         final long epoch = accountGeneration, generation = watchGeneration;
+        final PasswordLogin.Session account = session;
+        final int selectedAccount = org.telegram.messenger.UserConfig.selectedAccount;
         if (!isAccountCurrent(epoch) || watchedDialog != dialogId) {
             callback.accept(null, "当前会话已变化，请重新打开问题。"); return;
         }
+        final String machine = dialogMachines.get(dialogId);
         final String remote = remoteIds.get(dialogId);
         final DesktopConnection connection = dialogConnection(dialogId);
+        final com.google.gson.JsonObject source = DesktopConnection.userCodexSource();
+        final String sourceKind = source.get("kind").getAsString();
+        final String sourceHome = source.get("home").getAsString();
         final SessionStatus.Snapshot observation = status(dialogId);
+        // 界面入队前固定已知 linked。之后映射变成别的值不能迁移，空串也不当作可打开的会话。
+        final String knownLinked = linkedSessions.get(dialogId);
+        if (knownLinked != null && knownLinked.isEmpty()) {
+            callback.accept(null, "电脑连接已变化，请重新查看问题。");
+            return;
+        }
         final android.content.SharedPreferences issued = ApplicationLoader.applicationContext.getSharedPreferences(
                 "codex-question-" + TranscriptStore.digest(session.server + "\n" + session.accountId), 0);
         approvalQueue.postRunnable(() -> {
             QuestionReview review = null; String failure = null;
             try {
-                if (!isAccountCurrent(epoch) || generation != watchGeneration || watchedDialog != dialogId) return;
-                if (connection == null || dialogConnection(dialogId) != connection) throw new java.io.IOException();
-                String linked = linkedSessions.get(dialogId);
-                if (linked == null) {
-                    linked = connection.openConversation(remote).get("sessionId").getAsString();
-                    if (!isAccountCurrent(epoch) || generation != watchGeneration) return;
-                    if (dialogConnection(dialogId) != connection) throw new java.io.IOException();
-                    linkedSessions.put(dialogId, linked);
-                }
-                review = new QuestionReview(epoch, generation, dialogId, connection, linked,
-                        connection.readQuestions(linked), issued, observation);
+                String liveLinked = linkedSessions.get(dialogId);
+                String linked;
+                if (knownLinked == null) {
+                    if (liveLinked != null) throw new java.io.IOException();
+                    if (!QuestionReview.identityCurrent(account, epoch, selectedAccount, generation, dialogId, machine, remote,
+                            connection, sourceKind, sourceHome, null, false)) throw new java.io.IOException();
+                    String opened = connection.openConversation(remote).get("sessionId").getAsString();
+                    if (opened == null || opened.isEmpty()) throw new java.io.IOException();
+                    if (!QuestionReview.identityCurrent(account, epoch, selectedAccount, generation, dialogId, machine, remote,
+                            connection, sourceKind, sourceHome, null, false)) throw new java.io.IOException();
+                    String raced = linkedSessions.putIfAbsent(dialogId, opened);
+                    if (raced != null && !raced.equals(opened)) throw new java.io.IOException();
+                    linked = opened;
+                } else if (!knownLinked.equals(liveLinked)) {
+                    throw new java.io.IOException();
+                } else linked = knownLinked;
+                if (!QuestionReview.identityCurrent(account, epoch, selectedAccount, generation, dialogId, machine, remote,
+                        connection, sourceKind, sourceHome, linked, true)) throw new java.io.IOException();
+                ArrayList<DesktopQuestion> questions = connection.readQuestions(linked);
+                if (!QuestionReview.identityCurrent(account, epoch, selectedAccount, generation, dialogId, machine, remote,
+                        connection, sourceKind, sourceHome, linked, true)) throw new java.io.IOException();
+                review = new QuestionReview(account, epoch, selectedAccount, generation, dialogId, machine, remote,
+                        connection, sourceKind, sourceHome, linked, questions, issued, observation);
             } catch (Exception error) { failure = "暂时无法读取问题，请稍后重试。"; }
             final QuestionReview loaded = review; final String message = failure;
             AndroidUtilities.runOnUIThread(() -> {
-                if (isAccountCurrent(epoch) && generation == watchGeneration && watchedDialog == dialogId) {
-                    // 同页换连接时结束旧读取，但旧题快照不能进入新连接的表单。
-                    if (dialogConnection(dialogId) != connection) callback.accept(null, "电脑连接已变化，请重新查看问题。");
-                    else callback.accept(loaded, message);
+                if (!isAccountCurrent(epoch) || generation != watchGeneration || watchedDialog != dialogId) return;
+                // 发布前再取界面上的最新事实。仍过期可以交给原表单停用，不能当成可回答。
+                if (loaded == null || !loaded.current()) callback.accept(null, "电脑连接已变化，请重新查看问题。");
+                else {
+                    long expiry = statuses.currentExpiry(dialogId, loaded.machine, android.os.SystemClock.elapsedRealtime());
+                    loaded.adoptExpiry(expiry);
+                    callback.accept(loaded, message);
                 }
             });
         });
@@ -1197,11 +1278,15 @@ public final class CodexRuntime {
     public static void answerQuestions(QuestionReview review, DesktopQuestion request,
             java.util.Map<String, String> answers, java.util.function.BiConsumer<String, String> callback) {
         final java.util.Map<String, String> submitted = new java.util.LinkedHashMap<>(answers);
+        final long expiry = statuses.currentExpiry(review.dialogId, review.machine, android.os.SystemClock.elapsedRealtime());
+        final long expiryStart = expiry < 0 ? -1 : expiry - SessionStatus.FRESHNESS_MS;
         approvalQueue.postRunnable(() -> {
             String status = "rejected", message;
             String operation = null;
             try {
                 if (!review.current()) throw new IllegalStateException("电脑连接已变化，请重新查看问题。");
+                if (!QuestionReview.fresh(expiry, expiryStart))
+                    throw new IllegalStateException("暂时无法核对问题状态，回答已保留。");
                 if (!review.requests.contains(request) || !request.canAnswer)
                     throw new IllegalStateException("此问题已不能回答，请查看最新进展。");
                 if (review.alreadyIssued(request)) {
@@ -1211,10 +1296,11 @@ public final class CodexRuntime {
                     request.action(review.connection.machineId, review.linked, operation, submitted);
                     if (!review.issued.edit().putString(review.key(request), operation).commit())
                         throw new java.io.IOException();
-                    // 写入期间发生切换时尚未外发，可以撤去本次意图；网络调用后的未知则保留。
-                    if (!review.current()) {
+                    // 写入期间身份或期限失效时尚未外发，可以撤去本次意图；网络调用后的未知则保留。
+                    if (!review.current() || !QuestionReview.fresh(expiry, expiryStart)) {
                         review.issued.edit().remove(review.key(request)).commit();
-                        throw new IllegalStateException("电脑连接已变化，请重新查看问题。");
+                        throw new IllegalStateException(!review.current()
+                                ? "电脑连接已变化，请重新查看问题。" : "暂时无法核对问题状态，回答已保留。");
                     }
                     status = "unknown";
                     JsonObject result = review.connection.answerQuestions(review.linked, request, operation, submitted);
