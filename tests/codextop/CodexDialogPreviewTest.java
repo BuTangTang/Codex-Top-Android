@@ -229,8 +229,52 @@ public final class CodexDialogPreviewTest {
                     long denseMs = (System.nanoTime() - denseStarted) / 1_000_000L;
                     check("a".repeat(160).contentEquals(denseOut), "上限内的密集链接没有留下标签");
                     check(denseMs < 8, "上限内的密集链接扫描过重: " + denseMs + "ms");
+                    String bold = "**已完成**" + "字".repeat(1100);
+                    CharSequence boldOut = CodexDialogPreview.readable(bold, "AttachPhoto");
+                    check(boldOut != bold, "长文开头的成对加粗被原样退回");
+                    check(boldOut.toString().startsWith("已完成"), "长文开头的成对加粗没有去掉标记");
+                    check(!boldOut.toString().contains("**"), "长文加粗标记留在显示副本里");
                     String mid = "请看 [文档](https://example.com/a)" + "字".repeat(1100);
-                    check(CodexDialogPreview.readable(mid, "AttachPhoto") == mid, "超过 1024 字的完整链接仍被解析");
+                    CharSequence midOut = CodexDialogPreview.readable(mid, "AttachPhoto");
+                    check(midOut != mid, "前缀内已闭合的长链接被原样退回");
+                    check(midOut.toString().startsWith("请看 文档"), "前缀内已闭合的长链接没有留下标签");
+                    check(!midOut.toString().contains("https://"), "前缀内已闭合的长链接仍露出目标");
+                    check(midOut.length() <= 1024, "长链接的显示副本带上了窗口之后的原文");
+                    String late = "请看 [文档](https://example.com/" + "a".repeat(2000) + ")";
+                    check(late.length() > 1024 && late.indexOf(')') > 1024, "后闭合用例没有把右括号放在扫描窗口外");
+                    check(CodexDialogPreview.readable(late, "AttachPhoto") == late, "扫描边界之后才闭合的链接被折叠或换了对象");
+                    int closeAt = 1023 - "请看 [文档](https://example.com/".length();
+                    String inside = "请看 [文档](https://example.com/" + "a".repeat(closeAt) + ")" + "字".repeat(80);
+                    check(inside.charAt(1023) == ')' && inside.length() > 1024, "1024 边界内的右括号位置不对");
+                    CharSequence insideOut = CodexDialogPreview.readable(inside, "AttachPhoto");
+                    check(insideOut != inside && insideOut.toString().startsWith("请看 文档")
+                            && !insideOut.toString().contains("https://"), "恰好落在窗口内的链接没有折叠");
+                    String edgeStars = "**" + "a".repeat(1020) + "**tail";
+                    check(edgeStars.length() == 1028 && CodexDialogPreview.readable(edgeStars, "AttachPhoto") == edgeStars,
+                            "窗口端部的强调闭合还要看后面的字符");
+                    String edgeTicks = "`" + "a".repeat(1022) + "``tail";
+                    check(edgeTicks.length() == 1029 && CodexDialogPreview.readable(edgeTicks, "AttachPhoto") == edgeTicks,
+                            "窗口端部的反引号长度还要看后面的字符");
+                    String edgeFence = "```java\\n" + "a".repeat(1012) + "\\n```x tail";
+                    check(edgeFence.length() == 1030 && CodexDialogPreview.readable(edgeFence, "AttachPhoto") == edgeFence,
+                            "窗口端部的围栏结束行还要看后面的字符");
+                    String boundaryEmoji = new String(new char[] {(char) 0xD83D, (char) 0xDE0A});
+                    String boldMark = "**好**";
+                    String exact = boldMark + "字".repeat(1024 - boldMark.length() - boundaryEmoji.length()) + boundaryEmoji;
+                    check(exact.length() == 1024, "整段 1024 的 emoji 用例长度不对");
+                    check(Character.isHighSurrogate(exact.charAt(1022)) && Character.isLowSurrogate(exact.charAt(1023)),
+                            "emoji 没有完整落在 1024 窗口末尾");
+                    CharSequence exactOut = CodexDialogPreview.readable(exact, "AttachPhoto");
+                    check(exactOut.toString().startsWith("好") && exactOut.toString().endsWith(boundaryEmoji)
+                            && !exactOut.toString().contains("**"), "1024 末尾的 emoji 被拆开或加粗没有折叠");
+                    check(paired(exactOut), "1024 窗口内的 emoji 显示副本有孤立代理项");
+                    String straddling = boldMark + "字".repeat(1023 - boldMark.length()) + boundaryEmoji + "后";
+                    check(straddling.charAt(1023) == (char) 0xD83D && straddling.charAt(1024) == (char) 0xDE0A,
+                            "跨窗口的 emoji 没有落在 1023/1024");
+                    CharSequence straddleOut = CodexDialogPreview.readable(straddling, "AttachPhoto");
+                    check(straddleOut != straddling && straddleOut.toString().startsWith("好")
+                            && straddleOut.toString().indexOf((char) 0xD83D) < 0, "跨边界的 emoji 被拆进扫描窗口");
+                    check(paired(straddleOut), "跨边界 emoji 的显示副本有孤立代理项");
                     String open = "[".repeat(20000);
                     long openStarted = System.nanoTime();
                     CharSequence openOut = CodexDialogPreview.readable(open, "AttachPhoto");
@@ -238,7 +282,9 @@ public final class CodexDialogPreviewTest {
                     check(openOut == open, "超长未闭合括号没有退回原对象");
                     check(openMs < 20, "超长未闭合括号仍在整段重扫: " + openMs + "ms");
                     String over = "请看 [文档](https://example.com/a)" + "字".repeat(4096);
-                    check(CodexDialogPreview.readable(over, "AttachPhoto") == over, "超过上限后先截断再解析，链接目标泄漏");
+                    CharSequence overOut = CodexDialogPreview.readable(over, "AttachPhoto");
+                    check(overOut != over && overOut.toString().startsWith("请看 文档")
+                            && !overOut.toString().contains("https://"), "更长正文里已经闭合的链接没有留下标签");
                     String huge = "前".repeat(100000) + " [文档](https://example.com/a)";
                     android.text.SpannableStringBuilder hugeMarked = new android.text.SpannableStringBuilder(huge);
                     Object hugeSpan = new Object();
@@ -249,8 +295,123 @@ public final class CodexDialogPreviewTest {
                     check(hugeOut == hugeMarked, "超长带链接的原文被改写成新对象");
                     check(hugeMarked.getSpanStart(hugeSpan) == 0 && hugeMarked.getSpanEnd(hugeSpan) == 1 && hugeMarked.getSpanFlags(hugeSpan) == 33, "超长回退改动了原 span");
                     check(hugeMs < 20, "超长带格式文字折叠不受限: " + hugeMs + "ms");
-                    System.out.println("bounded open=" + openMs + "ms spanned=" + hugeMs + "ms");
+                    Object plainSpan = new Object();
+                    Probe plainProbe = new Probe("前".repeat(100000), new Object[] {plainSpan}, new int[] {0}, new int[] {1}, new int[] {33});
+                    long plainStarted = System.nanoTime();
+                    CharSequence plainOut = CodexDialogPreview.readable(plainProbe, "AttachPhoto");
+                    long plainMs = (System.nanoTime() - plainStarted) / 1_000_000L;
+                    check(plainOut == plainProbe, "十万字纯文本被换成了新对象");
+                    check(plainProbe.queries == 0, "没有改写时仍枚举了 span");
+                    check(plainProbe.getSpanStart(plainSpan) == 0 && plainProbe.getSpanEnd(plainSpan) == 1 && plainProbe.getSpanFlags(plainSpan) == 33,
+                            "纯文本退回时改动了原 span");
+                    check(plainMs < 20, "十万字纯文本前缀扫描过重: " + plainMs + "ms");
+                    String lead = "看 [说明](https://example.com) 尾";
+                    String spannedText = lead + "字".repeat(2000);
+                    Object early = new Object();
+                    Object labelSpan = new Object();
+                    Object urlSpan = new Object();
+                    Object kept = new Object();
+                    Object crossing = new Object();
+                    Object outside = new Object();
+                    int labelAt = lead.indexOf('说');
+                    int urlAt = lead.indexOf("https");
+                    int outsideCount = 20000;
+                    Object[] spanObjs = new Object[6 + outsideCount];
+                    int[] spanStarts = new int[spanObjs.length];
+                    int[] spanEnds = new int[spanObjs.length];
+                    int[] spanFlags = new int[spanObjs.length];
+                    spanObjs[0] = early; spanStarts[0] = 0; spanEnds[0] = 1; spanFlags[0] = 33;
+                    spanObjs[1] = labelSpan; spanStarts[1] = labelAt; spanEnds[1] = labelAt + 1; spanFlags[1] = 17;
+                    spanObjs[2] = urlSpan; spanStarts[2] = urlAt; spanEnds[2] = urlAt + 5; spanFlags[2] = 9;
+                    spanObjs[3] = kept; spanStarts[3] = 800; spanEnds[3] = 810; spanFlags[3] = 21;
+                    spanObjs[4] = crossing; spanStarts[4] = 1000; spanEnds[4] = 1100; spanFlags[4] = 4;
+                    spanObjs[5] = outside; spanStarts[5] = 1500; spanEnds[5] = 1510; spanFlags[5] = 6;
+                    for (int i = 0; i < outsideCount; i++) {
+                        spanObjs[6 + i] = new Object();
+                        spanStarts[6 + i] = 3000 + i;
+                        spanEnds[6 + i] = 3001 + i;
+                        spanFlags[6 + i] = 1;
+                    }
+                    Probe rich = new Probe(spannedText, spanObjs, spanStarts, spanEnds, spanFlags);
+                    long richStarted = System.nanoTime();
+                    CharSequence richOut = CodexDialogPreview.readable(rich, "AttachPhoto");
+                    long richMs = (System.nanoTime() - richStarted) / 1_000_000L;
+                    check(richOut != rich && richOut instanceof android.text.Spanned, "长文链接的显示副本没有带走保留 span");
+                    check(richOut.toString().startsWith("看 说明 尾") && !richOut.toString().contains("https://"),
+                            "带 span 的长链接没有留下标签");
+                    android.text.Spanned richSpans = (android.text.Spanned) richOut;
+                    check(richSpans.getSpanStart(early) == 0 && richSpans.getSpanEnd(early) == 1 && richSpans.getSpanFlags(early) == 33,
+                            "窗口内开头的 span 没有留在原位置");
+                    check(richSpans.getSpanStart(labelSpan) == richOut.toString().indexOf('说') && richSpans.getSpanFlags(labelSpan) == 17,
+                            "链接标签上的 span 没有跟着保留文字移动");
+                    check(richSpans.getSpanStart(urlSpan) < 0, "链接目标上的 span 被贴进显示副本");
+                    int removed = lead.length() - "看 说明 尾".length();
+                    check(richSpans.getSpanStart(kept) == 800 - removed && richSpans.getSpanEnd(kept) == 810 - removed
+                            && richSpans.getSpanFlags(kept) == 21, "窗口内后段 span 没有按删除长度平移");
+                    check(richSpans.getSpanStart(crossing) < 0 && richSpans.getSpanStart(outside) < 0,
+                            "越过窗口或落在窗口外的 span 被保留");
+                    check(rich.queries > 0 && rich.maxQueryEnd <= 1024, "span 查询读过了扫描窗口: " + rich.maxQueryEnd);
+                    check(richMs < 20, "窗口外的 span 数量拖慢了预览: " + richMs + "ms");
+                    for (int i = 0; i < spanObjs.length; i++) {
+                        if (rich.getSpanStart(spanObjs[i]) != spanStarts[i] || rich.getSpanEnd(spanObjs[i]) != spanEnds[i]
+                                || rich.getSpanFlags(spanObjs[i]) != spanFlags[i]) {
+                            check(false, "显示副本改写了原 span");
+                        }
+                    }
+                    System.out.println("bounded open=" + openMs + "ms spanned=" + hugeMs + "ms plain=" + plainMs + "ms rich=" + richMs + "ms");
                     System.out.println("PASS CodexDialogPreviewTest");
+                }
+                static boolean paired(CharSequence text) {
+                    for (int index = 0; index < text.length(); index++) {
+                        char value = text.charAt(index);
+                        if (Character.isHighSurrogate(value)) {
+                            if (index + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(index + 1))) return false;
+                            index++;
+                        } else if (Character.isLowSurrogate(value)) return false;
+                    }
+                    return true;
+                }
+                static final class Probe implements CharSequence, android.text.Spanned {
+                    final char[] data;
+                    final Object[] spans;
+                    final int[] starts, ends, flags;
+                    int queries, maxQueryEnd;
+                    Probe(String text, Object[] spans, int[] starts, int[] ends, int[] flags) {
+                        data = text.toCharArray();
+                        this.spans = spans;
+                        this.starts = starts;
+                        this.ends = ends;
+                        this.flags = flags;
+                    }
+                    public int length() { return data.length; }
+                    public char charAt(int index) { return data[index]; }
+                    public CharSequence subSequence(int start, int end) {
+                        if (end - start > 1024) throw new AssertionError("读取了超过扫描窗口的原文");
+                        return new String(data, start, end - start);
+                    }
+                    public String toString() { throw new AssertionError("把超长原文整段复制成字符串"); }
+                    public Object[] getSpans(int start, int end, Class type) {
+                        queries++;
+                        if (end > maxQueryEnd) maxQueryEnd = end;
+                        if (end > 1024) throw new AssertionError("span 查询越过扫描窗口: " + end);
+                        java.util.ArrayList<Object> found = new java.util.ArrayList<>();
+                        for (int index = 0; index < spans.length; index++) {
+                            if (starts[index] < end && ends[index] > start) found.add(spans[index]);
+                        }
+                        return found.toArray();
+                    }
+                    public int getSpanStart(Object span) { return locate(span, true); }
+                    public int getSpanEnd(Object span) { return locate(span, false); }
+                    public int getSpanFlags(Object span) {
+                        for (int index = 0; index < spans.length; index++) if (spans[index] == span) return flags[index];
+                        return 0;
+                    }
+                    int locate(Object span, boolean start) {
+                        for (int index = 0; index < spans.length; index++) {
+                            if (spans[index] == span) return start ? starts[index] : ends[index];
+                        }
+                        return -1;
+                    }
                 }
                 static final class Marked implements CharSequence {
                     final String text;

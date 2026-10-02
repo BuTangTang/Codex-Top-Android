@@ -304,7 +304,13 @@ public final class DialogCellCodexSubtitleTest {
                             String oversized = "请看 [文档](https://example.com/a) " + "字".repeat(5000);
                             cell.messageString = oversized;
                             cell.originalOrder();
-                            check(oversized.substring(0, 150).contentEquals(cell.messageString), "超长文字没有退回原有 150 字截断");
+                            String shown = String.valueOf(cell.messageString);
+                            check(shown.startsWith("请看 文档 ") && !shown.contains("https://"), "前缀内已闭合的长链接没有先折叠再截断");
+                            check(shown.length() == 150, "折叠后的长预览没有继续走原有 150 字截断");
+                            String lateClose = "请看 [文档](https://example.com/" + "a".repeat(2000) + ")";
+                            cell.messageString = lateClose;
+                            cell.originalOrder();
+                            check(lateClose.substring(0, 150).contentEquals(cell.messageString), "窗口外才闭合的链接没有保留原文再截断");
                             System.out.println("PASS Codex dialog preview gate");
                         }
                         static final class MessageObject {

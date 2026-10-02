@@ -13,8 +13,9 @@ import java.util.ArrayList;
  */
 public final class CodexDialogPreview {
     /**
-     * 列表预览最多扫描 1024 个字符。
-     * 更长的原文原样返回，交给单元格已有的 150 字截断；不先截一段再解析，避免未写完的链接漏出目标。
+     * 列表预览最多扫描 1024 个 UTF-16 单元。
+     * 更长的原文只看这一段；没改写、超过扫描预算，或窗口末尾仍有未闭合格式时返回原对象。
+     * 不读取窗口之后的文字，也不补右括号或链接目标。
      */
     private static final int LIST_PREVIEW_LIMIT = 1024;
 
@@ -29,48 +30,84 @@ public final class CodexDialogPreview {
 
     /**
      * 返回列表上使用的文字。
-     * 没有可折叠格式、超过 {@link #LIST_PREVIEW_LIMIT}，或扫描超过 {@link #LIST_PREVIEW_WORK} 时返回原 CharSequence。有改写时，只把仍落在保留文字上的原 span 移到新位置，
-     * 然后交给原有换行处理；不按消息实体的旧偏移重贴 span。空图片说明使用调用方传入的原照片文案。
+     * 没有可折叠格式、扫描超过 {@link #LIST_PREVIEW_WORK}，或超长原文的前缀在窗口末尾仍未闭合时，返回原 CharSequence 及其 span。
+     * 有改写时只复制完整落在扫描窗口内、且没有跨过被删结构的 span；查询也停在窗口，不枚举窗口后的 span。
+     * 然后交给原有换行处理。空图片说明使用调用方传入的原照片文案。
      */
     public static CharSequence readable(CharSequence text, String emptyImageLabel) {
         if (text == null || text.length() == 0) return text;
-        if (text.length() > LIST_PREVIEW_LIMIT) return text;
+        int limit = scanEnd(text);
+        if (limit <= 0) return text;
+        String source = copyPrefix(text, limit);
         String label = emptyImageLabel == null ? "" : emptyImageLabel;
-        String source = text.toString();
-        int[] work = new int[1];
-        String flattened = flatten(source, label, null, work);
-        if (work[0] > LIST_PREVIEW_WORK || flattened.equals(source)) return text;
+        Scan scan = new Scan(limit < text.length(), source);
+        String flattened = flatten(source, label, null, scan);
+        if (scan.work > LIST_PREVIEW_WORK || scan.openAtEnd || flattened.equals(source)) return text;
         CharSequence edited = flattened;
         if (text instanceof Spanned) {
             ArrayList<Piece> pieces = new ArrayList<>();
-            work[0] = 0;
-            flatten(source, label, pieces, work);
-            if (work[0] > LIST_PREVIEW_WORK) return text;
-            edited = copyKeptSpans((Spanned) text, flattened, pieces);
+            Scan again = new Scan(scan.truncated, source);
+            flatten(source, label, pieces, again);
+            if (again.work > LIST_PREVIEW_WORK || again.openAtEnd) return text;
+            edited = copyKeptSpans((Spanned) text, flattened, pieces, limit);
         }
         return AndroidUtilities.replaceNewLines(edited);
     }
 
-    /** 记一笔扫描。超过固定次数后返回 true，整段预览改退回原文。 */
-    private static boolean charge(int[] work) {
-        work[0]++;
-        return work[0] > LIST_PREVIEW_WORK;
+    /** 扫描终点不超过 1024，并且不把窗口末尾的高位代理和窗口外的低位代理拆开。 */
+    private static int scanEnd(CharSequence text) {
+        int end = Math.min(text.length(), LIST_PREVIEW_LIMIT);
+        if (end > 0 && end < text.length() && Character.isHighSurrogate(text.charAt(end - 1))) end--;
+        return end;
+    }
+
+    /** 只复制扫描窗口。String 直接截取；其他文本逐字读取，避免为了前缀把整段超长原文变成字符串。 */
+    private static String copyPrefix(CharSequence text, int end) {
+        if (text instanceof String) return ((String) text).substring(0, end);
+        char[] chars = new char[end];
+        for (int index = 0; index < end; index++) chars[index] = text.charAt(index);
+        return new String(chars);
+    }
+
+    /** 一次扫描的预算和窗口状态。未闭合标记只有走到顶层窗口末尾才算，子串内部的失败不算。 */
+    private static final class Scan {
+        final boolean truncated;
+        final String prefix;
+        int work;
+        boolean openAtEnd;
+
+        /** 记录这次扫描是否只看了超长原文的前缀，以及前缀字符串本身。 */
+        Scan(boolean truncated, String prefix) {
+            this.truncated = truncated;
+            this.prefix = prefix;
+        }
+
+        /** 记一笔扫描。超过固定次数后返回 true，整段预览改退回原文。 */
+        boolean charge() {
+            work++;
+            return work > LIST_PREVIEW_WORK;
+        }
+
+        /** 顶层窗口走到末尾仍未闭合时，标记整段预览必须退回原文。 */
+        void noteEnd(String source) {
+            if (truncated && source == prefix) openAtEnd = true;
+        }
     }
 
     /** 单次扫描完整格式。失败的片段原样留下，避免把未闭合标记整段删掉。 */
-    private static String flatten(String source, String emptyImageLabel, ArrayList<Piece> pieces, int[] work) {
+    private static String flatten(String source, String emptyImageLabel, ArrayList<Piece> pieces, Scan scan) {
         StringBuilder out = new StringBuilder(source.length());
-        flattenInto(source, 0, emptyImageLabel, out, pieces, work);
+        flattenInto(source, 0, emptyImageLabel, out, pieces, scan);
         return out.toString();
     }
 
     /**
      * 把 source 写进已有输出。base 是这段文字在完整原文中的起点，用来给保留片段定位。
      */
-    private static void flattenInto(String source, int base, String emptyImageLabel, StringBuilder out, ArrayList<Piece> pieces, int[] work) {
+    private static void flattenInto(String source, int base, String emptyImageLabel, StringBuilder out, ArrayList<Piece> pieces, Scan scan) {
         int index = 0;
-        while (index < source.length() && work[0] <= LIST_PREVIEW_WORK) {
-            int consumed = appendConstruct(source, index, base, emptyImageLabel, out, pieces, work);
+        while (index < source.length() && scan.work <= LIST_PREVIEW_WORK) {
+            int consumed = appendConstruct(source, index, base, emptyImageLabel, out, pieces, scan);
             if (consumed > index) {
                 index = consumed;
                 continue;
@@ -98,18 +135,18 @@ public final class CodexDialogPreview {
     }
 
     /**
-     * 复制没有跨过删除区的原 span。落在链接目标、标记上的 span 直接丢掉，不用旧偏移贴回新文字。
+     * 复制完整落在扫描窗口内、且没有跨过删除区的原 span。
+     * 越过窗口、落在窗口外或盖住链接目标的 span 直接丢掉，不用旧偏移贴回新文字。
      */
-    private static SpannableStringBuilder copyKeptSpans(Spanned original, String flattened, ArrayList<Piece> pieces) {
+    private static SpannableStringBuilder copyKeptSpans(Spanned original, String flattened, ArrayList<Piece> pieces, int prefixLength) {
         SpannableStringBuilder builder = new SpannableStringBuilder(flattened);
-        int sourceLength = original.length();
-        for (Object span : original.getSpans(0, sourceLength, Object.class)) {
+        for (Object span : original.getSpans(0, prefixLength, Object.class)) {
             int start = original.getSpanStart(span);
             int end = original.getSpanEnd(span);
-            if (start < 0 || end < start || end > sourceLength) continue;
+            if (start < 0 || end < start || start >= prefixLength || end > prefixLength) continue;
             if (start != end && overlapsReplacement(pieces, start, end)) continue;
-            int mappedStart = mapPoint(pieces, start, sourceLength, builder.length());
-            int mappedEnd = mapPoint(pieces, end, sourceLength, builder.length());
+            int mappedStart = mapPoint(pieces, start, prefixLength, builder.length());
+            int mappedEnd = mapPoint(pieces, end, prefixLength, builder.length());
             if (mappedStart < 0 || mappedEnd < mappedStart || mappedEnd > builder.length()) continue;
             builder.setSpan(span, mappedStart, mappedEnd, original.getSpanFlags(span));
         }
@@ -155,14 +192,14 @@ public final class CodexDialogPreview {
     }
 
     /** 尝试从当前位置吃掉一种完整格式；吃不掉时返回原位置。保留下来的原文会记入 pieces。 */
-    private static int appendConstruct(String source, int index, int base, String emptyImageLabel, StringBuilder out, ArrayList<Piece> pieces, int[] work) {
+    private static int appendConstruct(String source, int index, int base, String emptyImageLabel, StringBuilder out, ArrayList<Piece> pieces, Scan scan) {
         if (isEscaped(source, index)) return index;
         if (source.charAt(index) == '\\' && index + 1 < source.length() && isPunctuation(source.charAt(index + 1))) {
             char escaped = source.charAt(index + 1);
             int bracket = escaped == '!' && index + 2 < source.length() && source.charAt(index + 2) == '[' ? index + 2
                     : escaped == '[' ? index + 1 : -1;
             if (bracket >= 0) {
-                int end = linkEnd(source, bracket, work);
+                int end = linkEnd(source, bracket, scan);
                 if (end > bracket) {
                     int output = out.length();
                     out.append(source, index, end);
@@ -176,7 +213,7 @@ public final class CodexDialogPreview {
             return index + 2;
         }
         if (isLineStart(source, index)) {
-            int fenceEnd = fenceEnd(source, index);
+            int fenceEnd = fenceEnd(source, index, scan);
             if (fenceEnd > index) {
                 appendFence(source, index, fenceEnd, base, out, pieces);
                 return fenceEnd;
@@ -185,7 +222,7 @@ public final class CodexDialogPreview {
         char current = source.charAt(index);
         if (current == '`') {
             int run = runLength(source, index, '`');
-            int close = findExactRun(source, index + run, '`', run, work);
+            int close = findExactRun(source, index + run, '`', run, scan);
             if (close >= 0) {
                 int output = out.length();
                 out.append(source, index + run, close);
@@ -194,25 +231,29 @@ public final class CodexDialogPreview {
             }
         }
         if (current == '!' && index + 1 < source.length() && source.charAt(index + 1) == '[') {
-            int end = linkEnd(source, index + 1, work);
+            int end = linkEnd(source, index + 1, scan);
             if (end > index) {
-                appendLink(source, index + 1, true, base, emptyImageLabel, out, pieces, work);
+                appendLink(source, index + 1, true, base, emptyImageLabel, out, pieces, scan);
                 return end;
             }
         }
         if (current == '[') {
-            int end = linkEnd(source, index, work);
+            int end = linkEnd(source, index, scan);
             if (end > index) {
-                appendLink(source, index, false, base, emptyImageLabel, out, pieces, work);
+                appendLink(source, index, false, base, emptyImageLabel, out, pieces, scan);
                 return end;
             }
         }
         if (current == '*' || current == '_') {
             int run = runLength(source, index, current);
             if (run > 2) return index;
-            int close = emphasisClose(source, index + run, current, run, work);
-            if (close > index + run && isBoundary(source, index - 1) && isBoundary(source, close + run)) {
-                flattenInto(source.substring(index + run, close), base + index + run, emptyImageLabel, out, pieces, work);
+            int close = emphasisClose(source, index + run, current, run, scan);
+            int after = close + run;
+            if (close > index + run && unseenAfter(scan, source, after)) {
+                // 闭合是否成立要看标记后面那个字符；窗口到此为止时不能把它当成字符串结束。
+                scan.noteEnd(source);
+            } else if (close > index + run && isBoundary(source, index - 1) && isBoundary(source, after)) {
+                flattenInto(source.substring(index + run, close), base + index + run, emptyImageLabel, out, pieces, scan);
                 return close + run;
             }
         }
@@ -229,6 +270,11 @@ public final class CodexDialogPreview {
     /** 行首才识别围栏，避免把段中的反引号当成代码块。 */
     private static boolean isLineStart(String source, int index) {
         return index == 0 || source.charAt(index - 1) == '\n';
+    }
+
+    /** 截断窗口的末尾没有这个下标。需要它才能确认的闭合不能当成原文已经结束。 */
+    private static boolean unseenAfter(Scan scan, String source, int index) {
+        return scan.truncated && source == scan.prefix && index >= source.length();
     }
 
     /** 标记两侧的英文数字不构成强调，中文和空白可以。 */
@@ -252,21 +298,29 @@ public final class CodexDialogPreview {
     }
 
     /** 寻找同样长度、且没有更长连续标记包住的闭合位置。 */
-    private static int findExactRun(String source, int from, char mark, int count, int[] work) {
+    private static int findExactRun(String source, int from, char mark, int count, Scan scan) {
         for (int index = from; index + count <= source.length(); index++) {
-            if (charge(work)) return -1;
+            if (scan.charge()) return -1;
             if (isEscaped(source, index) || source.charAt(index) != mark) continue;
             int run = runLength(source, index, mark);
-            if (run == count) return index;
+            if (run == count) {
+                if (unseenAfter(scan, source, index + run)) {
+                    // 紧贴窗口末尾的标记可能在窗外继续，长度还不能确定。
+                    scan.noteEnd(source);
+                    return -1;
+                }
+                return index;
+            }
             index += run - 1;
         }
+        scan.noteEnd(source);
         return -1;
     }
 
     /** 闭合强调时跳过已经完整的代码和链接，避免在它们内部截断。 */
-    private static int emphasisClose(String source, int from, char mark, int count, int[] work) {
+    private static int emphasisClose(String source, int from, char mark, int count, Scan scan) {
         for (int index = from; index + count <= source.length(); index++) {
-            if (charge(work)) return -1;
+            if (scan.charge()) return -1;
             if (isEscaped(source, index)) {
                 index++;
                 continue;
@@ -274,19 +328,19 @@ public final class CodexDialogPreview {
             char current = source.charAt(index);
             if (current == '`') {
                 int run = runLength(source, index, '`');
-                int close = findExactRun(source, index + run, '`', run, work);
+                int close = findExactRun(source, index + run, '`', run, scan);
                 if (close >= 0) {
                     index = close + run - 1;
                     continue;
                 }
             } else if (current == '!' && index + 1 < source.length() && source.charAt(index + 1) == '[') {
-                int end = linkEnd(source, index + 1, work);
+                int end = linkEnd(source, index + 1, scan);
                 if (end > index) {
                     index = end - 1;
                     continue;
                 }
             } else if (current == '[') {
-                int end = linkEnd(source, index, work);
+                int end = linkEnd(source, index, scan);
                 if (end > index) {
                     index = end - 1;
                     continue;
@@ -294,26 +348,38 @@ public final class CodexDialogPreview {
             }
             if (source.charAt(index) == mark && runLength(source, index, mark) == count) return index;
         }
+        scan.noteEnd(source);
         return -1;
     }
 
-    /** 读取完整围栏的结束位置；信息行或结束行不完整时返回起点。 */
-    private static int fenceEnd(String source, int start) {
+    /** 读取完整围栏的结束位置；信息行或结束行不完整时返回起点。窗口末尾仍未结束时记下未闭合。 */
+    private static int fenceEnd(String source, int start, Scan scan) {
         char mark = source.charAt(start);
         if (mark != '`' && mark != '~') return start;
         int count = runLength(source, start, mark);
         if (count < 3) return start;
         int infoEnd = source.indexOf('\n', start + count);
-        if (infoEnd < 0) return start;
+        if (infoEnd < 0) {
+            scan.noteEnd(source);
+            return start;
+        }
         if (mark == '`' && source.substring(start + count, infoEnd).indexOf('`') >= 0) return start;
         int line = infoEnd + 1;
         while (line < source.length()) {
             int next = source.indexOf('\n', line);
             int lineEnd = next < 0 ? source.length() : next;
-            if (closesFence(source, line, lineEnd, mark, count)) return lineEnd + (next < 0 ? 0 : 1);
+            if (closesFence(source, line, lineEnd, mark, count)) {
+                if (next < 0 && unseenAfter(scan, source, lineEnd)) {
+                    // 结束行没有换行就碰到窗口末尾，后面还可能有非空白字符。
+                    scan.noteEnd(source);
+                    return start;
+                }
+                return lineEnd + (next < 0 ? 0 : 1);
+            }
             if (next < 0) break;
             line = next + 1;
         }
+        scan.noteEnd(source);
         return start;
     }
 
@@ -347,18 +413,23 @@ public final class CodexDialogPreview {
     }
 
     /** 链接或图片必须有闭合标签和目标，否则整段保持原样。 */
-    private static int linkEnd(String source, int bracket, int[] work) {
-        int labelEnd = closingBracket(source, bracket + 1, work);
-        if (labelEnd < 0 || labelEnd + 1 >= source.length() || source.charAt(labelEnd + 1) != '(') return -1;
-        int destinationEnd = destinationClose(source, labelEnd + 1, work);
+    private static int linkEnd(String source, int bracket, Scan scan) {
+        int labelEnd = closingBracket(source, bracket + 1, scan);
+        if (labelEnd < 0) return -1;
+        if (labelEnd + 1 >= source.length()) {
+            scan.noteEnd(source);
+            return -1;
+        }
+        if (source.charAt(labelEnd + 1) != '(') return -1;
+        int destinationEnd = destinationClose(source, labelEnd + 1, scan);
         return destinationEnd < 0 ? -1 : destinationEnd + 1;
     }
 
     /** 标签内的方括号按层配对，换行或转义右括号都不提前结束。 */
-    private static int closingBracket(String source, int start, int[] work) {
+    private static int closingBracket(String source, int start, Scan scan) {
         int depth = 1;
         for (int index = start; index < source.length() && source.charAt(index) != '\n'; index++) {
-            if (charge(work)) return -1;
+            if (scan.charge()) return -1;
             if (isEscaped(source, index)) continue;
             char value = source.charAt(index);
             if (value == '[') depth++;
@@ -367,27 +438,44 @@ public final class CodexDialogPreview {
                 if (depth == 0) return index;
             }
         }
+        if (start >= source.length()) {
+            scan.noteEnd(source);
+            return -1;
+        }
+        if (source.charAt(start) == '\n') return -1;
+        int index = start;
+        while (index < source.length() && source.charAt(index) != '\n') index++;
+        if (index >= source.length()) scan.noteEnd(source);
         return -1;
     }
 
     /** 普通目标按圆括号层数结束；尖括号目标允许空格，标题写法保持不动。 */
-    private static int destinationClose(String source, int openParen, int[] work) {
+    private static int destinationClose(String source, int openParen, Scan scan) {
         int index = openParen + 1;
-        if (index >= source.length()) return -1;
+        if (index >= source.length()) {
+            scan.noteEnd(source);
+            return -1;
+        }
         if (source.charAt(index) == '<') {
             int angle = index + 1;
             while (angle < source.length() && source.charAt(angle) != '\n') {
-                if (charge(work)) return -1;
+                if (scan.charge()) return -1;
                 if (source.charAt(angle) == '>' && !isEscaped(source, angle)) break;
                 angle++;
             }
-            if (angle >= source.length() || source.charAt(angle) != '>' || angle + 1 >= source.length()
-                    || source.charAt(angle + 1) != ')') return -1;
+            if (angle >= source.length()) {
+                scan.noteEnd(source);
+                return -1;
+            }
+            if (source.charAt(angle) != '>' || angle + 1 >= source.length() || source.charAt(angle + 1) != ')') {
+                if (source.charAt(angle) == '>' && angle + 1 >= source.length()) scan.noteEnd(source);
+                return -1;
+            }
             return angle + 1;
         }
         int depth = 1;
         while (index < source.length()) {
-            if (charge(work)) return -1;
+            if (scan.charge()) return -1;
             char value = source.charAt(index);
             if (value == '\n') return -1;
             if (!isEscaped(source, index)) {
@@ -399,14 +487,15 @@ public final class CodexDialogPreview {
             }
             index++;
         }
+        scan.noteEnd(source);
         return -1;
     }
 
     /** 链接留下标签。图片说明只展开一次；展开后仍是空白时，改用调用方给出的照片文案并撤掉这段 span。 */
-    private static void appendLink(String source, int bracket, boolean image, int base, String emptyImageLabel, StringBuilder out, ArrayList<Piece> pieces, int[] work) {
-        int labelEnd = closingBracket(source, bracket + 1, work);
+    private static void appendLink(String source, int bracket, boolean image, int base, String emptyImageLabel, StringBuilder out, ArrayList<Piece> pieces, Scan scan) {
+        int labelEnd = closingBracket(source, bracket + 1, scan);
         int labelStart = bracket + 1;
-        if (labelEnd < labelStart || work[0] > LIST_PREVIEW_WORK) return;
+        if (labelEnd < labelStart || scan.work > LIST_PREVIEW_WORK) return;
         int outputBefore = out.length();
         int piecesBefore = pieces == null ? 0 : pieces.size();
         int savedSourceEnd = 0;
@@ -416,7 +505,7 @@ public final class CodexDialogPreview {
             savedSourceEnd = last.sourceEnd;
             savedOutputEnd = last.outputEnd;
         }
-        flattenInto(source.substring(labelStart, labelEnd), base + labelStart, emptyImageLabel, out, pieces, work);
+        flattenInto(source.substring(labelStart, labelEnd), base + labelStart, emptyImageLabel, out, pieces, scan);
         if (!image || !regionIsBlank(out, outputBefore)) return;
         out.setLength(outputBefore);
         if (pieces != null) {
