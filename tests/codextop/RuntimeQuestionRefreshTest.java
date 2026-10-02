@@ -47,7 +47,7 @@ public final class RuntimeQuestionRefreshTest {
                 Class<?> type = loader.loadClass("com.butang.codextop.QuestionRefreshProbe");
                 for (String method : hasRefresh ? new String[]{"main", "refreshScenarios", "staleScenarios", "linkedScenarios",
                         "readIdentityScenarios", "identityScenarios", "openBootstrapScenarios", "deadlineScenarios",
-                        "knownLinkedScenarios"}
+                        "knownLinkedScenarios", "independentReadScenarios", "returnedKeyScenarios"}
                         : new String[]{"main"}) {
                     try { type.getMethod(method, String[].class).invoke(null, (Object) new String[0]); }
                     catch (java.lang.reflect.InvocationTargetException error) { throw new AssertionError("真实提问生命周期回归失败", error.getCause()); }
@@ -257,6 +257,117 @@ public final class RuntimeQuestionRefreshTest {
                 android.os.SystemClock.elapsed=15100;
                 answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
                 check(!same&&desktop.reads==reads&&desktop.sends==1,"相同current没有零RPC更新期限");
+            }
+            public static void independentReadScenarios(String[] ignored)throws Exception{
+                reset();now=16000;android.os.SystemClock.elapsed=16000;
+                QuestionReview initial=read();DesktopQuestion request=initial.requests.get(0);
+                check(desktop.reads==1&&"stale".equals(status(1).validity),"过期初读不是一次");
+                int[] errors={0},success={0};
+                check(refreshQuestions(initial,request,(r,e)->{if(r==null)errors[0]++;}),"第一次过期刷新没有通知原表单");
+                for(int n=0;n<3;n++)check(!refreshQuestions(initial,request,(r,e)->errors[0]++),"相同过期重复回调");
+                pump();check(desktop.reads==1&&errors[0]==1,"相同过期又发起了读取");
+                observation("needs_input","turn","a","b");QuestionReview[] fresh={null};
+                check(refreshQuestions(initial,request,(r,e)->{fresh[0]=r;if(r!=null)success[0]++;}),"过期恢复没有读题");
+                pump();check(desktop.reads==2&&success[0]==1&&fresh[0]!=null&&fresh[0].requests.get(0).canAnswer,"恢复后的题目不可回答");
+                QuestionReview loaded=fresh[0];DesktopQuestion current=loaded.requests.get(0);long expiry=loaded.expiry;
+                for(int n=0;n<3;n++){observation("needs_input","turn","a","b");check(!refreshQuestions(loaded,current,(r,e)->success[0]++),"相同current重复回调");}
+                pump();check(desktop.reads==2&&loaded.expiry>expiry,"相同current没有零RPC更新期限");
+                reset();now=16000;android.os.SystemClock.elapsed=16000;QuestionReview failed=read();DesktopQuestion failedRequest=failed.requests.get(0);
+                refreshQuestions(failed,failedRequest,(r,e)->{});observation("needs_input","turn","a","b");
+                desktop.onRead=()->{throw new RuntimeException("synthetic one-shot control read failure");};
+                final int[] refreshed={0},failedCallbacks={0};
+                refreshQuestions(failed,failedRequest,(r,e)->{if(r==null)failedCallbacks[0]++;else refreshed[0]++;});
+                check(!refreshQuestions(failed,failedRequest,(r,e)->refreshed[0]++),"在途失败又发起了第二次读取");
+                pump();
+                check(desktop.reads==2&&failedCallbacks[0]==1&&failed.current()&&refreshed[0]==0,"一次失败改变了身份或启用了旧回答");
+                desktop.onRead=null;
+                for(int n=0;n<10;n++){now+=5000;observation("needs_input","turn","a","b");refreshQuestions(failed,failedRequest,(r,e)->{if(r!=null)refreshed[0]++;});pump();}
+                check(desktop.reads==3&&refreshed[0]==1,"一次失败的读题后，相同current状态没有再试一次");
+                for(int n=0;n<3;n++){observation("needs_input","turn","a","b");check(!refreshQuestions(failed,failedRequest,(r,e)->refreshed[0]++),"成功后相同current又读题");}
+                pump();check(desktop.reads==3&&refreshed[0]==1,"成功后的相同current不是零RPC");
+                desktop.onRead=()->{throw new RuntimeException("synthetic repeated control read failure");};
+                int bounded=desktop.reads;
+                for(int n=0;n<4;n++){
+                    observation("running","turn");
+                    int before=desktop.reads;
+                    refreshQuestions(failed,failedRequest,(r,e)->{});
+                    refreshQuestions(failed,failedRequest,(r,e)->{});
+                    pump();
+                    check(desktop.reads==before+1,"同一次状态跳动发起了多次失败读取");
+                }
+                check(desktop.reads==bounded+4,"重复失败没有按每次状态跳动只读一次");
+                remoteIds.put(1L,"other-remote");
+                int frozen=desktop.reads;
+                observation("running","turn");
+                QuestionReview[] late={failed};
+                refreshQuestions(failed,failedRequest,(r,e)->late[0]=r);pump();
+                check(desktop.reads==frozen&&(late[0]==null||!failed.current()),"身份变化后失败重试仍在读取或保持提交许可");
+            }
+            public static void returnedKeyScenarios(String[] ignored)throws Exception{
+                reset();QuestionReview review=read();DesktopQuestion request=review.requests.get(0);
+                check(review.expiry>0&&desktop.reads==1,"原始current读题没有期限");
+                JsonObject rollout=new JsonObject(),body=new JsonObject();rollout.addProperty("ok",true);rollout.addProperty("machineOnline",true);rollout.add("observation",body);
+                body.addProperty("v",1);body.addProperty("source","rollout");body.addProperty("turnId","turn");body.addProperty("state","needs_input");
+                JsonArray ids=new JsonArray();for(String id:new String[]{"a","b"}){JsonObject item=new JsonObject();item.addProperty("requestId",id);item.addProperty("kind","user_action_request");ids.add(item);}body.add("requests",ids);
+                now=20;android.os.SystemClock.elapsed=now;statuses.observation(1,"machine",rollout,now,now);
+                desktop.onRead=()->{throw new RuntimeException("synthetic control failure");};
+                int[] failures={0},success={0};
+                refreshQuestions(review,request,(loaded,error)->{if(loaded==null)failures[0]++;else success[0]++;});
+                check(!refreshQuestions(review,request,(loaded,error)->success[0]++),"失败读取在途又发起一次");
+                pump();
+                check(desktop.reads==2&&failures[0]==1&&success[0]==0&&review.expiry==-1&&review.current(),"失败读题没有停用期限或改变了身份");
+                desktop.onRead=null;
+                for(int n=0;n<6;n++){now+=5000;observation("needs_input","turn","a","b");refreshQuestions(review,request,(loaded,error)->{if(loaded!=null)success[0]++;});pump();}
+                System.out.println("RETURNED_ORIGINAL_KEY reads="+desktop.reads+" success="+success[0]+" identityCurrent="+review.current()+" expiry="+review.expiry);
+                check(desktop.reads==3&&success[0]==1,"failure then original current key remains disabled without a control reread");
+                int settled=desktop.reads;
+                for(int n=0;n<3;n++){observation("needs_input","turn","a","b");check(!refreshQuestions(review,request,(loaded,error)->success[0]++),"成功后回到原键仍在读题");}
+                pump();check(desktop.reads==settled&&success[0]==1,"成功后的原键不是零RPC");
+                desktop.onRead=()->{throw new RuntimeException("synthetic transition failure");};
+                observation("needs_input","other-turn","a","b");
+                refreshQuestions(review,request,(loaded,error)->{});
+                refreshQuestions(review,request,(loaded,error)->{});
+                pump();
+                check(desktop.reads==settled+1,"失败后的轮次变化没有只读一次");
+                desktop.onRead=null;
+                observation("needs_input","other-turn","a");
+                int[] transition={0};
+                refreshQuestions(review,request,(loaded,error)->{if(loaded!=null)transition[0]++;});pump();
+                check(desktop.reads==settled+2&&transition[0]==1,"失败后的题目集合变化没有完成一次核对");
+                observation("needs_input","other-turn","a");
+                check(!refreshQuestions(review,request,(loaded,error)->transition[0]++),"题目集合核对成功后又读了一次");
+                desktop.onRead=()->{throw new RuntimeException("synthetic guard failure");};
+                observation("needs_input","guard-turn","a");
+                int[] disabled={0};int beforeGuard=desktop.reads;
+                refreshQuestions(review,request,(loaded,error)->{if(loaded==null)disabled[0]++;});
+                refreshQuestions(review,request,(loaded,error)->disabled[0]++);
+                pump();
+                check(desktop.reads==beforeGuard+1&&disabled[0]==1&&review.expiry==-1,"失败后的再次核对没有停在单次在途");
+                desktop.onRead=null;int frozen=desktop.reads;
+                android.os.SystemClock.elapsed=now+16000;
+                int[] staleNotes={0};
+                refreshQuestions(review,request,(loaded,error)->{staleNotes[0]++;if(loaded!=null)throw new AssertionError("过期仍交付题目");});
+                answerQuestions(review,request,Map.of("a","kept"),(outcome,message)->{});pump();
+                check(desktop.reads==frozen&&staleNotes[0]==1&&desktop.sends==0,"过期状态在失败后仍读取或派发草稿");
+                JsonObject unknown=new JsonObject(),fact=new JsonObject();unknown.addProperty("ok",true);unknown.addProperty("machineOnline",true);unknown.add("observation",fact);
+                fact.addProperty("v",1);fact.addProperty("state","unknown");fact.addProperty("reason","not_observed");
+                now+=17000;android.os.SystemClock.elapsed=now;statuses.observation(1,"machine",unknown,now,now);
+                int[] unknownNotes={0};
+                refreshQuestions(review,request,(loaded,error)->{unknownNotes[0]++;if(loaded!=null)throw new AssertionError("未知仍交付题目");});
+                answerQuestions(review,request,Map.of("a","kept"),(outcome,message)->{});pump();
+                check(desktop.reads==frozen&&unknownNotes[0]==1&&desktop.sends==0,"未知状态在失败后仍读取或派发草稿");
+                desktop.snapshot=snapshot("expired",false);
+                observation("needs_input","guard-turn","a");
+                QuestionReview[] expired={null};int beforeExpired=desktop.reads;
+                refreshQuestions(review,request,(loaded,error)->expired[0]=loaded);pump();
+                check(desktop.reads==beforeExpired+1&&expired[0]!=null&&!expired[0].requests.get(0).canAnswer,"失效题目在失败后没有核对或仍可提交");
+                answerQuestions(expired[0],expired[0].requests.get(0),Map.of("a","kept"),(outcome,message)->{});pump();
+                check(desktop.sends==0,"失效题目核对后仍派发草稿");
+                remoteIds.put(1L,"other-remote");int identityReads=desktop.reads;
+                observation("needs_input","guard-turn","a");
+                QuestionReview[] late={review};
+                refreshQuestions(review,request,(loaded,error)->late[0]=loaded);pump();
+                check(desktop.reads==identityReads&&late[0]==null&&desktop.sends==0,"身份变化后仍读取或派发草稿");
             }
         """;
 }

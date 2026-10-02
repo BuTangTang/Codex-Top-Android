@@ -1092,7 +1092,7 @@ public final class CodexRuntime {
         private final android.content.SharedPreferences issued;
         private SessionStatus.Snapshot observation;
         private long expiry = -1, expiryStart = -1;
-        private boolean refreshing, invalidNotified;
+        private boolean refreshing, invalidNotified, revalidationRequired;
 
         /** 固定原题所属账号、页面、电脑、remote、连接、来源和 linked。期限单独保存，不参与误关表单。 */
         private QuestionReview(PasswordLogin.Session account, long epoch, int selectedAccount, long generation,
@@ -1190,13 +1190,14 @@ public final class CodexRuntime {
             return true;
         }
         review.invalidNotified = false;
-        if (review.refreshing || review.observationKey(observed, request).equals(review.observationKey(review.observation, request))) {
+        // 在途只合并一次。失败后即使状态回到上次成功的键，下一次 current 仍要再核对。
+        if (review.refreshing) return false;
+        if (!review.revalidationRequired
+                && review.observationKey(observed, request).equals(review.observationKey(review.observation, request))) {
             review.observation = observed;
             review.adoptExpiry(expiry);
             return false;
         }
-        review.observation = observed;
-        review.adoptExpiry(expiry);
         review.refreshing = true;
         readQuestions(review.dialogId, (loaded, error) -> {
             review.refreshing = false;
@@ -1204,9 +1205,14 @@ public final class CodexRuntime {
             if (!review.current()) callback.accept(null, "电脑连接已变化。");
             else if (loaded != null && error == null) {
                 // 忙碌期间STATUS仍会前进；旧读回不得重新启用已失效的原表单。
+                review.revalidationRequired = false;
                 review.observation = loaded.observation;
                 if (!refreshQuestions(review, request, callback)) callback.accept(loaded, null);
-            } else callback.accept(loaded, error);
+            } else {
+                review.revalidationRequired = true;
+                review.adoptExpiry(-1);
+                callback.accept(loaded, error);
+            }
         });
         return true;
     }
