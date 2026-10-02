@@ -33,7 +33,17 @@ public final class SettingsBrowserIconsTest {
             actual.append(factory.getFieldByName(field).orElseThrow());
         for (String method : List.of("of", "ofCodex", "ofBrowse", "equals", "contentsEquals"))
             for (var overload : factory.getMethodsByName(method)) actual.append(overload);
-        actual.append("}} void fill(ArrayList<UItem> items) {").append(branch).append("}");
+        actual.append("}}");
+        ClassOrInterfaceDeclaration computer = source.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .filter(value -> value.getNameAsString().equals("ComputerCell")).findFirst().orElseThrow();
+        var computerFactory = computer.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .filter(value -> value.getNameAsString().equals("Factory")).findFirst().orElseThrow();
+        actual.append("static class ComputerCell {").append(computer.getMethodsByName("statusOf").get(0))
+                .append("static class Factory {").append(computerFactory.getMethodsByName("of").get(0)).append("}}");
+        String click = source.getMethodsByName("onClick").get(0).toString();
+        if (!click.contains("item.id == 1000") || !click.contains("codexMachine") || !click.contains("presentFragment(new SettingsActivity(child))"))
+            throw new AssertionError("电脑点击不再走原项目路由");
+        actual.append("void fill(ArrayList<UItem> items) {").append(branch).append("}");
         Path model = Path.of("TMessagesProj/src/main/java/com/butang/codextop");
         var identity = StaticJavaParser.parse(model.resolve("BrowseStore.java")).getClassByName("BrowseStore").orElseThrow()
                 .getMethodsByName("identity").get(0);
@@ -85,7 +95,7 @@ public final class SettingsBrowserIconsTest {
             /** 电脑和项目只换现有语义素材，真实行负载、原稳定键和顺序不变。 */
             static void entities(){
                 BrowserIconsProbe p=page(false,false);JsonObject a=row("a"),b=row("b");p.codexBrowseRows.add(a);p.codexBrowseRows.add(b);p.codexBrowseLoaded=true;
-                ArrayList<UItem> rows=items(p);check(rows.size()==3&&rows.get(0).iconResId==R.drawable.settings_devices,"computer row kept unrelated brand icon");
+                ArrayList<UItem> rows=items(p);check(rows.size()==3&&"在线".contentEquals(String.valueOf(rows.get(0).subtext)),"computer status no longer comes from the active fact");
                 check(rows.get(0).id==1000&&rows.get(0).object==a&&"computers:a".equals(rows.get(0).object2)&&rows.get(1).object==b,"computer identity, click payload or order changed");
                 p=page(true,false);p.codexBrowseRows.add(a);rows=items(p);
                 check(rows.size()==3&&rows.get(0).id==8&&rows.get(0).iconResId==R.drawable.settings_chat,"all conversations entry lost semantic icon or id");

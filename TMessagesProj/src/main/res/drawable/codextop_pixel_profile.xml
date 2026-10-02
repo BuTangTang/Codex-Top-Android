@@ -4,8 +4,7 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- 底栏我的图标。单色小人像素，不是会话或聊天顶部的头像。 -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M10,4h2v2h-2z M12,4h2v2h-2z M8,6h2v2h-2z M10,6h2v2h-2z M12,6h2v2h-2z M14,6h2v2h-2z M8,8h2v2h-2z M10,8h2v2h-2z M12,8h2v2h-2z M14,8h2v2h-2z M10,10h2v2h-2z M12,10h2v2h-2z M8,12h2v2h-2z M10,12h2v2h-2z M12,12h2v2h-2z M14,12h2v2h-2z M6,14h2v2h-2z M8,14h2v2h-2z M10,14h2v2h-2z M12,14h2v2h-2z M14,14h2v2h-2z M16,14h2v2h-2z M6,16h2v2h-2z M8,16h2v2h-2z M10,16h2v2h-2z M12,16h2v2h-2z M14,16h2v2h-2z M16,16h2v2h-2z" />
+        android:pathData="M8,1h8v2h-8zM6,3h2v8h-2zM16,3h2v8h-2zM8,11h8v2h-8zM2,15h20v2h-20zM2,17h2v4h-2zM20,17h2v4h-2zM4,21h16v2h-16z" />
 </vector>

@@ -367,37 +367,34 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         return java.text.NumberFormat.getNumberInstance().format(duration / 1000.0) + " 秒";
     }
 
+    /** 已有快照时每个窗口独立成行；刷新中不拿掉原数字、时间和位置。 */
+    private UItem codexUsageItem() {
+        java.text.NumberFormat percent = java.text.NumberFormat.getNumberInstance();
+        percent.setMaximumFractionDigits(1);
+        ArrayList<UsageCell.MeterLine> lines = new ArrayList<>();
+        for (com.butang.codextop.AccountUsage.Meter meter : codexUsage.meters) {
+            boolean missing = meter.remainingPercent == null;
+            String shown = null;
+            String suffix = null;
+            if (!missing) {
+                shown = percent.format(meter.remainingPercent) + "%";
+                suffix = meter.estimated ? "采集时预计剩余" : "采集时剩余";
+            }
+            lines.add(new UsageCell.MeterLine(meter.label, codexQuotaWindow(meter.windowDurationMs), shown, suffix,
+                    meter.resetsAtMs == null ? "来源未返回" : codexQuotaTime(meter.resetsAtMs), missing,
+                    missing ? 0 : meter.remainingPercent));
+        }
+        return UsageCell.Factory.of(new UsageCell.State(lines,
+                TextUtils.isEmpty(codexUsage.accountLabel) ? "来源未返回" : codexUsage.accountLabel,
+                codexQuotaTime(codexUsage.fetchedAtMs), codexUsage.isStale(System.currentTimeMillis()),
+                codexUsageLoading, codexUsageError));
+    }
+
     /** 额度优先使用原文字行；窗口与重置紧邻，原采集来源、预计及过期含义完整保留。 */
     private void fillCodexUsageItems(ArrayList<UItem> items) {
         items.add(UItem.asHeader("Codex 额度"));
         if (codexUsageMachineId() != null && codexUsage != null && codexUsage.available) {
-            int id = 40;
-            java.text.NumberFormat percent = java.text.NumberFormat.getNumberInstance();
-            percent.setMaximumFractionDigits(1);
-            StringBuilder resets = new StringBuilder();
-            for (com.butang.codextop.AccountUsage.Meter meter : codexUsage.meters) {
-                CharSequence remaining = "剩余比例未返回";
-                if (meter.remainingPercent != null) {
-                    String value = percent.format(meter.remainingPercent) + "%";
-                    android.text.SpannableStringBuilder text = new android.text.SpannableStringBuilder(value)
-                            .append(meter.estimated ? "  采集时预计剩余" : "  采集时剩余");
-                    text.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, value.length(),
-                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                    text.setSpan(new android.text.style.RelativeSizeSpan(1.375f), 0, value.length(),
-                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                    text.setSpan(new org.telegram.ui.Components.ForegroundColorSpanThemable(Theme.key_windowBackgroundWhiteBlueText), 0, value.length(),
-                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                    remaining = text;
-                }
-                items.add(SettingCell.Factory.ofCodex(id++, 0, 0, 0, remaining,
-                        meter.label + " · " + codexQuotaWindow(meter.windowDurationMs)).setEnabled(false));
-                ++id; // 保留各窗口原编号间隔，重置说明合并到同一原说明行。
-                if (resets.length() > 0) resets.append('\n');
-                resets.append(meter.label).append(" · 重置时间：").append(meter.resetsAtMs == null
-                        ? "来源未返回" : codexQuotaTime(meter.resetsAtMs));
-            }
-            // 长日期沿原说明行自然换行，各窗口不单独拆成卡片。
-            items.add(UItem.asShadow(resets));
+            items.add(codexUsageItem());
         }
         if (codexMyRoot()) {
             items.add(SettingCell.Factory.ofCodex(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
@@ -410,13 +407,6 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         if (codexUsageMachineId() == null) {
             items.add(UItem.asShadow("选择来源电脑后显示该电脑的 Codex 额度"));
             return;
-        }
-        if (codexUsage != null && codexUsage.available) {
-            items.add(SettingCell.Factory.ofCodex(31, 0, 0, 0, "采集账号", TextUtils.isEmpty(codexUsage.accountLabel)
-                    ? "来源未返回" : codexUsage.accountLabel).setEnabled(false));
-            items.add(SettingCell.Factory.ofCodex(32, 0, 0, 0,
-                    codexUsage.isStale(System.currentTimeMillis()) ? "采集时间（已过期）" : "采集时间",
-                    codexQuotaTime(codexUsage.fetchedAtMs)).setEnabled(false));
         }
         String status = codexUsageLoading && (codexUsage == null || !codexUsage.available) ? "正在读取" : codexUsageError != null ? codexUsageError
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
@@ -984,12 +974,15 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 }
                 for (int i = 0; i < codexBrowseRows.size(); i++) {
                     com.google.gson.JsonObject row = codexBrowseRows.get(i).getAsJsonObject();
+                    if (computers) {
+                        items.add(ComputerCell.Factory.of(row));
+                        continue;
+                    }
                     String subtitle = conversations ? "" : row.has("cached") && row.get("cached").getAsBoolean() ? "状态未更新"
-                            : computers ? (row.get("active").getAsBoolean() ? "在线" : "离线")
                             : (row.get("available").getAsBoolean() ? "项目" : "暂不可用");
-                    String kind = conversations ? "conversations" : computers ? "computers" : "projects";
+                    String kind = conversations ? "conversations" : "projects";
                     items.add(SettingCell.Factory.ofBrowse(kind + ":" + com.butang.codextop.BrowseStore.identity(kind, row), row, IconBackgroundColors.BLUE_DEEP.top,
-                            IconBackgroundColors.BLUE_DEEP.bottom, conversations ? 0 : computers ? R.drawable.settings_devices : R.drawable.settings_folders,
+                            IconBackgroundColors.BLUE_DEEP.bottom, conversations ? 0 : R.drawable.settings_folders,
                             conversations ? (row.has("title") && !row.get("title").isJsonNull()
                                     ? row.get("title").getAsString() : "未命名对话") : row.get("name").getAsString(), subtitle));
                 }
@@ -1011,17 +1004,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
             fillCodexUsageItems(items);
             com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
-            items.add(SettingCell.Factory.ofCodex(20, 0, 0, 0, "账号",
-                    TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName).setEnabled(false));
-            items.add(SettingCell.Factory.ofCodex(21, 0, 0, 0, "连接状态", account.connectionLabel).setEnabled(false));
-            items.add(SettingCell.Factory.ofCodex(22, 0, 0, 0, "服务地址", account.server).setEnabled(false));
-            items.add(UItem.asShadow(null));
+            items.add(AccountMetaCell.Factory.of(
+                    TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName,
+                    account.connectionLabel, account.server,
+                    "已读取的聊天记录保存在本机，联网后自动更新", getVersionName()));
             items.add(SettingCell.Factory.ofCodex(6, 0, 0, 0, "最近会话条数",
                     com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
-            items.add(UItem.asShadow(null));
-            items.add(SettingCell.Factory.ofCodex(23, 0, 0, 0, "本地缓存",
-                    "已读取的聊天记录保存在本机，联网后自动更新", SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(false));
-            items.add(SettingCell.Factory.ofCodex(24, 0, 0, 0, "版本", getVersionName()).setEnabled(false));
             items.add(UItem.asShadow(null));
             return;
         }
@@ -1875,6 +1863,430 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 item.text = attachMenuBot.short_name;
                 item.longValue = ((long) iconColorBottom << 32) | (iconColorTop & 0xFFFFFFFFL);
                 return item;
+            }
+        }
+    }
+
+    /** 我的页账号资料纵向排列，长账号不再和标签挤在同一行。 */
+    public static class AccountMetaCell extends LinearLayout implements Theme.Colorable {
+        private final Theme.ResourcesProvider resourcesProvider;
+        private final TextView[] labels = new TextView[5];
+        private final TextView[] values = new TextView[5];
+
+        public AccountMetaCell(Context context, Theme.ResourcesProvider resourcesProvider) {
+            super(context);
+            this.resourcesProvider = resourcesProvider;
+            setOrientation(VERTICAL);
+            setPadding(dp(16), dp(12), dp(16), dp(12));
+            String[] titles = {"账号", "连接状态", "服务地址", "本地缓存", "版本"};
+            for (int i = 0; i < titles.length; i++) {
+                labels[i] = new TextView(context);
+                labels[i].setText(titles[i]);
+                labels[i].setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                values[i] = new TextView(context);
+                values[i].setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                values[i].setSingleLine(false);
+                addView(labels[i], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+                addView(values[i], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, i == titles.length - 1 ? 0 : 8));
+            }
+            updateColors();
+        }
+
+        public void setValues(String account, String connection, String server, String cache, String version) {
+            values[0].setText(account);
+            values[1].setText(connection);
+            values[2].setText(server);
+            values[3].setText(cache);
+            values[4].setText(version);
+        }
+
+        @Override
+        public void updateColors() {
+            int ink = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider);
+            int secondary = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourcesProvider);
+            setBackgroundColor(Theme.getColor(Theme.key_dialogBackground, resourcesProvider));
+            for (int i = 0; i < labels.length; i++) {
+                labels[i].setTextColor(secondary);
+                values[i].setTextColor(ink);
+            }
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            super.onMeasure(View.MeasureSpec.makeMeasureSpec(View.MeasureSpec.getSize(widthMeasureSpec), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        }
+
+        public static final class State {
+            public final String account, connection, server, cache, version;
+            public State(String account, String connection, String server, String cache, String version) {
+                this.account = account;
+                this.connection = connection;
+                this.server = server;
+                this.cache = cache;
+                this.version = version;
+            }
+            public boolean same(State other) {
+                return other != null && TextUtils.equals(account, other.account) && TextUtils.equals(connection, other.connection)
+                        && TextUtils.equals(server, other.server) && TextUtils.equals(cache, other.cache) && TextUtils.equals(version, other.version);
+            }
+        }
+
+        public static class Factory extends UItem.UItemFactory<AccountMetaCell> {
+            static { setup(new Factory()); }
+            @Override
+            public AccountMetaCell createView(Context context, RecyclerListView listView, int currentAccount, int classGuid, Theme.ResourcesProvider resourcesProvider) {
+                return new AccountMetaCell(context, resourcesProvider);
+            }
+            @Override
+            public void bindView(View view, UItem item, boolean divider, UniversalAdapter adapter, UniversalRecyclerView listView) {
+                AccountMetaCell cell = (AccountMetaCell) view;
+                State state = (State) item.object;
+                cell.setValues(state.account, state.connection, state.server, state.cache, state.version);
+                cell.updateColors();
+            }
+            public static UItem of(String account, String connection, String server, String cache, String version) {
+                UItem item = UItem.ofFactory(Factory.class);
+                item.object = new State(account, connection, server, cache, version);
+                item.object2 = "codex-account";
+                item.setEnabled(false);
+                return item;
+            }
+            @Override
+            public boolean isClickable() {
+                return false;
+            }
+            @Override
+            public boolean equals(UItem a, UItem b) {
+                return java.util.Objects.equals(a.object2, b.object2);
+            }
+            @Override
+            public boolean contentsEquals(UItem a, UItem b) {
+                return equals(a, b) && a.object instanceof State && b.object instanceof State && ((State) a.object).same((State) b.object);
+            }
+        }
+    }
+
+    /** 每个额度窗口独立数字和细刻度；缺失不画成 0，过期不再使用实时强调色。 */
+    public static class UsageCell extends LinearLayout implements Theme.Colorable {
+        public static final class MeterLine {
+            public final String label, window, percent, suffix, reset;
+            public final boolean hideFill;
+            public final double percentValue;
+            public MeterLine(String label, String window, String percent, String suffix, String reset, boolean hideFill, double percentValue) {
+                this.label = label;
+                this.window = window;
+                this.percent = percent;
+                this.suffix = suffix;
+                this.reset = reset;
+                this.hideFill = hideFill;
+                this.percentValue = percentValue;
+            }
+            public boolean same(MeterLine other) {
+                return other != null && hideFill == other.hideFill && Double.compare(percentValue, other.percentValue) == 0 && TextUtils.equals(label, other.label)
+                        && TextUtils.equals(window, other.window) && TextUtils.equals(percent, other.percent)
+                        && TextUtils.equals(suffix, other.suffix) && TextUtils.equals(reset, other.reset);
+            }
+        }
+
+        public static final class State {
+            public final java.util.List<MeterLine> meters;
+            public final String account, fetched, error;
+            public final boolean stale, loading;
+            public State(java.util.List<MeterLine> meters, String account, String fetched, boolean stale, boolean loading, String error) {
+                this.meters = meters;
+                this.account = account;
+                this.fetched = fetched;
+                this.stale = stale;
+                this.loading = loading;
+                this.error = error;
+            }
+            public boolean same(State other) {
+                if (other == null || stale != other.stale || loading != other.loading || meters.size() != other.meters.size()) return false;
+                if (!TextUtils.equals(account, other.account) || !TextUtils.equals(fetched, other.fetched) || !TextUtils.equals(error, other.error)) return false;
+                for (int i = 0; i < meters.size(); i++) if (!meters.get(i).same(other.meters.get(i))) return false;
+                return true;
+            }
+        }
+
+        public static class ScaleView extends View {
+            public double percent;
+            public boolean hideFill;
+            int fillColor, trackColor;
+            private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            public ScaleView(Context context) { super(context); }
+            /** 每格代表 10%；末格按真实余量部分填充，不把 95 画满、也不把 1 画空。 */
+            public static float segmentFill(int index, double percent) {
+                double start = index * 10.0;
+                if (percent <= start) return 0f;
+                if (percent >= start + 10.0) return 1f;
+                return (float) ((percent - start) / 10.0);
+            }
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                setMeasuredDimension(View.MeasureSpec.getSize(widthMeasureSpec), dp(4));
+            }
+            @Override
+            protected void onDraw(Canvas canvas) {
+                int gap = dp(3);
+                int cell = Math.max(1, (getWidth() - gap * 9) / 10);
+                for (int i = 0; i < 10; i++) {
+                    int left = i * (cell + gap);
+                    paint.setColor(trackColor);
+                    canvas.drawRect(left, 0, left + cell, getHeight(), paint);
+                    float fraction = hideFill ? 0f : segmentFill(i, percent);
+                    if (fraction > 0f) {
+                        paint.setColor(fillColor);
+                        canvas.drawRect(left, 0, left + cell * fraction, getHeight(), paint);
+                    }
+                }
+            }
+        }
+
+        private final Theme.ResourcesProvider resourcesProvider;
+        private final ArrayList<TextView> percentViews = new ArrayList<>();
+        private final ArrayList<Boolean> liveNumbers = new ArrayList<>();
+        private final ArrayList<ScaleView> scales = new ArrayList<>();
+        private final ArrayList<TextView> secondaryViews = new ArrayList<>();
+        private final ArrayList<TextView> inkViews = new ArrayList<>();
+        private boolean stale;
+
+        public UsageCell(Context context, Theme.ResourcesProvider resourcesProvider) {
+            super(context);
+            this.resourcesProvider = resourcesProvider;
+            setOrientation(VERTICAL);
+            setPadding(dp(16), dp(12), dp(16), dp(12));
+        }
+
+        public void setState(State state) {
+            removeAllViews();
+            percentViews.clear();
+            liveNumbers.clear();
+            scales.clear();
+            secondaryViews.clear();
+            inkViews.clear();
+            stale = state.stale;
+            for (int i = 0; i < state.meters.size(); i++) {
+                MeterLine line = state.meters.get(i);
+                addText(line.label + " · " + line.window, 13, false, false);
+                TextView percent = addText(line.percent == null ? "剩余比例未返回" : line.percent, line.percent == null ? 16 : 32, true, false);
+                percentViews.add(percent);
+                liveNumbers.add(line.percent != null);
+                if (line.suffix != null) addText(line.suffix, 14, false, false);
+                ScaleView scale = new ScaleView(getContext());
+                scale.percent = line.percentValue;
+                scale.hideFill = line.hideFill;
+                scales.add(scale);
+                addView(scale, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 4, 0, 6, 0, 6));
+                addText("重置时间：" + line.reset, 13, false, false);
+                if (i < state.meters.size() - 1) {
+                    View gap = new View(getContext());
+                    addView(gap, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 8));
+                }
+            }
+            addText(state.stale ? "采集时间（已过期）" : "采集时间", 13, false, false);
+            addText(state.fetched, 15, false, true);
+            addText("采集账号", 13, false, false);
+            addText(state.account, 15, false, true);
+            updateColors();
+        }
+
+        private TextView addText(String text, int sizeSp, boolean percent, boolean ink) {
+            TextView view = new TextView(getContext());
+            view.setText(text);
+            view.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
+            view.setSingleLine(false);
+            if (!percent) {
+                if (ink) inkViews.add(view);
+                else secondaryViews.add(view);
+            }
+            addView(view, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, percent ? 2 : 0, 0, 2));
+            return view;
+        }
+
+        @Override
+        public void updateColors() {
+            int accent = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText, resourcesProvider);
+            int secondary = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourcesProvider);
+            int ink = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider);
+            int track = Theme.getColor(Theme.key_divider, resourcesProvider);
+            setBackgroundColor(Theme.getColor(Theme.key_dialogBackground, resourcesProvider));
+            for (TextView view : secondaryViews) view.setTextColor(secondary);
+            for (TextView view : inkViews) view.setTextColor(ink);
+            for (int i = 0; i < percentViews.size(); i++) {
+                percentViews.get(i).setTextColor(!stale && liveNumbers.get(i) ? accent : secondary);
+            }
+            for (ScaleView scale : scales) {
+                scale.fillColor = stale ? secondary : accent;
+                scale.trackColor = track;
+                scale.invalidate();
+            }
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            super.onMeasure(View.MeasureSpec.makeMeasureSpec(View.MeasureSpec.getSize(widthMeasureSpec), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        }
+
+        public static class Factory extends UItem.UItemFactory<UsageCell> {
+            static { setup(new Factory()); }
+            @Override
+            public UsageCell createView(Context context, RecyclerListView listView, int currentAccount, int classGuid, Theme.ResourcesProvider resourcesProvider) {
+                return new UsageCell(context, resourcesProvider);
+            }
+            @Override
+            public void bindView(View view, UItem item, boolean divider, UniversalAdapter adapter, UniversalRecyclerView listView) {
+                ((UsageCell) view).setState((State) item.object);
+            }
+            public static UItem of(State state) {
+                UItem item = UItem.ofFactory(Factory.class);
+                item.id = 40;
+                item.object = state;
+                item.object2 = "codex-usage";
+                item.setEnabled(false);
+                return item;
+            }
+            @Override
+            public boolean isClickable() {
+                return false;
+            }
+            @Override
+            public boolean equals(UItem a, UItem b) {
+                return a.id == b.id && java.util.Objects.equals(a.object2, b.object2);
+            }
+            @Override
+            public boolean contentsEquals(UItem a, UItem b) {
+                return equals(a, b) && a.object instanceof State && b.object instanceof State && ((State) a.object).same((State) b.object);
+            }
+        }
+    }
+
+    /** 电脑清单上的自然高度卡片；整行仍用原来的稳定键进入项目。 */
+    public static class ComputerCell extends LinearLayout implements Theme.Colorable {
+        private final Theme.ResourcesProvider resourcesProvider;
+        private final View edge;
+        final MonitorView monitor;
+        private final TextView nameView, statusView, openView;
+
+        public static class MonitorView extends View {
+            int color;
+            private final Paint paint = new Paint();
+            public MonitorView(Context context) { super(context); }
+            @Override
+            protected void onDraw(Canvas canvas) {
+                paint.setColor(color);
+                float u = getWidth() / 24f;
+                canvas.drawRect(u, u, 23 * u, 3 * u, paint);
+                canvas.drawRect(u, 3 * u, 3 * u, 16 * u, paint);
+                canvas.drawRect(21 * u, 3 * u, 23 * u, 16 * u, paint);
+                canvas.drawRect(u, 15 * u, 23 * u, 17 * u, paint);
+                canvas.drawRect(10 * u, 17 * u, 14 * u, 20 * u, paint);
+                canvas.drawRect(6 * u, 20 * u, 18 * u, 22 * u, paint);
+            }
+        }
+
+        public ComputerCell(Context context, Theme.ResourcesProvider resourcesProvider) {
+            super(context);
+            this.resourcesProvider = resourcesProvider;
+            setOrientation(HORIZONTAL);
+            setPadding(dp(16), dp(12), dp(16), dp(12));
+            edge = new View(context);
+            monitor = new MonitorView(context);
+            LinearLayout text = new LinearLayout(context);
+            text.setOrientation(VERTICAL);
+            nameView = line(context, 18);
+            statusView = line(context, 13);
+            openView = line(context, 13);
+            openView.setText("查看项目");
+            text.addView(nameView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            text.addView(statusView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+            text.addView(openView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+            addView(edge, LayoutHelper.createLinear(2, 28, Gravity.CENTER_VERTICAL, 0, 0, 10, 0));
+            addView(monitor, LayoutHelper.createLinear(24, 24, Gravity.CENTER_VERTICAL, 0, 0, 12, 0));
+            addView(text, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, Gravity.CENTER_VERTICAL, 0, 0, 0, 0));
+            updateColors();
+        }
+
+        private static TextView line(Context context, int sizeSp) {
+            TextView view = new TextView(context);
+            view.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
+            view.setSingleLine(false);
+            return view;
+        }
+
+        public void bind(String name, String status) {
+            nameView.setText(name);
+            statusView.setText(status);
+        }
+
+        @Override
+        public void updateColors() {
+            int accent = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText, resourcesProvider);
+            setBackgroundColor(Theme.getColor(Theme.key_dialogBackground, resourcesProvider));
+            edge.setBackgroundColor(accent);
+            monitor.color = accent;
+            monitor.invalidate();
+            nameView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider));
+            statusView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourcesProvider));
+            openView.setTextColor(accent);
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int width = View.MeasureSpec.makeMeasureSpec(View.MeasureSpec.getSize(widthMeasureSpec), View.MeasureSpec.EXACTLY);
+            super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            if (getMeasuredHeight() < dp(80)) super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(dp(80), View.MeasureSpec.EXACTLY));
+        }
+
+        /** 连接事实缺失时保持未知，不把缺字段画成离线。 */
+        static String statusOf(com.google.gson.JsonObject row) {
+            if (row.has("cached") && !row.get("cached").isJsonNull() && row.get("cached").getAsBoolean()) return "状态未更新";
+            if (!row.has("active") || row.get("active").isJsonNull()) return "未知";
+            return row.get("active").getAsBoolean() ? "在线" : "离线";
+        }
+
+        public static class Factory extends UItem.UItemFactory<ComputerCell> {
+            static { setup(new Factory()); }
+            @Override
+            public ComputerCell createView(Context context, RecyclerListView listView, int currentAccount, int classGuid, Theme.ResourcesProvider resourcesProvider) {
+                return new ComputerCell(context, resourcesProvider);
+            }
+            @Override
+            public void bindView(View view, UItem item, boolean divider, UniversalAdapter adapter, UniversalRecyclerView listView) {
+                ((ComputerCell) view).bind(item.text == null ? "" : item.text.toString(), item.subtext == null ? "" : item.subtext.toString());
+            }
+            public static UItem of(com.google.gson.JsonObject row) {
+                UItem item = UItem.ofFactory(Factory.class);
+                item.id = 1000;
+                item.object = row;
+                item.object2 = "computers:" + com.butang.codextop.BrowseStore.identity("computers", row);
+                item.text = row.has("name") && !row.get("name").isJsonNull() ? row.get("name").getAsString() : "";
+                item.subtext = statusOf(row);
+                return item;
+            }
+            @Override
+            public boolean equals(UItem a, UItem b) {
+                return a.id == b.id && java.util.Objects.equals(a.object2, b.object2);
+            }
+            @Override
+            public boolean contentsEquals(UItem a, UItem b) {
+                return equals(a, b) && TextUtils.equals(a.text, b.text) && TextUtils.equals(a.subtext, b.subtext)
+                        && TextUtils.equals(text(a, "name"), text(b, "name"))
+                        && java.util.Objects.equals(flag(a, "active"), flag(b, "active"))
+                        && java.util.Objects.equals(flag(a, "cached"), flag(b, "cached"));
+            }
+            private static String text(UItem item, String key) {
+                if (!(item.object instanceof com.google.gson.JsonObject)) return null;
+                com.google.gson.JsonObject row = (com.google.gson.JsonObject) item.object;
+                if (!row.has(key) || row.get(key).isJsonNull()) return null;
+                return row.get(key).getAsString();
+            }
+            private static Boolean flag(UItem item, String key) {
+                if (!(item.object instanceof com.google.gson.JsonObject)) return null;
+                com.google.gson.JsonObject row = (com.google.gson.JsonObject) item.object;
+                if (!row.has(key) || row.get(key).isJsonNull()) return null;
+                return row.get(key).getAsBoolean();
             }
         }
     }

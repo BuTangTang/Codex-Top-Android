@@ -4,8 +4,7 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- 底栏会话图标。单色小像素气泡，由原控件着色，不作为会话头像。 -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M8,4h2v2h-2z M10,4h2v2h-2z M12,4h2v2h-2z M14,4h2v2h-2z M6,6h2v2h-2z M16,6h2v2h-2z M6,8h2v2h-2z M16,8h2v2h-2z M6,10h2v2h-2z M16,10h2v2h-2z M8,12h2v2h-2z M10,12h2v2h-2z M12,12h2v2h-2z M14,12h2v2h-2z M10,14h2v2h-2z M12,14h2v2h-2z M10,16h2v2h-2z" />
+        android:pathData="M4,1h16v2h-16zM1,3h2v14h-2zM21,3h2v14h-2zM4,17h12v2h-12zM8,19h4v2h-4zM6,21h4v2h-4zM8,8h8v2h-8z" />
 </vector>
