@@ -1276,6 +1276,7 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
         this(context, parentFragment, forceDarkTheme, showingFromDialog, true, null);
     }
 
+    /** 构建原附件面板；Codex 分区存储下的文件入口不要求图库权限，其余入口沿原行为。 */
     @SuppressLint("ClickableViewAccessibility")
     public ChatAttachAlert(Context context, final @Nullable BaseFragment parentFragment, boolean forceDarkTheme, boolean showingFromDialog, boolean needCamera, Theme.ResourcesProvider resourcesProvider) {
         super(context, false, resourcesProvider);
@@ -2784,6 +2785,11 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
                     openAudioLayout(true);
                 } else if (num == 4) {
                     if (!documentsEnabled && checkCanRemoveRestrictionsByBoosts()) {
+                        return;
+                    }
+                    // 分区存储的文件页已沿原存储行交系统选择器，只需要用户所选文件的 URI 授权。
+                    if (com.butang.codextop.CodexRuntime.ownsConversation(getDialogId()) && !BuildVars.NO_SCOPED_STORAGE) {
+                        openDocumentsLayout(true);
                         return;
                     }
                     if (Build.VERSION.SDK_INT >= 33) {
@@ -6566,6 +6572,7 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
             return new RecyclerListView.Holder(view);
         }
 
+        /** 绑定原附件按钮；Codex 分区存储文件可正常选择时不显示图库权限错误标记。 */
         @Override
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
             switch (holder.getItemViewType()) {
@@ -6581,7 +6588,8 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
                     } else if (position == documentButton) {
                         attachButton.setTextAndIcon(4, getString(R.string.ChatDocument), GlassTabView.TabAnimation.FILES);
                         attachButton.setTag(4);
-                        err = !checkPhotoAndDocumentsPermission(mContext);
+                        err = !(com.butang.codextop.CodexRuntime.ownsConversation(getDialogId()) && !BuildVars.NO_SCOPED_STORAGE)
+                            && !checkPhotoAndDocumentsPermission(mContext);
                     } else if (position == locationButton) {
                         attachButton.setTextAndIcon(6, getString(R.string.ChatLocation), GlassTabView.TabAnimation.LOCATION);
                         attachButton.setTag(6);
