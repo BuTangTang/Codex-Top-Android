@@ -488,7 +488,13 @@ public class FileLog {
         }
     }
 
+    /** 原入口保持线程栈及 heap 转储行为。 */
     public static void dumpANR() {
+        dumpANR(true);
+    }
+
+    /** 自动 ANR 可只保留线程诊断，不影响显式请求及真实 OOM 的 heap 路径。 */
+    public static void dumpANR(boolean includeHeap) {
         StringBuilder sb = new StringBuilder();
         Map<Thread, StackTraceElement[]> allThreads = Thread.getAllStackTraces();
 
@@ -504,7 +510,9 @@ public class FileLog {
         }
 
         FileLog.e("ANR thread dump\n" + sb.toString());
-        getInstance().dumpMemory(false);
+        if (includeHeap) {
+            getInstance().dumpMemory(false);
+        }
     }
 
     public static void fatal(final Throwable e, boolean logToAppCenter) {

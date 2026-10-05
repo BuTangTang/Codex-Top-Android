@@ -346,7 +346,9 @@ public class ApplicationLoader extends Application {
             }
         };
         if (BuildConfig.DEBUG_VERSION) {
-            new ANRDetector(FileLog::dumpANR);
+            // 独立客户端自动 ANR 只抓线程栈，避免 heap 转储放大卡顿；不初始化业务运行时。
+            final boolean includeHeapInAnr = !applicationContext.getPackageName().startsWith("com.butang.codextop.nativepreview");
+            new ANRDetector(() -> FileLog.dumpANR(includeHeapInAnr));
         }
 
         if (BuildVars.LOGS_ENABLED) {
