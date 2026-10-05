@@ -7401,7 +7401,9 @@ public class ChatActivityEnterView extends FrameLayout implements
                 return;
             }
             if (processSendingText(message, notify, scheduleDate, scheduleRepeatPeriod, payStars)) {
-                if (delegate.hasForwardingMessages() || (scheduleDate != 0 && !isInScheduleMode()) || isInScheduleMode()) {
+                // 独立对话在本次文字提交后同步清输入，避免延迟动画回调清掉下一条草稿。
+                if ((com.butang.codextop.CodexRuntime.enabled() && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id))
+                        || delegate.hasForwardingMessages() || (scheduleDate != 0 && !isInScheduleMode()) || isInScheduleMode()) {
                     if (messageEditText != null) {
                         messageEditText.setText("");
                     }
