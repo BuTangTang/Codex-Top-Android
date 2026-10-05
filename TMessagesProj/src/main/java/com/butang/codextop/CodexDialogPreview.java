@@ -9,7 +9,7 @@ import java.util.ArrayList;
 
 /**
  * 会话列表单行预览的显示副本。
- * 只展开写法完整的行内图片、链接、成对强调和代码；不改消息对象、正文或附件。
+ * 提取明确自动化信封的正文，并展开完整的行内图片、链接、成对强调和代码；不改消息对象、正文或附件。
  */
 public final class CodexDialogPreview {
     /**
@@ -32,6 +32,7 @@ public final class CodexDialogPreview {
      * 返回列表上使用的文字。
      * 没有可折叠格式、扫描超过 {@link #LIST_PREVIEW_WORK}，或超长原文的前缀在窗口末尾仍未闭合时，返回原 CharSequence 及其 span。
      * 有改写时只复制完整落在扫描窗口内、且没有跨过被删结构的 span；查询也停在窗口，不枚举窗口后的 span。
+     * 已识别的自动化信封只保留正文；正文格式无法折叠时也不退回内部字段，纯协议包显示中性摘要。
      * 然后交给原有换行处理。空图片说明使用调用方传入的原照片文案。
      */
     public static CharSequence readable(CharSequence text, String emptyImageLabel) {
@@ -39,19 +40,126 @@ public final class CodexDialogPreview {
         int limit = scanEnd(text);
         if (limit <= 0) return text;
         String source = copyPrefix(text, limit);
+        int[] automation = automationBody(source, limit < text.length());
+        int base = automation == null ? 0 : automation[0];
+        if (automation != null) {
+            if (automation[0] == automation[1]) return "自动化任务";
+            source = source.substring(automation[0], automation[1]);
+        }
         String label = emptyImageLabel == null ? "" : emptyImageLabel;
-        Scan scan = new Scan(limit < text.length(), source);
-        String flattened = flatten(source, label, null, scan);
-        if (scan.work > LIST_PREVIEW_WORK || scan.openAtEnd || flattened.equals(source)) return text;
+        Scan scan = new Scan(automation == null ? limit < text.length() : automation[2] != 0, source);
+        String flattened = flatten(source, label, null, scan, base);
+        boolean fallback = scan.work > LIST_PREVIEW_WORK || scan.openAtEnd;
+        if (automation == null && (fallback || flattened.equals(source))) return text;
+        // 格式折叠失败只回退到已确认的可读正文，避免重新露出自动化身份和时间字段。
+        if (fallback) flattened = source;
         CharSequence edited = flattened;
         if (text instanceof Spanned) {
             ArrayList<Piece> pieces = new ArrayList<>();
-            Scan again = new Scan(scan.truncated, source);
-            flatten(source, label, pieces, again);
-            if (again.work > LIST_PREVIEW_WORK || again.openAtEnd) return text;
+            if (fallback) {
+                keep(pieces, base, base + source.length(), 0, source.length());
+            } else {
+                Scan again = new Scan(scan.truncated, source);
+                flatten(source, label, pieces, again, base);
+            }
             edited = copyKeptSpans((Spanned) text, flattened, pieces, limit);
         }
         return AndroidUtilities.replaceNewLines(edited);
+    }
+
+    /**
+     * 仅识别顶层 heartbeat 的正式自动化身份及触发／响应字段，返回正文范围及正文是否被窗口截断。
+     * 普通 XML、引用和代码围栏返回 null；纯协议或正文尚未进入窗口时返回空范围，绝不继续读取超长原文。
+     */
+    private static int[] automationBody(String source, boolean truncated) {
+        int start = skipWhitespace(source, 0);
+        if (!source.startsWith("<heartbeat>", start)) return null;
+        int lineStart = source.lastIndexOf('\n', start - 1) + 1;
+        if (start - lineStart >= 4 || source.substring(lineStart, start).indexOf('\t') >= 0) return null;
+        int close = source.lastIndexOf("</heartbeat>");
+        if (close >= 0 && skipWhitespace(source, close + "</heartbeat>".length()) != source.length()) close = -1;
+        if (close < 0 && !truncated) return null;
+        int contentEnd = close < 0 ? source.length() : close;
+        int cursor = skipWhitespace(source, start + "<heartbeat>".length());
+        if (!source.startsWith("<automation_id>", cursor)) {
+            return truncated && "<automation_id>".startsWith(source.substring(cursor)) ? new int[]{0, 0} : null;
+        }
+        int identityStart = cursor + "<automation_id>".length();
+        int identityEnd = source.indexOf("</automation_id>", identityStart);
+        if (identityEnd < 0) return truncated ? new int[]{0, 0} : null;
+        if (source.substring(identityStart, identityEnd).trim().isEmpty()
+                || source.indexOf('<', identityStart) != identityEnd) return null;
+        cursor = skipWhitespace(source, identityEnd + "</automation_id>".length());
+        if (cursor == contentEnd) return new int[]{0, 0};
+
+        String field;
+        if (source.startsWith("<current_time_iso>", cursor)) {
+            int timeEnd = source.indexOf("</current_time_iso>", cursor + "<current_time_iso>".length());
+            if (timeEnd < 0) return truncated ? new int[]{0, 0} : null;
+            cursor = skipWhitespace(source, timeEnd + "</current_time_iso>".length());
+            field = "instructions";
+        } else if (source.startsWith("<decision>", cursor)) {
+            int decisionStart = cursor + "<decision>".length();
+            int decisionEnd = source.indexOf("</decision>", decisionStart);
+            if (decisionEnd < 0) return truncated ? new int[]{0, 0} : null;
+            String decision = source.substring(decisionStart, decisionEnd).trim();
+            if (!decision.equals("NOTIFY") && !decision.equals("DONT_NOTIFY")) return null;
+            cursor = skipWhitespace(source, decisionEnd + "</decision>".length());
+            field = "message";
+        } else {
+            String remaining = source.substring(cursor);
+            return truncated && ("<current_time_iso>".startsWith(remaining) || "<decision>".startsWith(remaining))
+                    ? new int[]{0, 0} : null;
+        }
+        if (cursor == contentEnd) return new int[]{0, 0};
+        String opening = "<" + field + ">", closing = "</" + field + ">";
+        if (!source.startsWith(opening, cursor)) {
+            return truncated && opening.startsWith(source.substring(cursor)) ? new int[]{0, 0} : null;
+        }
+        int bodyStart = cursor + opening.length();
+        int visibleStart = skipWhitespace(source, bodyStart);
+        boolean cdata = field.equals("message") && source.startsWith("<![CDATA[", visibleStart);
+        int cdataEnd = cdata ? source.indexOf("]]>", visibleStart + 9) : -1;
+        int bodyEnd = cdata && cdataEnd < 0 ? -1 : source.indexOf(closing, cdata ? cdataEnd + 3 : bodyStart);
+        boolean bodyTruncated = bodyEnd < 0;
+        if (bodyEnd < 0) {
+            if (!truncated) return null;
+            bodyEnd = source.length();
+            // 结束标签跨过扫描边界时不把半个协议标签留在摘要末尾。
+            int partialClose = source.lastIndexOf('<');
+            if ((!cdata || cdataEnd >= 0) && partialClose >= bodyStart
+                    && closing.startsWith(source.substring(partialClose))) bodyEnd = partialClose;
+        } else {
+            int afterBody = skipWhitespace(source, bodyEnd + closing.length());
+            if (afterBody != contentEnd && !(truncated && close < 0
+                    && "</heartbeat>".startsWith(source.substring(afterBody)))) return null;
+        }
+        bodyStart = skipWhitespace(source, bodyStart);
+        while (bodyEnd > bodyStart && Character.isWhitespace(source.charAt(bodyEnd - 1))) bodyEnd--;
+        if (field.equals("message") && bodyTruncated && "<![CDATA[".startsWith(source.substring(bodyStart, bodyEnd))) {
+            return new int[]{0, 0};
+        }
+        if (cdata) {
+            boolean completeCdata = bodyEnd - bodyStart >= 12 && source.substring(bodyEnd - 3, bodyEnd).equals("]]>");
+            if (completeCdata || bodyTruncated) {
+                bodyStart = skipWhitespace(source, bodyStart + 9);
+                if (completeCdata) bodyEnd -= 3;
+                else if (cdataEnd < 0) {
+                    // CDATA 尾分隔符可能只露出一两个右括号，不能把这部分协议留在正文末尾。
+                    int partialEnd = bodyEnd;
+                    while (partialEnd > bodyStart && bodyEnd - partialEnd < 2 && source.charAt(partialEnd - 1) == ']') partialEnd--;
+                    bodyEnd = partialEnd;
+                }
+                while (bodyEnd > bodyStart && Character.isWhitespace(source.charAt(bodyEnd - 1))) bodyEnd--;
+            }
+        }
+        return new int[]{Math.min(bodyStart, bodyEnd), bodyEnd, bodyTruncated ? 1 : 0};
+    }
+
+    /** 在当前受限窗口内跳过协议字段间的空白，不读取窗口之后的原文。 */
+    private static int skipWhitespace(String source, int start) {
+        while (start < source.length() && Character.isWhitespace(source.charAt(start))) start++;
+        return start;
     }
 
     /** 扫描终点不超过 1024，并且不把窗口末尾的高位代理和窗口外的低位代理拆开。 */
@@ -94,10 +202,10 @@ public final class CodexDialogPreview {
         }
     }
 
-    /** 单次扫描完整格式。失败的片段原样留下，避免把未闭合标记整段删掉。 */
-    private static String flatten(String source, String emptyImageLabel, ArrayList<Piece> pieces, Scan scan) {
+    /** 单次扫描完整格式；base 保留正文在原消息中的偏移，失败片段原样留下。 */
+    private static String flatten(String source, String emptyImageLabel, ArrayList<Piece> pieces, Scan scan, int base) {
         StringBuilder out = new StringBuilder(source.length());
-        flattenInto(source, 0, emptyImageLabel, out, pieces, scan);
+        flattenInto(source, base, emptyImageLabel, out, pieces, scan);
         return out.toString();
     }
 

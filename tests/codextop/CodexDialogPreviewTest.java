@@ -32,7 +32,7 @@ public final class CodexDialogPreviewTest {
             Files.writeString(temp.resolve("Spanned.java"), SPANNED);
             Files.writeString(temp.resolve("Spannable.java"), SPANNABLE);
             Files.writeString(temp.resolve("SpannableStringBuilder.java"), SPANNABLE_BUILDER);
-            if (ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", temp.toString(),
+            if (ToolProvider.getSystemJavaCompiler().run(null, null, null, "--release", "8", "-d", temp.toString(),
                     temp.resolve("Spanned.java").toString(),
                     temp.resolve("Spannable.java").toString(),
                     temp.resolve("SpannableStringBuilder.java").toString(),
@@ -123,7 +123,9 @@ public final class CodexDialogPreviewTest {
                 static void same(String text) {
                     check(show(text) == text, "不该改写: " + text);
                 }
+                /** 同时执行自动化摘要和已有 Markdown、附件、span 与扫描预算回归。 */
                 public static void main(String[] args) {
+                    automationPreviews();
                     check("请看 文档 这里".contentEquals(show("请看 [文档](https://example.com/a) 这里")), "链接没有留下标签");
                     check("请看 界面 这里".contentEquals(show("请看 ![界面](https://example.com/a.png) 这里")), "图片没有留下说明");
                     check("AttachPhoto".contentEquals(show("![](screenshot.png)")), "空图片说明没有使用原照片文案");
@@ -361,6 +363,85 @@ public final class CodexDialogPreviewTest {
                     System.out.println("bounded open=" + openMs + "ms spanned=" + hugeMs + "ms plain=" + plainMs + "ms rich=" + richMs + "ms");
                     System.out.println("PASS CodexDialogPreviewTest");
                 }
+                /** 按桌面正式触发及响应模板构造合成信封，防止内部字段直接进入会话摘要。 */
+                static void automationPreviews() {
+                    String response = "<heartbeat>\\n  <automation_id>synthetic-monitor</automation_id>\\n"
+                            + "  <decision>DONT_NOTIFY</decision>\\n  <message>暂无变化，继续检查。</message>\\n</heartbeat>";
+                    check("暂无变化，继续检查。".contentEquals(show(response)), "自动化响应摘要泄漏内部标签");
+                    String trigger = "<heartbeat>\\n  <automation_id>synthetic-monitor</automation_id>\\n"
+                            + "  <current_time_iso>2026-10-06T00:00:00Z</current_time_iso>\\n"
+                            + "  <instructions>\\n检查任务进展。\\n  </instructions>\\n</heartbeat>";
+                    check("检查任务进展。".contentEquals(show(trigger)), "自动化触发摘要没有提取 instructions 正文");
+                    check("暂无变化，继续检查。".contentEquals(show(" \\n" + response + "\\n ")),
+                            "自动化信封外围空白影响识别");
+                    check("已完成 图 😊".contentEquals(show(response.replace("DONT_NOTIFY", "NOTIFY")
+                            .replace("暂无变化，继续检查。", "**已完成** ![图](shot.png) 😊"))),
+                            "自动化正文没有沿用 Markdown、附件说明和 emoji 处理");
+                    check("自动化任务".contentEquals(show(response.replace("暂无变化，继续检查。", " "))),
+                            "纯协议响应仍泄漏字段或伪造任务完成状态");
+                    check("自动化任务".contentEquals(show("<heartbeat><automation_id>synthetic-monitor</automation_id></heartbeat>")),
+                            "仅有自动化身份的协议包仍泄漏字段");
+                    check("自动化任务".contentEquals(show(response.replace("  <message>暂无变化，继续检查。</message>\\n", ""))),
+                            "只有响应决定的协议包仍泄漏字段");
+                    check("自动化任务".contentEquals(show(trigger.replace("  <instructions>\\n检查任务进展。\\n  </instructions>\\n", ""))),
+                            "只有触发元数据的协议包仍泄漏字段");
+                    check("保留 <item>正文</item>".contentEquals(show(response.replace("暂无变化，继续检查。",
+                            "<![CDATA[保留 <item>正文</item>]]>"))), "响应 CDATA 被当作可见协议标签");
+                    same("<item><automation_id>example</automation_id><message>正常 XML</message></item>");
+                    same("引用：" + response);
+                    same("\\\"" + response + "\\\"");
+                    same("    " + response);
+                    same("\\t" + response);
+                    check(response.replace('\\n', ' ').contentEquals(show("```xml\\n" + response + "\\n```")),
+                            "代码围栏里的 XML 示例被当作自动化信封删掉");
+                    String longTrigger = trigger.replace("检查任务进展。", "**未闭合 " + "字".repeat(4000));
+                    CharSequence longOut = show(longTrigger);
+                    check(longOut.toString().startsWith("**未闭合 ") && longOut.length() <= 1024
+                            && !longOut.toString().contains("automation_id") && !longOut.toString().contains("current_time_iso"),
+                            "正文格式未闭合时回退到了原始自动化信封");
+                    String longId = trigger.replace("synthetic-monitor", "a".repeat(4000));
+                    Probe limited = new Probe(longId, new Object[0], new int[0], new int[0], new int[0]);
+                    check("自动化任务".contentEquals(CodexDialogPreview.readable(limited, "AttachPhoto")),
+                            "超长内部字段越过预算或泄漏到摘要");
+                    // 逐字符移动窗口边界，覆盖字段头、字段尾、正文与外层结束标签被截断。
+                    for (int padding = 800; padding < 1050; padding++) {
+                        String boundary = response.replace("synthetic-monitor", "x".repeat(padding));
+                        String output = show(boundary).toString();
+                        check(output.indexOf('<') < 0 && !output.contains("x".repeat(30)) && output.length() <= 1024,
+                                "自动化响应在边界 " + padding + " 回退或泄漏了协议: " + output.substring(0, Math.min(30, output.length())));
+                        String triggerBoundary = trigger.replace("synthetic-monitor", "x".repeat(padding));
+                        String triggerOutput = show(triggerBoundary).toString();
+                        check(triggerOutput.indexOf('<') < 0 && !triggerOutput.contains("x".repeat(30)) && triggerOutput.length() <= 1024,
+                                "自动化触发在边界 " + padding + " 回退或泄漏了协议");
+                        String cdataBoundary = boundary.replace("暂无变化，继续检查。", "<![CDATA[暂无变化，继续检查。]]>");
+                        String cdataOutput = show(cdataBoundary).toString();
+                        check(cdataOutput.indexOf('<') < 0 && !cdataOutput.contains("CDATA") && !cdataOutput.contains("x".repeat(30)),
+                                "CDATA 在边界 " + padding + " 回退或泄漏了协议");
+                    }
+                    String longCdata = response.replace("暂无变化，继续检查。", "<![CDATA[" + "字".repeat(1500) + "]]>");
+                    check(show(longCdata).toString().startsWith("字") && show(longCdata).toString().indexOf('<') < 0,
+                            "长 CDATA 正文仍显示内部包裹标签");
+                    check("保留 </message> 标签".contentEquals(show(response.replace("暂无变化，继续检查。",
+                            "<![CDATA[保留 </message> 标签]]>"))), "CDATA 内字面结束标签被误认成协议边界");
+                    String longLiteral = response.replace("暂无变化，继续检查。", "<![CDATA[保留 </heartbeat> 标签" + "字".repeat(1500) + "]]>");
+                    check(show(longLiteral).toString().startsWith("保留 </heartbeat> 标签")
+                            && !show(longLiteral).toString().contains("automation_id"), "长正文内外层标签字面量导致整信封回退");
+                    check("完成".contentEquals(show(response.replace("暂无变化，继续检查。", "**完成**") + " ".repeat(1200))),
+                            "信封已完整时，窗口外的空白阻止了正文格式折叠");
+                    android.text.SpannableStringBuilder marked = new android.text.SpannableStringBuilder(response);
+                    Object bodySpan = new Object(), metadataSpan = new Object();
+                    int bodyAt = response.indexOf("暂无变化");
+                    marked.setSpan(bodySpan, bodyAt, bodyAt + 4, 33);
+                    marked.setSpan(metadataSpan, response.indexOf("synthetic-monitor"), response.indexOf("synthetic-monitor") + 4, 17);
+                    CharSequence projected = CodexDialogPreview.readable(marked, "AttachPhoto");
+                    check(projected instanceof android.text.Spanned, "自动化正文丢失原 span");
+                    android.text.Spanned spans = (android.text.Spanned) projected;
+                    check(spans.getSpanStart(bodySpan) == 0 && spans.getSpanEnd(bodySpan) == 4 && spans.getSpanFlags(bodySpan) == 33
+                            && spans.getSpanStart(metadataSpan) < 0, "自动化摘要的 span 没有按保留正文重映射");
+                    check(marked.toString().equals(response) && marked.getSpanStart(bodySpan) == bodyAt,
+                            "生成自动化摘要改写了原始消息或 span");
+                    System.out.println("PASS automation preview: trigger, response, protocol-only, XML, bounded fallback, spans");
+                }
                 static boolean paired(CharSequence text) {
                     for (int index = 0; index < text.length(); index++) {
                         char value = text.charAt(index);
@@ -384,7 +465,11 @@ public final class CodexDialogPreviewTest {
                         this.flags = flags;
                     }
                     public int length() { return data.length; }
-                    public char charAt(int index) { return data[index]; }
+                    /** 原文探针只允许读取摘要窗口，超长协议和普通文本遵守同一边界。 */
+                    public char charAt(int index) {
+                        if (index >= 1024) throw new AssertionError("逐字读取越过扫描窗口: " + index);
+                        return data[index];
+                    }
                     public CharSequence subSequence(int start, int end) {
                         if (end - start > 1024) throw new AssertionError("读取了超过扫描窗口的原文");
                         return new String(data, start, end - start);
