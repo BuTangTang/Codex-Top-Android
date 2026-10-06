@@ -12753,10 +12753,13 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
     }
 
-    /** 原文件气泡只按Codex描述区分未知大小，模型占位的零不冒充真实字节数。 */
+    /** 原文件气泡可显示建模时已知的本地大小；缺少两种来源时仍未知，绘制不再查文件。 */
     private static String documentSizeText(MessageObject messageObject, long sizeBytes) {
         com.butang.codextop.DesktopAttachment attachment = com.butang.codextop.CodexRuntime.attachment(messageObject);
-        return attachment != null && attachment.sizeBytes == null ? "大小未知" : AndroidUtilities.formatFileSize(sizeBytes);
+        boolean localSizeKnown = attachment != null && messageObject.messageOwner.params != null
+                && "true".equals(messageObject.messageOwner.params.get("codexLocalSizeKnown"));
+        return attachment != null && attachment.sizeBytes == null && !localSizeKnown
+                ? "大小未知" : AndroidUtilities.formatFileSize(sizeBytes);
     }
 
     /** 保留原文件气泡排版；电脑文件的图片缩略图只能来自本地缓存。 */

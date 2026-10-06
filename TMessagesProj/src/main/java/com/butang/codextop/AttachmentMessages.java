@@ -41,9 +41,14 @@ public final class AttachmentMessages {
         media(message, selected.name, selected.kind, null, selected.localPath == null ? null : new File(selected.localPath));
     }
 
-    /** 原消息只引用真实存在的本地文件；电脑路径与虚拟显示编号均不能用作attachPath。 */
+    /** 原消息只引用真实存在的本地文件；本地大小标记每次重算，不补写电脑附件元数据。 */
     private static void media(TLRPC.TL_message message, String name, String kind, Long size, File cachedFile) {
         File local = cachedFile != null && cachedFile.isFile() ? cachedFile : null;
+        if (message.params != null) message.params.remove("codexLocalSizeKnown");
+        if (size == null && local != null) {
+            if (message.params == null) message.params = new HashMap<>();
+            message.params.put("codexLocalSizeKnown", "true");
+        }
         message.attachPath = local == null ? "" : local.getAbsolutePath();
         message.flags |= 512;
         long displayId = message.dialog_id ^ ((long) message.id << 32);

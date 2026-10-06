@@ -58,7 +58,8 @@ public final class AttachmentUnknownSizeUiTest {
                     + "public static DesktopAttachment attachment(MessageObject message){return message!=null&&message.codex?message.attachment:null;}}");
             Path message = temp.resolve("MessageObject.java");
             Files.writeString(message, "package org.telegram.messenger; import com.butang.codextop.DesktopAttachment;"
-                    + "public class MessageObject {public boolean codex;public DesktopAttachment attachment;}");
+                    + "public class MessageObject {public boolean codex;public DesktopAttachment attachment;"
+                    + "public Owner messageOwner=new Owner();public static class Owner {public java.util.Map<String,String> params;}}");
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, "-cp", System.getProperty("java.class.path"),
                     "-d", temp.toString(), probe.toString(), runtime.toString(), message.toString()) != 0)
                 throw new AssertionError("真实文件大小显示夹具编译失败");
@@ -66,12 +67,173 @@ public final class AttachmentUnknownSizeUiTest {
                 try { loader.loadClass("com.butang.codextop.AttachmentSizeUiProbe").getMethod("main", String[].class).invoke(null, (Object) new String[0]); }
                 catch (java.lang.reflect.InvocationTargetException error) { throw new AssertionError("真实文件大小显示回归失败", error.getCause()); }
             }
+            verifyLocalFileProjection(temp.resolve("local-size"), formatter, caption, accessibility);
         } finally {
             try (var paths = Files.walk(temp)) {
                 for (Path path : paths.sorted(Comparator.reverseOrder()).toArray(Path[]::new)) Files.delete(path);
             }
         }
     }
+
+    /** 联合执行真实附件映射、缓存归属和气泡格式化；平台替身不代替文件选择或大小判断。 */
+    private static void verifyLocalFileProjection(Path temp, String formatter, String caption, String accessibility) throws Exception {
+        Files.createDirectories(temp);
+        Path source = Path.of("TMessagesProj/src/main/java/com/butang/codextop");
+        var runtime = StaticJavaParser.parse(source.resolve("CodexRuntime.java"));
+        var names = java.util.Set.of("attachmentDirectory", "cachedAttachment", "isAttachmentMessage", "attachment");
+        StringBuilder methods = new StringBuilder();
+        int extracted = 0;
+        for (var method : runtime.findAll(com.github.javaparser.ast.body.MethodDeclaration.class)) {
+            if (names.contains(method.getNameAsString())) { methods.append(method).append('\n'); extracted++; }
+        }
+        if (extracted != names.size()) throw new AssertionError("真实缓存方法提取边界变化");
+        var digest = StaticJavaParser.parse(source.resolve("TranscriptStore.java"))
+                .findAll(com.github.javaparser.ast.body.MethodDeclaration.class).stream()
+                .filter(method -> method.getNameAsString().equals("digest")).findFirst().orElseThrow();
+        Files.writeString(temp.resolve("CodexRuntime.java"), LOCAL_RUNTIME + methods
+                + "static class TranscriptStore {" + digest + "}}\n");
+        Files.writeString(temp.resolve("TLRPC.java"), LOCAL_TLRPC);
+        Files.writeString(temp.resolve("BitmapFactory.java"), "package android.graphics;public class BitmapFactory {"
+                + "public static class Options {public boolean inJustDecodeBounds;public int outWidth,outHeight;}"
+                + "public static Object decodeFile(String path,Options options){return null;}}");
+        Files.writeString(temp.resolve("OutboxStore.java"), "package com.butang.codextop;public class OutboxStore {"
+                + "public static class Selection {public String localPath,name,kind,mimeType;}}");
+        Files.writeString(temp.resolve("MessageObject.java"), "package org.telegram.messenger;import org.telegram.tgnet.TLRPC;"
+                + "public class MessageObject {public TLRPC.TL_message messageOwner;"
+                + "public long getDialogId(){return messageOwner.dialog_id;}}");
+        Files.writeString(temp.resolve("AttachmentLocalSizeProbe.java"), LOCAL_PROBE + formatter
+                + "String caption(MessageObject messageObject){" + caption + "return str;}"
+                + "String accessibility(){StringBuilder sb=new StringBuilder();" + accessibility + "return sb.toString();}"
+                + LOCAL_SCENARIOS + "}\n");
+        java.util.ArrayList<String> compile = new java.util.ArrayList<>(java.util.List.of(
+                "-cp", System.getProperty("java.class.path"), "-d", temp.toString(),
+                source.resolve("AttachmentMessages.java").toString(), source.resolve("AttachmentFiles.java").toString()));
+        try (var files = Files.list(temp)) {
+            files.filter(path -> path.toString().endsWith(".java")).forEach(path -> compile.add(path.toString()));
+        }
+        if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(new String[0])) != 0)
+            throw new AssertionError("真实附件映射和缓存联测编译失败");
+        try (var loader = new URLClassLoader(new java.net.URL[]{temp.toUri().toURL()}, AttachmentUnknownSizeUiTest.class.getClassLoader())) {
+            try { loader.loadClass("com.butang.codextop.AttachmentLocalSizeProbe").getMethod("main", String[].class)
+                    .invoke(null, (Object) new String[]{temp.resolve("files").toString()}); }
+            catch (java.lang.reflect.InvocationTargetException error) { throw new AssertionError("真实附件大小联测失败", error.getCause()); }
+        }
+    }
+
+    // 仅替换平台账号和目录入口；缓存路径、描述解析与散列均从当前产品源码提取。
+    private static final String LOCAL_RUNTIME = """
+        package com.butang.codextop;
+        import java.io.*;import java.util.*;import java.security.MessageDigest;import java.nio.charset.StandardCharsets;
+        import com.google.gson.*;import org.telegram.messenger.MessageObject;
+        public class CodexRuntime {
+            static final Map<Long,String> remoteIds=new HashMap<>();
+            static PasswordLogin.Session session=new PasswordLogin.Session();
+            static String machine="machine-a";static boolean owned=true;
+            static class PasswordLogin {static class Session {String server="server-a",accountId="account-a";}}
+            static class ApplicationLoader {static Context applicationContext=new Context();}
+            static class Context {File root;File getExternalFilesDir(String name){return root;}File getNoBackupFilesDir(){return root;}}
+            static String dialogMachine(long id){return machine;}
+            static boolean ownsConversation(long id){return owned&&remoteIds.containsKey(id);}
+            static File directory(){return attachmentDirectory(1);}
+            static File cached(String localId,DesktopAttachment value){return cachedAttachment(directory(),localId,value);}
+        """;
+
+    // 平台模型只提供真实 AttachmentMessages 所写入的字段，不实现任何显示或缓存逻辑。
+    private static final String LOCAL_TLRPC = """
+        package org.telegram.tgnet;import java.util.*;
+        public class TLRPC {
+            public static class TL_message {public HashMap<String,String> params;public String attachPath;public int flags,id,date;public long dialog_id;public MessageMedia media;}
+            public static class MessageMedia {public int flags;public TL_document document;public TL_photo photo;}
+            public static class TL_messageMediaPhoto extends MessageMedia {}
+            public static class TL_messageMediaDocument extends MessageMedia {}
+            public static class TL_photo {public long id;public int date;public byte[] file_reference;public ArrayList<TL_photoSize> sizes=new ArrayList<>();}
+            public static class TL_photoSize {public String type;public int w,h,size;public TL_fileLocationUnavailable location;}
+            public static class TL_fileLocationUnavailable {public long volume_id;public int local_id;public byte[] file_reference;}
+            public static class TL_document {public long id,size;public int date;public byte[] file_reference;public String mime_type;public ArrayList<TL_documentAttributeFilename> attributes=new ArrayList<>();}
+            public static class TL_documentAttributeFilename {public String file_name;}
+        }
+        """;
+
+    private static final String LOCAL_PROBE = """
+        package com.butang.codextop;
+        import java.io.*;import java.nio.file.*;import org.telegram.messenger.MessageObject;import org.telegram.tgnet.TLRPC;
+        public class AttachmentLocalSizeProbe {
+            static int checks;
+            static final int DOCUMENT_ATTACH_TYPE_DOCUMENT=1;
+            static class AndroidUtilities {static String formatFileSize(long n){return n==0?"0 KB":n+" B";}}
+            static class FileLoader {static String getDocumentExtension(TLRPC.TL_document d){return "BIN";}}
+            static class Paint {String measured;float measureText(String s){measured=s;return s.length();}}
+            static class Theme {static final Paint chat_infoPaint=new Paint();}
+            TLRPC.TL_document documentAttach;MessageObject currentMessageObject;
+            int documentAttachType=1,buttonState=-1,infoWidth,maxWidth=1000;
+            static int dp(int n){return n;}
+            static void check(boolean value,String label){checks++;if(!value)throw new AssertionError(label);}
+        """;
+
+    private static final String LOCAL_SCENARIOS = """
+            static DesktopAttachment description(Long size,String availability){
+                return new DesktopAttachment("same.bin","file",availability==null?"/synthetic/remote.bin":null,null,size,null,availability,null);
+            }
+            static TLRPC.TL_message message(){TLRPC.TL_message m=new TLRPC.TL_message();m.dialog_id=1;m.id=100;m.date=1;return m;}
+            static void verify(TLRPC.TL_message m,String expected,String label){
+                AttachmentLocalSizeProbe p=new AttachmentLocalSizeProbe();MessageObject object=new MessageObject();object.messageOwner=m;
+                p.currentMessageObject=object;p.documentAttach=m.media.document;
+                check(p.caption(object).equals(expected+" BIN"),label+": subtitle");
+                check(Theme.chat_infoPaint.measured.equals("000.0 mm / "+expected),label+": measurement");
+                check(p.accessibility().equals(", "+expected),label+": accessibility");
+            }
+            static TLRPC.TL_message echo(String id,DesktopAttachment value,String expected,String label){
+                File cached=CodexRuntime.cached(id,value);TLRPC.TL_message m=message();AttachmentMessages.apply(m,value,cached);
+                check(m.params.get("codexAttachment").equals(value.toJson().toString()),label+": authoritative JSON unchanged");
+                verify(m,expected,label);return m;
+            }
+            public static void main(String[] args)throws Exception{
+                Path root=Path.of(args[0]);Files.createDirectories(root);
+                CodexRuntime.ApplicationLoader.applicationContext.root=root.resolve("cache").toFile();CodexRuntime.remoteIds.put(1L,"remote-a");
+                Path source=root.resolve("source.bin");Files.write(source,new byte[17]);
+                DesktopAttachment.Pending staged=AttachmentFiles.stage(source.toFile(),"same.bin","file",null,CodexRuntime.directory(),"send\\noriginal");
+                DesktopAttachment unknown=description(null,null);
+                check(new File(staged.localPath).length()==17,"real stage size");
+                TLRPC.TL_message local=echo("original",unknown,"17 B","cached unknown");
+                check(local.media.document.size==17,"media uses actual local size");
+                echo("original",unknown,"17 B","recreated without Outbox");
+                echo("different",unknown,"大小未知","other localId same filename");
+                echo("original:attachment:1",unknown,"大小未知","other attachment index");
+                for(int scope=0;scope<4;scope++){
+                    if(scope==0)CodexRuntime.session.server="other";
+                    if(scope==1)CodexRuntime.session.accountId="other";
+                    if(scope==2)CodexRuntime.machine="other";
+                    if(scope==3)CodexRuntime.remoteIds.put(1L,"other");
+                    check(CodexRuntime.cached("original",unknown)==null,"scope isolation "+scope);
+                    echo("original",unknown,"大小未知","different scope "+scope);
+                    CodexRuntime.session.server="server-a";CodexRuntime.session.accountId="account-a";CodexRuntime.machine="machine-a";CodexRuntime.remoteIds.put(1L,"remote-a");
+                }
+                DesktopAttachment conflict=description(3L,null);
+                check(CodexRuntime.cached("original",conflict)==null,"known size conflict rejects original cache");
+                echo("original",conflict,"3 B","authoritative size wins");
+                echo("different",description(0L,null),"0 KB","known remote zero");
+                echo("original",description(null,"unavailable"),"大小未知","unavailable rejects cache");
+                Path empty=root.resolve("empty.bin");Files.write(empty,new byte[0]);
+                AttachmentFiles.stage(empty.toFile(),"same.bin","file",null,CodexRuntime.directory(),"send\\nempty");
+                echo("empty",unknown,"0 KB","actual empty local file");
+                // 同一对象从本地已知改为无缓存时必须清理派生事实；引用JSON仍缺大小。
+                AttachmentMessages.apply(local,unknown,null);verify(local,"大小未知","stale local marker cleared");
+                AttachmentMessages.apply(local,description(3L,null),new File(staged.localPath));verify(local,"3 B","provided authoritative value wins");
+                AttachmentMessages.apply(local,unknown,null);verify(local,"大小未知","known-to-unknown clears marker");
+                // 格式化只读已建立模型；删除文件不影响本次格式化，重建则重新判定为未知。
+                TLRPC.TL_message beforeDeletion=echo("original",unknown,"17 B","before deletion");
+                Files.delete(Path.of(staged.localPath));verify(beforeDeletion,"17 B","formatter performs no file lookup");
+                echo("original",unknown,"大小未知","recreate after cache removal");
+                TLRPC.TL_message telegram=message();AttachmentMessages.apply(telegram,unknown,null);telegram.media.document.size=23;
+                CodexRuntime.owned=false;verify(telegram,"23 B","ordinary Telegram formatter unchanged");CodexRuntime.owned=true;
+                // 选中或待发投影复用同一media入口，之后权威无缓存回显不能继承其标记。
+                TLRPC.TL_message selected=message();AttachmentMessages.applySelected(selected,empty.toFile(),"same.bin","file");
+                AttachmentMessages.apply(selected,unknown,null);verify(selected,"大小未知","selected-to-echo reset");
+                AttachmentMessages.applyPending(selected,DesktopAttachment.Pending.read(AttachmentFiles.stage(empty.toFile(),"same.bin","file",null,CodexRuntime.directory(),"send\\npending").toJson()));
+                verify(selected,"0 KB","pending zero unchanged");AttachmentMessages.apply(selected,unknown,null);verify(selected,"大小未知","pending-to-echo reset");
+                System.out.println("AttachmentLocalSize PASS: "+checks+" assertions; real apply, cache scope, subtitle, measurement and accessibility");
+            }
+        """;
 
     // 替身只提供原平台格式化、绘制测宽与已解析描述；显示决策来自真实提取语句。
     private static final String FIXTURE = """
