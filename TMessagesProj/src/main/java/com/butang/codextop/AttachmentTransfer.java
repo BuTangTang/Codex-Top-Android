@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.Arrays;
+import java.util.function.LongSupplier;
 
 /** 沿已认证机器 RPC 分块收发附件；调用方负责工作队列、原会话归属及缓存位置。 */
 public final class AttachmentTransfer {
@@ -35,13 +36,20 @@ public final class AttachmentTransfer {
     }
     private final Rpc rpc;
     private final Progress progress;
+    private final LongSupplier uploadClock;
 
     /** 接收既有连接与可选进度回调，不持有账号凭据或添加后台任务。 */
     public AttachmentTransfer(Rpc rpc, Progress progress) {
-        this.rpc = java.util.Objects.requireNonNull(rpc); this.progress = progress;
+        this(rpc, progress, System::nanoTime);
     }
 
-    /** 上传当前本地文件到电脑临时目录；失败只终止本传输，保留本地原件供原发送流程处理。 */
+    /** 测试可注入单调时钟；生产沿用调用线程读取 nanoTime，不创建计时任务。 */
+    AttachmentTransfer(Rpc rpc, Progress progress, LongSupplier uploadClock) {
+        this.rpc = java.util.Objects.requireNonNull(rpc); this.progress = progress;
+        this.uploadClock = java.util.Objects.requireNonNull(uploadClock);
+    }
+
+    /** 首块保守探速，后续仅按成功 ACK 调整下一块；失败只终止本传输，保留原件且不重投。 */
     public Result upload(File file, String kind, String localId, String cwd) throws IOException {
         if (!("image".equals(kind) || "file".equals(kind)) || localId == null || localId.isEmpty()
                 || !absolute(cwd) || file == null || !file.isFile()) throw new IOException("附件上传信息不完整");
@@ -56,6 +64,7 @@ public final class AttachmentTransfer {
         boolean complete = false;
         try {
             int chunkSize = chunkSize(init);
+            int uploadChunkSize = Math.min(8192, chunkSize);
             String recipient = string(init, "recipientPublicKeyBase64");
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] buffer = new byte[chunkSize];
@@ -64,15 +73,19 @@ public final class AttachmentTransfer {
             try (FileInputStream input = new FileInputStream(file)) {
                 for (int index = 0; sent < size; index++) {
                     checkInterrupted();
-                    int wanted = (int) Math.min(buffer.length, size - sent), count = 0;
+                    int wanted = (int) Math.min(uploadChunkSize, size - sent), count = 0;
                     while (count < wanted) {
                         int read = input.read(buffer, count, wanted - count);
                         if (read < 0) throw new IOException("上传期间附件长度已变化");
                         count += read;
                     }
+                    // 只测量后面仍有数据的完整块；计时含加密与原 RPC，末尾短块不污染估速。
+                    boolean sample = count == uploadChunkSize && sent + count < size;
+                    long started = sample ? readUploadClock() : Long.MIN_VALUE;
                     JsonObject chunk = BulkTransferCrypto.encrypt(id, index, buffer, count, recipient);
                     chunk.addProperty("uploadId", id); chunk.addProperty("index", index);
                     call("upload.chunk", chunk);
+                    if (sample) uploadChunkSize = nextUploadChunkSize(count, chunkSize, started, readUploadClock());
                     digest.update(buffer, 0, count); sent += count;
                     updateProgress(sent, size);
                 }
@@ -88,6 +101,20 @@ public final class AttachmentTransfer {
             return new Result(file.getName(), path, size, hash);
         } catch (Exception error) { throw failure(error); }
         finally { if (!complete) abort("upload", id); }
+    }
+
+    /** 时钟异常只放弃当前速度样本，不能把已成功的块改判失败或触发重传。 */
+    private long readUploadClock() {
+        try { return uploadClock.getAsLong(); }
+        catch (RuntimeException ignored) { return Long.MIN_VALUE; }
+    }
+
+    /** 目标每块 1.5 秒，单次增长最多四倍；无效耗时退回保守块，long 乘积在原 1 MiB 上限内安全。 */
+    private static int nextUploadChunkSize(int current, int maximum, long started, long finished) {
+        long elapsed = finished - started;
+        if (started == Long.MIN_VALUE || finished == Long.MIN_VALUE || elapsed <= 0) return Math.min(current, 8192);
+        long estimated = current * 1_500_000_000L / elapsed;
+        return (int) Math.max(Math.min(1024, maximum), Math.min(Math.min(maximum, current * 4L), estimated));
     }
 
     /** 下载到同目录临时文件，字节、摘要及电脑 finalize 均成功后才原子替换目标；失败不破坏旧文件。 */

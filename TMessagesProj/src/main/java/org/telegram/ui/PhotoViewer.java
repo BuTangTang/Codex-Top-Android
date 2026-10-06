@@ -9732,7 +9732,24 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         return result;
     }
 
+    /** 本地电脑会话视频明确作为原文件，头像、贴纸、照片和普通 Telegram 不进入此模式。 */
+    private boolean isCodexVideoFile(Object value) {
+        return (sendPhotoType == 0 || sendPhotoType == 2) && parentChatActivity != null
+                && com.butang.codextop.CodexRuntime.enabled()
+                && com.butang.codextop.CodexRuntime.ownsConversation(parentChatActivity.getDialogId())
+                && value instanceof MediaController.PhotoEntry
+                && ((MediaController.PhotoEntry) value).isVideo && !((MediaController.PhotoEntry) value).isLivePhoto();
+    }
+
+    /** 每次按当前项判断，滑回照片或复用预览查看别的会话时不遗留文件模式。 */
+    private boolean isCodexCurrentVideoFile() {
+        return currentIndex >= 0 && currentIndex < imagesArrLocals.size()
+                && isCodexVideoFile(imagesArrLocals.get(currentIndex));
+    }
+
+    /** 原文件模式不生成裁剪或压缩参数，其他媒体继续原编辑结果。 */
     private VideoEditedInfo getCurrentVideoEditedInfo() {
+        if (isCodexCurrentVideoFile()) return null;
         if (!isCurrentVideo && hasAnimatedMediaEntities() && centerImage.getBitmapWidth() > 0) {
             float maxSize = 854;
             if (sendPhotoType == SELECT_TYPE_AVATAR) {
@@ -14450,7 +14467,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         } else if (!imagesArrLocals.isEmpty()) {
             final Object entry = imagesArrLocals.get(index);
             final TLRPC.User user = parentChatActivity != null ? parentChatActivity.getCurrentUser() : null;
-            boolean allowTimeItem = !isDocumentsPicker && (
+            // 原文件发送不执行定时销毁，不向视频开放这个选项。
+            boolean allowTimeItem = !isDocumentsPicker && !isCodexVideoFile(entry) && (
                 (parentChatActivity != null && !parentChatActivity.isSecretChat() && !parentChatActivity.isInScheduleMode() && user != null && !user.bot && !UserObject.isUserSelf(user) && !parentChatActivity.isEditingMessageMedia())
                 || (parentChatActivity == null && placeProvider != null && placeProvider.canSetTimer())
             );
@@ -14503,7 +14521,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
     private void setIsAboutToSwitchToIndex(int index, boolean init, boolean animated) {
         setIsAboutToSwitchToIndex(index, init, animated, false);
     }
-    /** 切换原预览内容；电脑附件保留本地查看和保存，不开启远端媒体操作。 */
+    /** 切项时保留照片编辑和附件本地查看；电脑视频明确按原件文件发送，不开启远端媒体操作。 */
     private void setIsAboutToSwitchToIndex(int index, boolean init, boolean animated, boolean force) {
         if (!init && switchingToIndex == index && !force) {
             return;
@@ -14946,7 +14964,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     Object coverPhotoObject = null;
                     if (object instanceof MediaController.PhotoEntry) {
                         MediaController.PhotoEntry photoEntry = ((MediaController.PhotoEntry) object);
-                        if (photoEntry.editedInfo != null) {
+                        // 文件模式播放完整原件，不能留下旧裁剪/静音预览却发送另一份内容。
+                        if (photoEntry.editedInfo != null && !isCodexVideoFile(object)) {
                             isMuted = photoEntry.editedInfo.muted;
                             start = photoEntry.editedInfo.start;
                             end = photoEntry.editedInfo.end;
@@ -14958,7 +14977,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     }
                     if (sendPhotoType != SELECT_TYPE_NO_SELECT) {
                         processOpenVideo(currentPathObject, livePhotoVideoOffset, isMuted, start, end, compressQuality, livePhotoTimestampUs);
-                        if (isDocumentsPicker) {
+                        if (isDocumentsPicker || isCodexVideoFile(object)) {
                             showVideoTimeline(false, animated);
                             videoAvatarTooltip.setVisibility(View.GONE);
                             cropItem.setVisibility(View.GONE);
@@ -14975,6 +14994,10 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                             AndroidUtilities.updateViewVisibilityAnimated(livePhotoButton, false, 1f, animated);
                             AndroidUtilities.updateViewVisibilityAnimated(editCoverButton, false, 1f, animated);
                             compressItem.setVisibility(View.GONE);
+                            if (isCodexVideoFile(object)) {
+                                currentSubtitle = "作为文件发送";
+                                actionBarContainer.setSubtitle(currentSubtitle);
+                            }
                         } else {
                             showVideoTimeline(!isLivePhoto, animated);
                             if (sendPhotoType != SELECT_TYPE_AVATAR && sendPhotoType != SELECT_TYPE_STICKER) {
@@ -15651,6 +15674,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         setImageIndex(index, init, animateCaption, false);
     }
 
+    /** 原件视频不复用旧编辑的播放状态，其他项保持 Telegram 预览生命周期。 */
     private void setImageIndex(int index, boolean init, boolean animateCaption, boolean force) {
         if (!force && currentIndex == index || placeProvider == null) {
             return;
@@ -15811,6 +15835,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     editState.averageDuration = entry.averageDuration;
                     editState.mediaEntities = entry.mediaEntities;
                     editState.cropState = entry.cropState;
+                    // 原件模式只清本次预览状态，保留选项本身的说明与其他会话编辑记录。
+                    if (isCodexVideoFile(entry)) editState.reset();
                     File file = new File(entry.path);
                     videoPath = Uri.fromFile(file);
                     if (isDocumentsPicker) {
@@ -15851,7 +15877,9 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 }
                 if (object instanceof MediaController.MediaEditState) {
                     MediaController.MediaEditState state = (MediaController.MediaEditState) object;
-                    if (hasAnimatedMediaEntities()) {
+                    if (isCodexVideoFile(object)) {
+                        currentImagePath = currentPathObject;
+                    } else if (hasAnimatedMediaEntities()) {
                         currentImagePath = state.imagePath;
                     } else if (state.filterPath != null) {
                         currentImagePath = state.filterPath;
@@ -16619,6 +16647,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         return getCaptionView().editText != null ? getCaptionView().getSelectionLength() : 0;
     }
 
+    /** 原视频的原件预览不叠加未发送的旧绘画；其他项沿原显示流程。 */
     private void setIndexToPaintingOverlay(int index, PaintingOverlay paintingOverlay) {
         if (paintingOverlay == null) {
             return;
@@ -16627,6 +16656,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         paintingOverlay.setVisibility(View.GONE);
         if (!imagesArrLocals.isEmpty() && index >= 0 && index < imagesArrLocals.size()) {
             Object object = imagesArrLocals.get(index);
+            if (isCodexVideoFile(object)) return;
             boolean isVideo = false;
             String paintPath = null;
             ArrayList<VideoEditedInfo.MediaEntity> mediaEntities = null;
@@ -16687,10 +16717,11 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 int cacheType = 0;
                 if (object instanceof MediaController.PhotoEntry) {
                     MediaController.PhotoEntry photoEntry = (MediaController.PhotoEntry) object;
-                    cropState = photoEntry.cropState;
+                    // 原文件缩略预览也不套用旧裁剪，照片和普通会话保持原行为。
+                    cropState = isCodexVideoFile(object) ? null : photoEntry.cropState;
                     isVideo = photoEntry.isVideo;
                     if (photoEntry.isVideo && !photoEntry.isLivePhoto()) {
-                        if (photoEntry.thumbPath != null) {
+                        if (photoEntry.thumbPath != null && !isCodexVideoFile(object)) {
                             if (fromCamera) {
                                 Bitmap b = BitmapFactory.decodeFile(photoEntry.thumbPath);
                                 if (b != null) {
@@ -21319,8 +21350,14 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 || editState.cropState != null || mediaEntities != null || paintPath != null || editState.savedFilterState != null || sendPhotoType == SELECT_TYPE_AVATAR;
     }
 
+    /** 原文件发送明确使用原生文案；异步视频信息回调也不能显示未应用的压缩预计值。 */
     private void updateVideoInfo() {
         if (actionBar == null) {
+            return;
+        }
+        if (isCodexCurrentVideoFile()) {
+            currentSubtitle = "作为文件发送";
+            actionBarContainer.setSubtitle(currentSubtitle);
             return;
         }
         if (compressionsCount == 0) {

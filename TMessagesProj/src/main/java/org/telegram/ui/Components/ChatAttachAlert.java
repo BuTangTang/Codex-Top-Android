@@ -6025,7 +6025,7 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
         emojiViewDelegate = delegate;
     }
 
-    /** 复用原版选择器；电脑对话只开放图片与文件，不展示尚未接入的媒体类型。 */
+    /** 复用原版选择器与权限入口；电脑会话开放图片、文件和视频原件。 */
     public void init() {
         writeButton.setEffect(effectId = 0);
         botButtonWasVisible = false;
@@ -6080,8 +6080,9 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
             commentTextView.setVisibility(allowEnterCaption ? View.VISIBLE : View.INVISIBLE);
         }
         if (com.butang.codextop.CodexRuntime.ownsConversation(getDialogId())) {
-            photosEnabled = documentsEnabled = true;
-            videosEnabled = musicEnabled = pollsEnabled = todoEnabled = false;
+            // 电脑会话的视频由原件文档路径发送，预览不开放不会执行的编辑。
+            photosEnabled = documentsEnabled = videosEnabled = true;
+            musicEnabled = pollsEnabled = todoEnabled = false;
             allowLivePhotos = false;
         }
         photoLayout.onInit(videosEnabled, photosEnabled, documentsEnabled);

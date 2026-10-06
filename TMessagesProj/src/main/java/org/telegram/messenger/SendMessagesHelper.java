@@ -9241,6 +9241,12 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
     private final static int ERROR_TYPE_UNSUPPORTED = 1;
     private final static int ERROR_TYPE_FILE_TOO_LARGE = 2;
 
+    /** 只有电脑会话的真实视频走原件文档；照片动画和普通 Telegram 仍沿原媒体准备流程。 */
+    private static boolean isCodexVideoFile(long dialogId, boolean isVideo) {
+        return isVideo && com.butang.codextop.CodexRuntime.enabled()
+                && com.butang.codextop.CodexRuntime.ownsConversation(dialogId);
+    }
+
     /** 文档仍沿原准备流程；Codex大小拒绝由其原发送owner处理，普通Telegram门禁保持。 */
     private static int prepareSendingDocumentInternal(AccountInstance accountInstance, String path, String originalPath, Uri uri, String mime, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, final ArrayList<TLRPC.MessageEntity> entities, final MessageObject editingMessageObject, long[] groupId, boolean isGroupFinal, CharSequence caption, boolean notify, int scheduleDate, int scheduleRepeatPeriod, Integer[] docType, boolean forceDocument, SendMessageChatArguments sendMessageChatArguments, long effectId, boolean invertMedia, long payStars, long monoForumPeerId, MessageSuggestionParams suggestionParams, PollSendParams pollSendParams, int pollIndex) {
         final long forcedPollGroupId = pollSendParams != null ? pollSendParams.groupId : 0;
@@ -10671,6 +10677,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         prepareSendingMedia(accountInstance, media, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, forceDocument, groupMedia, editingMessageObject, pollToAddOptionMessageObject, notify, scheduleDate, scheduleRepeatPeriod, mode, updateStikcersOrder, inputContent, sendMessageChatArguments, effectId, invertMedia, payStars, monoForumPeerId, suggestionParams, null, false);
     }
 
+    /** 电脑会话视频在原媒体队列按顺序交给文档准备，照片和其他会话保持原路径。 */
     @UiThread
     public static void prepareSendingMedia(AccountInstance accountInstance, ArrayList<SendingMediaInfo> media, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, boolean forceDocument, boolean groupMedia, MessageObject editingMessageObject, TLRPC.TL_inputPollAnswer pollToAddOptionMessageObject, boolean notify, int scheduleDate, int scheduleRepeatPeriod, int mode, boolean updateStikcersOrder, InputContentInfoCompat inputContent, SendMessageChatArguments sendMessageChatArguments, long effectId, boolean invertMedia, long payStars, long monoForumPeerId, MessageSuggestionParams suggestionParams, PollSendParams pollSendParams, boolean forcedPollDoNotSendFinal) {
         if (media.isEmpty()) {
@@ -10838,6 +10845,19 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
                 } else if (groupMediaFinal && count > 1 && mediaCount % 10 == 0) {
                     lastGroupId = groupId = Utilities.random.nextLong();
                     mediaCount = 0;
+                }
+                // 普通图库的原视频按当前位置准备为文件；显式“作为文件”保留原整批文档顺序。
+                if (!forceDocument && isCodexVideoFile(dialogId, info.isVideo) && !info.isLivePhoto) {
+                    mediaCount++;
+                    boolean finalVideoFile = !forcedPollDoNotSendFinal && (pollSendParams == null && mediaCount == 10 || a == count - 1);
+                    int error = prepareSendingDocumentInternal(accountInstance, info.path, info.path, info.uri, null,
+                            dialogId, replyToMsg, replyToTopMsg, storyItem, quote, info.entities, editingMessageObject,
+                            groupMediaFinal ? new long[]{groupId} : null, finalVideoFile, info.caption, notify,
+                            scheduleDate, scheduleRepeatPeriod, null, true, sendMessageChatArguments, effectId,
+                            invertMedia, payStars, monoForumPeerId, suggestionParams, pollSendParams, info.pollIndex);
+                    if (error == 0 && finalVideoFile) lastGroupId = 0;
+                    handleError(error, accountInstance);
+                    continue;
                 }
                 if (info.searchImage != null && info.videoEditedInfo == null) {
                     if (info.searchImage.type == 1) {
@@ -11886,11 +11906,21 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         prepareSendingVideo(accountInstance, videoPath, info, coverPath, coverPhoto, dialogId, replyToMsg, replyToTopMsg, storyItem, quote, entities, ttl, editingMessageObject, notify, scheduleDate, scheduleRepeatPeriod, forceDocument, hasMediaSpoilers, caption, sendMessageChatArguments, effectId, stars, monoForumPeerId, suggestionParams, false);
     }
 
+    /** 单视频入口复用原准备线程发送原件文档，不生成将被绕过的转码结果。 */
     public static void prepareSendingVideo(AccountInstance accountInstance, String videoPath, VideoEditedInfo info, String coverPath, TLRPC.Photo coverPhoto, long dialogId, MessageObject replyToMsg, MessageObject replyToTopMsg, TL_stories.StoryItem storyItem, ChatActivity.ReplyQuote quote, ArrayList<TLRPC.MessageEntity> entities, int ttl, MessageObject editingMessageObject, boolean notify, int scheduleDate, int scheduleRepeatPeriod, boolean forceDocument, boolean hasMediaSpoilers, CharSequence caption, SendMessageChatArguments sendMessageChatArguments, long effectId, long stars, long monoForumPeerId, MessageSuggestionParams suggestionParams, boolean invertMedia) {
         if (videoPath == null || videoPath.length() == 0) {
             return;
         }
         new Thread(() -> {
+            // 复用本来的视频准备线程与文档处理器，不创建转码目标或另一条传输链。
+            if (isCodexVideoFile(dialogId, true)) {
+                int error = prepareSendingDocumentInternal(accountInstance, videoPath, videoPath, null, null,
+                        dialogId, replyToMsg, replyToTopMsg, storyItem, quote, entities, editingMessageObject,
+                        null, false, caption, notify, scheduleDate, scheduleRepeatPeriod, null, true,
+                        sendMessageChatArguments, effectId, invertMedia, stars, monoForumPeerId, suggestionParams, null, -1);
+                handleError(error, accountInstance);
+                return;
+            }
             final VideoEditedInfo videoEditedInfo = info != null ? info : createCompressionSettings(videoPath, 0);
 
             boolean isEncrypted = DialogObject.isEncryptedDialog(dialogId);
