@@ -66,6 +66,54 @@ public class ApplicationLoader extends Application {
 
     public static long startTime;
 
+    private static final String[] CODEX_STARTUP_STAGES = {
+            "app_create_begin", "app_native_begin", "app_native_end", "app_create_end",
+            "post_init_begin", "post_init_config_begin", "post_init_accounts_begin",
+            "post_init_accounts_end", "post_init_media_begin", "post_init_end",
+            "launch_create_begin", "launch_theme_begin", "launch_theme_end",
+            "launch_theme_resources_begin", "launch_theme_resources_end",
+            "launch_content_view_begin", "launch_content_view_end", "launch_create_end",
+            "root_first_draw"
+    };
+    private static boolean codexStartupTraceChecked;
+    private static boolean codexStartupTraceEnabled;
+    private static long codexStartupTraceStartedAt;
+    private static int codexStartupTraceStages;
+
+    /** 按包名、调试构建和显式日志开关初始化诊断；进程内只采样一次开关并记录单调时钟起点。 */
+    private static synchronized void beginCodexStartupTrace(String packageName) {
+        if (codexStartupTraceChecked) {
+            return;
+        }
+        codexStartupTraceChecked = true;
+        // 必须在进程启动前启用日志标签；此处不初始化业务运行时或文件日志，避免诊断改变启动链。
+        codexStartupTraceEnabled = BuildConfig.DEBUG_VERSION
+                && packageName != null && packageName.startsWith("com.butang.codextop.nativepreview")
+                && android.util.Log.isLoggable("CodexStartup", android.util.Log.DEBUG);
+        if (codexStartupTraceEnabled) {
+            codexStartupTraceStartedAt = SystemClock.elapsedRealtime();
+            traceCodexStartup("app_create_begin");
+        }
+    }
+
+    /** 同步记录固定阶段及启动后耗时，每阶段每进程最多一次；绘制阶段不代表屏幕已呈现。 */
+    public static synchronized void traceCodexStartup(String stage) {
+        if (!codexStartupTraceEnabled) {
+            return;
+        }
+        for (int i = 0; i < CODEX_STARTUP_STAGES.length; i++) {
+            if (CODEX_STARTUP_STAGES[i].equals(stage)) {
+                int mask = 1 << i;
+                if ((codexStartupTraceStages & mask) == 0) {
+                    codexStartupTraceStages |= mask;
+                    android.util.Log.d("CodexStartup", "stage=" + CODEX_STARTUP_STAGES[i]
+                            + " elapsedMs=" + (SystemClock.elapsedRealtime() - codexStartupTraceStartedAt));
+                }
+                return;
+            }
+        }
+    }
+
     public static volatile boolean isScreenOn = false;
     public static volatile boolean mainInterfacePaused = true;
     public static volatile boolean mainInterfaceStopped = true;
@@ -188,11 +236,13 @@ public class ApplicationLoader extends Application {
         return null;
     }
 
+    /** 上下文就绪后按原顺序初始化账号与媒体组件；已有初始化直接返回，诊断仅标记原流程边界。 */
     public static void postInitApplication() {
         if (applicationInited || applicationContext == null) {
             return;
         }
         applicationInited = true;
+        traceCodexStartup("post_init_begin");
         NativeLoader.initNativeLibs(ApplicationLoader.applicationContext);
 
         try {
@@ -249,8 +299,10 @@ public class ApplicationLoader extends Application {
             e.printStackTrace();
         }
 
+        traceCodexStartup("post_init_config_begin");
         SharedConfig.loadConfig();
         SharedPrefsHelper.init(applicationContext);
+        traceCodexStartup("post_init_accounts_begin");
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) { //TODO improve account
             UserConfig.getInstance(a).loadConfig();
             MessagesController.getInstance(a);
@@ -266,26 +318,31 @@ public class ApplicationLoader extends Application {
             }
         }
 
+        traceCodexStartup("post_init_accounts_end");
         ApplicationLoader app = (ApplicationLoader) ApplicationLoader.applicationContext;
         app.initPushServices();
         if (BuildVars.LOGS_ENABLED) {
             FileLog.d("app initied");
         }
 
+        traceCodexStartup("post_init_media_begin");
         MediaController.getInstance();
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) { //TODO improve account
             ContactsController.getInstance(a).checkAppAccount();
             DownloadController.getInstance(a);
         }
         BillingController.getInstance().startConnection();
+        traceCodexStartup("post_init_end");
     }
 
     public ApplicationLoader() {
         super();
     }
 
+    /** 建立应用上下文并执行原启动流程；入口采样诊断开关，只在原初始化步骤前后记录阶段。 */
     @Override
     public void onCreate() {
+        beginCodexStartupTrace(getPackageName());
         applicationLoaderInstance = this;
         try {
             applicationContext = getApplicationContext();
@@ -328,6 +385,7 @@ public class ApplicationLoader extends Application {
             applicationContext = getApplicationContext();
         }
 
+        traceCodexStartup("app_native_begin");
         NativeLoader.initNativeLibs(ApplicationLoader.applicationContext);
 
         try {
@@ -335,6 +393,7 @@ public class ApplicationLoader extends Application {
         } catch (UnsatisfiedLinkError error) {
             throw new RuntimeException("can't load native libraries " +  Build.CPU_ABI + " lookup folder " + NativeLoader.getAbiFolder());
         }
+        traceCodexStartup("app_native_end");
         new ForegroundDetector(this) {
             @Override
             public void onActivityStarted(Activity activity) {
@@ -365,6 +424,7 @@ public class ApplicationLoader extends Application {
         //if (BuildConfig.DEBUG_PRIVATE_VERSION) {
         //    Choreographer60FpsContent.getInstance().addFrameCallback(debugEverySecondChecks, 1);
         //}
+        traceCodexStartup("app_create_end");
     }
 
     private final Runnable debugEverySecondChecks = () -> AndroidUtilities.runOnUIThread(() -> {

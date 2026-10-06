@@ -391,8 +391,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     private FrameMetricsOverlayView frameMetricsOverlayView;
     // private RefreshRateController refreshRateController;
 
+    /** 按原生命周期建立启动界面；诊断标记主题、根视图和创建结束，不调整初始化或早退顺序。 */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        ApplicationLoader.traceCodexStartup("launch_create_begin");
         isActive = true;
         activeInstanceCount++;
         if (BuildVars.DEBUG_VERSION) {
@@ -431,11 +433,13 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         }
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setTheme(R.style.Theme_TMessages);
+        ApplicationLoader.traceCodexStartup("launch_theme_begin");
         try {
             setTaskDescription(new ActivityManager.TaskDescription(null, null, Theme.getColor(Theme.key_actionBarDefault) | 0xff000000));
         } catch (Throwable ignore) {
 
         }
+        ApplicationLoader.traceCodexStartup("launch_theme_end");
         getWindow().setBackgroundDrawable(new ActivityWindowEmptyBackgroundDrawable());
         getWindow().setFormat(PixelFormat.OPAQUE);
 
@@ -446,8 +450,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         if (Build.VERSION.SDK_INT >= 24) {
             AndroidUtilities.isInMultiwindow = isInMultiWindowMode();
         }
+        ApplicationLoader.traceCodexStartup("launch_theme_resources_begin");
         Theme.createCommonChatResources();
         Theme.createDialogsResources(this);
+        ApplicationLoader.traceCodexStartup("launch_theme_resources_end");
         if (SharedConfig.passcodeHash.length() != 0 && SharedConfig.appLocked) {
             SharedConfig.lastPauseTime = (int) (SystemClock.elapsedRealtime() / 1000);
         }
@@ -457,7 +463,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         frameLayout = new ActivityContentLayout(this);
         frameLayout.setClipToPadding(false);
         frameLayout.setClipChildren(false);
+        ApplicationLoader.traceCodexStartup("launch_content_view_begin");
         setContentView(frameLayout);
+        ApplicationLoader.traceCodexStartup("launch_content_view_end");
         rootAnimatedInsetsListener = new WindowAnimatedInsetsProvider(frameLayout);
         pipActivityController.addPipListener(new IPipActivityListener() {
             final ActivityVisibilityController activityVisibilityController = createActivityVisibilityController(false);
@@ -852,6 +860,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         //    refreshRateController = new RefreshRateController(this);
         //}
         checkFrameMetrics();
+        ApplicationLoader.traceCodexStartup("launch_create_end");
     }
 
     public void checkFrameMetrics() {
@@ -9233,14 +9242,22 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     }
 
     private class ActivityContentLayout extends FrameLayout {
+        private boolean codexStartupDrawTraced;
+
         public ActivityContentLayout(@NonNull Context context) {
             super(context);
         }
 
+        /** 完成原根视图与波纹绘制后标记首次遍历；后续帧不调用诊断，实际可见仍需屏幕验证。 */
         @Override
         protected void dispatchDraw(@NonNull Canvas canvas) {
             super.dispatchDraw(canvas);
             drawRippleAbove(canvas, this);
+            // 局部标记避开后续逐帧调用，进程级助手继续抑制界面重建产生的重复阶段。
+            if (!codexStartupDrawTraced) {
+                codexStartupDrawTraced = true;
+                ApplicationLoader.traceCodexStartup("root_first_draw");
+            }
         }
 
         @Override
