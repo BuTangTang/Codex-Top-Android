@@ -525,6 +525,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     private int searchViewPagerIndex;
     @Nullable
     private SearchViewPager searchViewPager;
+    private SearchViewPager codexSearchObservedPager;
+    private RecyclerView.AdapterDataObserver codexSearchDataObserver;
     private SharedMediaLayout.SharedMediaPreloader sharedMediaPreloader;
     public DialogStoriesCell dialogStoriesCell;
     private DialogsActivityStatusLayout dialogsActivityStatusLayout;
@@ -3071,8 +3073,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
+    /** 销毁会话页时解绑按需搜索的结果观察，防止迟结果继续持有旧页面。 */
     @Override
     public void onFragmentDestroy() {
+        clearCodexSearchObserver();
         super.onFragmentDestroy();
         if (observersGroup != null) {
             observersGroup.removeAllObservers();
@@ -3204,6 +3208,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     /** Codex 三栏首页沿用原会话列表，不再重复展示电脑和设置菜单入口；仅普通首页省去完整聊天资源预热。 */
     @Override
     public View createView(final Context context) {
+        clearCodexSearchObserver();
         searching = false;
         searchWas = false;
         wasDrawn = false;
@@ -3384,8 +3389,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 return true;
             }
 
+            /** 先关闭 Codex 搜索意图，再清筛选，避免同步数据通知重新展开正在关闭的搜索。 */
             @Override
             public void onSearchCollapse() {
+                if (shouldDeferCodexSearchPreload()) {
+                    searching = false;
+                }
                 if (fragmentSearchField != null) {
                     fragmentSearchField.clearSearchFiltersWithCallback();
                 }
@@ -7366,6 +7375,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         canShowStoryHint = true;
     }
 
+    /** 普通 Codex 首页保留会话显示，完整搜索树延后到原搜索入口创建；其他入口仍预热。 */
     @Override
     public void onBecomeFullyVisible() {
         super.onBecomeFullyVisible();
@@ -7387,7 +7397,53 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             canShowStoryHint = false;
             storyHint.show();
         }
-        AndroidUtilities.runOnUIThread(this::createSearchViewPager, 200);
+        if (!shouldDeferCodexSearchPreload()) {
+            AndroidUtilities.runOnUIThread(this::createSearchViewPager, 200);
+        }
+    }
+
+    /** 只延后普通 Codex 三栏首页的隐藏搜索树，不改变归档、选择、预置搜索或预览。 */
+    private boolean shouldDeferCodexSearchPreload() {
+        return com.butang.codextop.CodexRuntime.enabled() && hasMainTabs
+                && initialDialogsType == DIALOGS_TYPE_DEFAULT && folderId == 0 && communityId == 0
+                && !onlySelect && searchString == null && !inPreviewMode;
+    }
+
+    /** 重建或销毁时解绑唯一观察器；同一页面多次调用也不会重复注销。 */
+    private void clearCodexSearchObserver() {
+        if (codexSearchObservedPager != null && codexSearchDataObserver != null) {
+            codexSearchObservedPager.dialogsSearchAdapter.unregisterAdapterDataObserver(codexSearchDataObserver);
+        }
+        codexSearchObservedPager = null;
+        codexSearchDataObserver = null;
+    }
+
+    /** 首次实际搜索后观察既有 recent/hints 通知；只恢复仍有效的空查询，不新增读取或轮询。 */
+    private void observeCodexSearchResults(SearchViewPager pager) {
+        clearCodexSearchObserver();
+        if (!shouldDeferCodexSearchPreload()) {
+            return;
+        }
+        final View ownerView = fragmentView;
+        final int ownerAccount = currentAccount;
+        codexSearchObservedPager = pager;
+        codexSearchDataObserver = new RecyclerView.AdapterDataObserver() {
+            /** 数据晚到或原 onResume 重播时，核对页面归属和用户意图，再沿原展开路径显示。 */
+            @Override
+            public void onChanged() {
+                if (codexSearchObservedPager != pager || searchViewPager != pager || fragmentView != ownerView
+                        || currentAccount != ownerAccount || pager.getParent() != ownerView
+                        || isFinished || isPaused || !searching || searchIsShowed
+                        || fragmentSearchField == null || !fragmentSearchField.editText.hasFocus()
+                        || !TextUtils.isEmpty(fragmentSearchField.editText.getText())
+                        || !pager.dialogsSearchAdapter.hasRecentSearch()) {
+                    return;
+                }
+                searchWas = true;
+                showSearch(true, false, true);
+            }
+        };
+        pager.dialogsSearchAdapter.registerAdapterDataObserver(codexSearchDataObserver);
     }
 
     private void showArchiveHelp() {
@@ -12913,6 +12969,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
+    /** 沿原入口创建完整搜索页，并为按需首页绑定一次异步结果观察；已有当前页直接复用。 */
     public void createSearchViewPager() {
         if (searchViewPager != null && searchViewPager.getParent() == fragmentView) return;
         if (fragmentView == null) return;
@@ -13297,6 +13354,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         searchViewPager.setScaleY(1.05f);
         searchViewPager.setVisibility(View.GONE);
         searchViewPager.setBlurredBackgroundDrawableFactory(iBlur3FactoryBlur);
+        observeCodexSearchResults(searchViewPager);
     }
 
     public boolean clickSelectsDialog() {
