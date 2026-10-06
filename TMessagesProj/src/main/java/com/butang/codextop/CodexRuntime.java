@@ -2470,7 +2470,7 @@ public final class CodexRuntime {
         refreshDialogs(account);
     }
 
-    /** 后台保存编号，界面复用稳定模型并恢复真实摘要；列表差异仍只认顺序和原展示字段。 */
+    /** 后台保存编号，界面复用稳定模型；按实际列表顺序优先恢复可见摘要，不改列表差异判定。 */
     private static void publishDialogs(int account, String machine, com.google.gson.JsonArray candidates,
             long startedAt, long receivedAt, boolean cached) {
         final long accountEpoch = accountGeneration;
@@ -2526,7 +2526,19 @@ public final class CodexRuntime {
             if (statusChanged || presentationChanged)
                 NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces,
                         MessagesController.UPDATE_MASK_STATUS | (presentationChanged ? MessagesController.UPDATE_MASK_NAME : 0));
-            restoreDialogPreviews(account, accountEpoch, machine, publishedIds);
+            // 先按本批实际可见顺序恢复摘要；绑定仍取本批快照，不重新读取其它来源的全局列表。
+            Map<Long, String> publishedRemotes = new HashMap<>();
+            for (Map.Entry<String, Long> binding : publishedIds.entrySet())
+                publishedRemotes.put(binding.getValue(), binding.getKey());
+            Map<String, Long> previewIds = new java.util.LinkedHashMap<>();
+            for (TLRPC.Dialog dialog : updated) {
+                String remote = publishedRemotes.get(dialog.id);
+                if (remote != null) previewIds.put(remote, dialog.id);
+            }
+            // 超出可见上限的原候选只后置，保持既有恢复集合，不删历史或增添后台工作。
+            for (Map.Entry<String, Long> binding : publishedIds.entrySet())
+                previewIds.putIfAbsent(binding.getKey(), binding.getValue());
+            restoreDialogPreviews(account, accountEpoch, machine, previewIds);
         });
     }
 
