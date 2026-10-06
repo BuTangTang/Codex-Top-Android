@@ -391,7 +391,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     private FrameMetricsOverlayView frameMetricsOverlayView;
     // private RefreshRateController refreshRateController;
 
-    /** 按原生命周期建立启动界面；诊断标记主题、根视图和创建结束，不调整初始化或早退顺序。 */
+    /** 按原生命周期建立启动界面；仅普通 Codex 冷启动复用刚挂载的首页，其他入口保留原重建。 */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         ApplicationLoader.traceCodexStartup("launch_create_begin");
@@ -589,12 +589,16 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             .add(NotificationCenter.memoryLeakFoundException);
 
         LiteMode.addOnPowerSaverAppliedListener(onPowerSaverCallback = this::onPowerSaver);
+        BaseFragment freshMainTabsRoot = null;
         if (actionBarLayout.getFragmentStack().isEmpty() && (layersActionBarLayout == null || layersActionBarLayout.getFragmentStack().isEmpty())) {
+            BaseFragment initialFragment;
             if (!UserConfig.getInstance(currentAccount).isClientActivated()) {
-                actionBarLayout.addFragmentToStack(getClientNotActivatedFragment());
+                initialFragment = getClientNotActivatedFragment();
             } else {
-                MainTabsActivity mainTabsActivity = new MainTabsActivity();
-                actionBarLayout.addFragmentToStack(mainTabsActivity);
+                initialFragment = new MainTabsActivity();
+            }
+            if (actionBarLayout.addFragmentToStack(initialFragment) && initialFragment instanceof MainTabsActivity) {
+                freshMainTabsRoot = initialFragment;
             }
 
             try {
@@ -661,7 +665,20 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         }
         checkLayout();
         checkSystemBarColors();
-        handleIntent(getIntent(), false, savedInstanceState != null, false, null, true, true);
+        Intent startupIntent = getIntent();
+        // 首页已同步创建并挂载；仅无恢复、参数和密码锁的图标冷启跳过紧接着的重复视图重建。
+        boolean keepFreshCodexRoot = com.butang.codextop.CodexRuntime.enabled()
+                && !AndroidUtilities.isTablet() && savedInstanceState == null
+                && freshMainTabsRoot != null && freshMainTabsRoot.getFragmentView() != null
+                && freshMainTabsRoot.getFragmentView().getParent() != null
+                && actionBarLayout.getFragmentStack().size() == 1
+                && actionBarLayout.getFragmentStack().get(0) == freshMainTabsRoot
+                && startupIntent != null && Intent.ACTION_MAIN.equals(startupIntent.getAction())
+                && startupIntent.getData() == null
+                && (startupIntent.getExtras() == null || startupIntent.getExtras().isEmpty())
+                && SharedConfig.passcodeHash.length() == 0 && !SharedConfig.appLocked
+                && !SharedConfig.isWaitingForPasscodeEnter && passcodeSaveIntent == null;
+        handleIntent(startupIntent, false, savedInstanceState != null, false, null, !keepFreshCodexRoot, true);
         try {
             String os1 = Build.DISPLAY;
             String os2 = Build.USER;
