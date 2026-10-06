@@ -3201,7 +3201,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
-    /** Codex 三栏首页沿用原会话列表，不再重复展示电脑和设置菜单入口。 */
+    /** Codex 三栏首页沿用原会话列表，不再重复展示电脑和设置菜单入口；仅普通首页省去完整聊天资源预热。 */
     @Override
     public View createView(final Context context) {
         searching = false;
@@ -3213,7 +3213,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
         maximumVelocity = ViewConfiguration.get(context).getScaledMaximumFlingVelocity();
 
-        AndroidUtilities.runOnUIThread(() -> Theme.createChatResources(context, false));
+        // 首页公共和列表资源保持；首次进入聊天仍由 ChatActivity 按原入口同步初始化。
+        if (!(com.butang.codextop.CodexRuntime.enabled() && hasMainTabs
+                && initialDialogsType == DIALOGS_TYPE_DEFAULT && folderId == 0 && communityId == 0
+                && !onlySelect && searchString == null && !inPreviewMode)) {
+            AndroidUtilities.runOnUIThread(() -> Theme.createChatResources(context, false));
+        }
 
         authHintCell = null;
         activeGiftAuctionsHintCell = null;
