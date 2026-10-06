@@ -211,14 +211,20 @@ public final class CodexRuntime {
         });
     }
 
-    /** 原草稿格式保持不变，仅按服务及账号选择文件；未登录不读取任何账号草稿。 */
-    public static synchronized String draftPreferencesName(int telegramAccount) {
+    /** 已恢复账号的草稿命名不等待联网类锁；冷恢复仍走原单飞入口，归属中途变化则隔离。 */
+    public static String draftPreferencesName(int telegramAccount) {
         String original = telegramAccount == 0 ? "drafts" : "drafts" + telegramAccount;
-        if (!loggedIn()) return "codex-drafts-signed-out-" + telegramAccount;
-        String owner = TranscriptStore.digest(session.server + "\n" + session.accountId);
+        String signedOut = "codex-drafts-signed-out-" + telegramAccount;
+        if (!loggedIn()) return signedOut;
+        long epoch = accountGeneration;
+        PasswordLogin.Session owner = session;
+        if (owner == null || !isAccountCurrent(epoch)) return signedOut;
+        // 两个身份字段只来自同一不可变会话，不能分别读取可能已切换的全局session。
+        String ownerKey = TranscriptStore.digest(owner.server + "\n" + owner.accountId);
         String legacyOwner = ApplicationLoader.applicationContext.getSharedPreferences("codex-preferences", 0)
                 .getString("legacyDraftOwner", "");
-        return owner.equals(legacyOwner) ? original : "codex-drafts-" + owner + "-" + telegramAccount;
+        if (session != owner || !isAccountCurrent(epoch)) return signedOut;
+        return ownerKey.equals(legacyOwner) ? original : "codex-drafts-" + ownerKey + "-" + telegramAccount;
     }
 
     /** 首页重连优先沿用缓存电脑，不能在原电脑离线时自动切到其他电脑。 */
