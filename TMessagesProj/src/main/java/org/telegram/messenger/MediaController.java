@@ -1009,6 +1009,10 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
     public static ArrayList<AlbumEntry> allMediaAlbums = new ArrayList<>();
     public static ArrayList<AlbumEntry> allPhotoAlbums = new ArrayList<>();
     private static Runnable broadcastPhotosRunnable;
+    private static final java.util.concurrent.atomic.AtomicInteger galleryLoadGeneration = new java.util.concurrent.atomic.AtomicInteger();
+    private static volatile int galleryLoadedPermissionState = -1;
+    private static volatile int galleryLoadingPermissionState;
+    private static volatile boolean galleryLoading;
 
     public boolean isSilent = false;
     private boolean isPaused = false;
@@ -1279,7 +1283,96 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         }
     }
 
+    /** 按实际媒体类型检查图库授权；音频授权不代表照片或视频可读。 */
+    public static boolean canReadGalleryMedia(Context context, boolean video) {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        if (context == null) return false;
+        if (Build.VERSION.SDK_INT >= 33) {
+            return context.checkSelfPermission(video ? Manifest.permission.READ_MEDIA_VIDEO : Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+                || Build.VERSION.SDK_INT >= 34 && context.checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED;
+        }
+        return context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** 是否仍可由用户主动扩大有限授权；某一媒体类型全量授权不冒充两类都已授权。 */
+    public static boolean hasSelectedGalleryAccess(Context context) {
+        return Build.VERSION.SDK_INT >= 34 && context != null
+            && context.checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED
+            && (context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED
+                || context.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED);
+    }
+
+    /** 沿原图库按钮请求视觉权限，Android 14 起显式接管选定项目和重新选择。 */
+    public static String[] galleryPermissions() {
+        if (Build.VERSION.SDK_INT >= 34) return new String[]{Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED};
+        if (Build.VERSION.SDK_INT >= 33) return new String[]{Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_IMAGES};
+        return new String[]{Manifest.permission.READ_EXTERNAL_STORAGE};
+    }
+
+    /** 预览发送时定点复核有限授权项目；最多查询照片、视频各一次，不扫描完整图库。 */
+    public static boolean areGallerySelectionsReadable(ArrayList<PhotoEntry> entries) {
+        if (Build.VERSION.SDK_INT < 34 || entries.isEmpty()) return true;
+        Context context = ApplicationLoader.applicationContext;
+        if ((galleryPermissionState() & 3) == 3) return true;
+        for (boolean video : new boolean[]{false, true}) {
+            HashMap<Integer, PhotoEntry> expected = new HashMap<>();
+            ArrayList<String> ids = new ArrayList<>();
+            for (PhotoEntry entry : entries) {
+                if (entry.isVideo != video) continue;
+                PhotoEntry previous = expected.put(entry.imageId, entry);
+                if (previous != null && !TextUtils.equals(previous.path, entry.path)) return false;
+                if (previous == null) ids.add(Integer.toString(entry.imageId));
+            }
+            if (ids.isEmpty()) continue;
+            if (!canReadGalleryMedia(context, video)) return false;
+            String[] placeholders = new String[ids.size()];
+            java.util.Arrays.fill(placeholders, "?");
+            Cursor cursor = null;
+            try {
+                cursor = context.getContentResolver().query(video ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI : MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    new String[]{MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATA},
+                    MediaStore.MediaColumns._ID + " IN (" + TextUtils.join(",", placeholders) + ")", ids.toArray(new String[0]), null);
+                if (cursor == null) return false;
+                while (cursor.moveToNext()) {
+                    PhotoEntry entry = expected.get(cursor.getInt(0));
+                    if (entry == null || !TextUtils.equals(entry.path, cursor.getString(1))) return false;
+                    expected.remove(entry.imageId);
+                }
+                if (!expected.isEmpty()) return false;
+            } catch (Exception ignored) {
+                return false;
+            } finally {
+                if (cursor != null) {
+                    try { cursor.close(); } catch (Exception ignored) {}
+                }
+            }
+        }
+        return true;
+    }
+
+    /** 只保存进程内查询所用的权限位，使用前仍读取系统授权，不永久缓存许可。 */
+    private static int galleryPermissionState() {
+        Context context = ApplicationLoader.applicationContext;
+        return (context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ? 1 : 0)
+            | (context.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ? 2 : 0)
+            | (context.checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED ? 4 : 0);
+    }
+
+    /** 有限访问或授权变化时重查；同一前台周期复用在途查询，稳定全量授权保留原缓存。 */
+    public static synchronized boolean refreshGalleryPhotosAlbums(int guid) {
+        if (Build.VERSION.SDK_INT < 34) return false;
+        // 从未打开图库时不因前台恢复主动扫描；原空缓存加载入口仍按需启动。
+        if (galleryLoadedPermissionState == -1 && !galleryLoading && allMediaAlbumEntry == null && allPhotosAlbumEntry == null) return false;
+        int state = galleryPermissionState();
+        boolean partial = (state & 4) != 0 && (state & 3) != 3;
+        if (!partial && state == galleryLoadedPermissionState) return false;
+        if (!galleryLoading || galleryLoadingPermissionState != state) loadGalleryPhotosAlbums(guid);
+        return true;
+    }
+
+    /** 前台恢复时重查 Android 14 图库；授权范围变化不能只比较项目数量。 */
     public static void checkGallery() {
+        if (refreshGalleryPhotosAlbums(0)) return;
         if (Build.VERSION.SDK_INT < 24 || allPhotosAlbumEntry == null) {
             return;
         }
@@ -1289,14 +1382,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             Cursor cursor = null;
             try {
                 final Context context = ApplicationLoader.applicationContext;
-                if (
-                    Build.VERSION.SDK_INT >= 33 && (
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-                    ) ||
-                    context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-                ) {
+                if (canReadGalleryMedia(context, false)) {
                     cursor = MediaStore.Images.Media.query(context.getContentResolver(), MediaStore.Images.Media.EXTERNAL_CONTENT_URI, new String[]{"COUNT(_id)"}, null, null, null);
                     if (cursor != null) {
                         if (cursor.moveToNext()) {
@@ -1313,14 +1399,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             }
             try {
                 final Context context = ApplicationLoader.applicationContext;
-                if (
-                    Build.VERSION.SDK_INT >= 33 && (
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-                    ) ||
-                    context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-                ) {
+                if (canReadGalleryMedia(context, true)) {
                     cursor = MediaStore.Images.Media.query(context.getContentResolver(), MediaStore.Video.Media.EXTERNAL_CONTENT_URI, new String[]{"COUNT(_id)"}, null, null, null);
                     if (cursor != null) {
                         if (cursor.moveToNext()) {
@@ -6102,7 +6181,20 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         return null;
     }
 
+    /** 在原后台线程读取当前授权图库；代次只用于 Android 14，阻止重选前的慢查询回填。 */
     public static void loadGalleryPhotosAlbums(final int guid) {
+        final int generation = Build.VERSION.SDK_INT >= 34 ? galleryLoadGeneration.incrementAndGet() : 0;
+        if (generation != 0) {
+            galleryLoadingPermissionState = galleryPermissionState();
+            galleryLoading = true;
+            final boolean invalidate = hasSelectedGalleryAccess(ApplicationLoader.applicationContext) || galleryLoadingPermissionState != galleryLoadedPermissionState;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (generation != galleryLoadGeneration.get() || !invalidate) return;
+                allMediaAlbumEntry = allPhotosAlbumEntry = allVideosAlbumEntry = null;
+                allMediaAlbums = new ArrayList<>();
+                allPhotoAlbums = new ArrayList<>();
+            });
+        }
         Thread thread = new Thread(() -> {
             final ArrayList<AlbumEntry> mediaAlbumsSorted = new ArrayList<>();
             final ArrayList<AlbumEntry> photoAlbumsSorted = new ArrayList<>();
@@ -6123,15 +6215,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             Cursor cursor = null;
             try {
                 final Context context = ApplicationLoader.applicationContext;
-                if (
-                    Build.VERSION.SDK_INT < 23 ||
-                    Build.VERSION.SDK_INT < 33 && context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED ||
-                    Build.VERSION.SDK_INT >= 33 && (
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-                    )
-                ) {
+                if (canReadGalleryMedia(context, false)) {
                     cursor = MediaStore.Images.Media.query(context.getContentResolver(), MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projectionPhotos, null, null, (Build.VERSION.SDK_INT > 28 ? MediaStore.Images.Media.DATE_MODIFIED : MediaStore.Images.Media.DATE_TAKEN) + " DESC");
                     if (cursor != null) {
                         int imageIdColumn = cursor.getColumnIndex(MediaStore.Images.Media._ID);
@@ -6219,15 +6303,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             try {
 
                 final Context context = ApplicationLoader.applicationContext;
-                if (
-                    Build.VERSION.SDK_INT < 23 ||
-                    Build.VERSION.SDK_INT < 33 && context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED ||
-                    Build.VERSION.SDK_INT >= 33 && (
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
-                        context.checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
-                    )
-                ) {
+                if (canReadGalleryMedia(context, true)) {
                     cursor = MediaStore.Images.Media.query(ApplicationLoader.applicationContext.getContentResolver(), MediaStore.Video.Media.EXTERNAL_CONTENT_URI, projectionVideo, null, null, (Build.VERSION.SDK_INT > 28 ? MediaStore.Video.Media.DATE_MODIFIED : MediaStore.Video.Media.DATE_TAKEN) + " DESC");
                     if (cursor != null) {
                         int imageIdColumn = cursor.getColumnIndex(MediaStore.Video.Media._ID);
@@ -6315,21 +6391,27 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                     return 0;
                 });
             }
-            broadcastNewPhotos(guid, mediaAlbumsSorted, photoAlbumsSorted, mediaCameraAlbumId, allMediaAlbum, allPhotosAlbum, allVideosAlbum, 0);
+            broadcastNewPhotos(guid, mediaAlbumsSorted, photoAlbumsSorted, mediaCameraAlbumId, allMediaAlbum, allPhotosAlbum, allVideosAlbum, 0, generation);
         });
         thread.setPriority(Thread.MIN_PRIORITY);
         thread.start();
     }
 
     public static boolean forceBroadcastNewPhotos;
-    private static void broadcastNewPhotos(final int guid, final ArrayList<AlbumEntry> mediaAlbumsSorted, final ArrayList<AlbumEntry> photoAlbumsSorted, final Integer cameraAlbumIdFinal, final AlbumEntry allMediaAlbumFinal, final AlbumEntry allPhotosAlbumFinal, final AlbumEntry allVideosAlbumFinal, int delay) {
-        if (broadcastPhotosRunnable != null) {
+    /** 只发布最新授权查询；照片预览的原延迟保留，旧代次也不能在延迟后回填。 */
+    private static void broadcastNewPhotos(final int guid, final ArrayList<AlbumEntry> mediaAlbumsSorted, final ArrayList<AlbumEntry> photoAlbumsSorted, final Integer cameraAlbumIdFinal, final AlbumEntry allMediaAlbumFinal, final AlbumEntry allPhotosAlbumFinal, final AlbumEntry allVideosAlbumFinal, int delay, final int generation) {
+        if (generation == 0 && broadcastPhotosRunnable != null) {
             AndroidUtilities.cancelRunOnUIThread(broadcastPhotosRunnable);
         }
         AndroidUtilities.runOnUIThread(broadcastPhotosRunnable = () -> {
+            if (generation != 0 && generation != galleryLoadGeneration.get()) return;
             if (PhotoViewer.getInstance().isVisible() && !forceBroadcastNewPhotos) {
-                broadcastNewPhotos(guid, mediaAlbumsSorted, photoAlbumsSorted, cameraAlbumIdFinal, allMediaAlbumFinal, allPhotosAlbumFinal, allVideosAlbumFinal, 1000);
+                broadcastNewPhotos(guid, mediaAlbumsSorted, photoAlbumsSorted, cameraAlbumIdFinal, allMediaAlbumFinal, allPhotosAlbumFinal, allVideosAlbumFinal, 1000, generation);
                 return;
+            }
+            if (generation != 0) {
+                galleryLoadedPermissionState = galleryLoadingPermissionState;
+                galleryLoading = false;
             }
             allMediaAlbums = mediaAlbumsSorted;
             allPhotoAlbums = photoAlbumsSorted;

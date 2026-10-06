@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 
 import androidx.annotation.RawRes;
 import androidx.fragment.app.FragmentActivity;
@@ -15,6 +16,7 @@ import org.telegram.messenger.ContactsController;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.ImageLoader;
 import org.telegram.messenger.LocaleController;
+import org.telegram.messenger.MediaController;
 import org.telegram.messenger.NotificationCenter;
 import org.telegram.messenger.R;
 import org.telegram.messenger.SharedConfig;
@@ -37,6 +39,7 @@ public class BasePermissionsActivity extends FragmentActivity {
 
     protected int currentAccount = -1;
 
+    /** 保留各请求原处理，仅显式选定图库请求按实时视觉授权判断成功。 */
     protected boolean checkPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         if (grantResults == null) {
             grantResults = new int[0];
@@ -56,6 +59,14 @@ public class BasePermissionsActivity extends FragmentActivity {
                 showPermissionErrorAlert(R.raw.permission_request_camera, LocaleController.getString(R.string.VoipNeedCameraPermission));
             }
         } else if (requestCode == REQUEST_CODE_EXTERNAL_STORAGE || requestCode == REQUEST_CODE_EXTERNAL_STORAGE_FOR_AVATAR) {
+            if (Build.VERSION.SDK_INT >= 34) {
+                for (String permission : permissions) {
+                    if (Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED.equals(permission)) {
+                        granted = MediaController.canReadGalleryMedia(this, false) || MediaController.canReadGalleryMedia(this, true);
+                        break;
+                    }
+                }
+            }
             if (!granted) {
                 showPermissionErrorAlert(R.raw.permission_request_folder, requestCode == REQUEST_CODE_EXTERNAL_STORAGE_FOR_AVATAR ? LocaleController.getString(R.string.PermissionNoStorageAvatar) :
                         LocaleController.getString(R.string.PermissionStorageWithHint));

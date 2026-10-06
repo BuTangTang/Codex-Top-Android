@@ -218,6 +218,12 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
     private boolean deviceHasGoodCamera;
     private boolean noCameraPermissions;
     private boolean noGalleryPermissions;
+    private boolean galleryRefreshPending;
+    private int galleryPreviewValidationGeneration;
+    private static ChatAttachAlertPhotoLayout gallerySelectionOwner;
+    private MediaController.AlbumEntry galleryAlbumBeforeRefresh;
+    private final HashMap<Object, Object> gallerySelectionsAwaitingRefresh = new HashMap<>();
+    private final ArrayList<Object> gallerySelectionOrderBeforeRefresh = new ArrayList<>();
     private boolean requestingPermissions;
 
     private boolean ignoreLayout;
@@ -390,8 +396,11 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
             setCurrentSpoilerVisible(-1, false);
         }
 
+        /** 本图库全屏预览关闭后兑现权限刷新，不改变其他 PhotoViewer 提供者的导航。 */
         @Override
         public void onClose() {
+            galleryPreviewValidationGeneration++;
+            if (Build.VERSION.SDK_INT >= 34 && parentAlert.isShowing() && !parentAlert.isDismissed()) loadGalleryPhotos();
             resumeCameraPreview();
             AndroidUtilities.runOnUIThread(()-> setCurrentSpoilerVisible(-1, true), 150);
             onSelectedItemsCountChanged(getSelectedCount());
@@ -520,8 +529,11 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
             return false;
         }
 
+        /** 预览仅发送仍有权限的原项目，提交完成后丢弃待核选择。 */
         @Override
         public void sendButtonPressed(int index, VideoEditedInfo videoEditedInfo, boolean notify, int scheduleDate, int scheduleRepeatPeriod, boolean forceDocument) {
+            galleryPreviewValidationGeneration++;
+            withReadableGalleryPreviewSelection(index, () -> {
             parentAlert.sent = true;
             MediaController.PhotoEntry photoEntry = getPhotoEntryAtPosition(index);
             if (photoEntry != null) {
@@ -563,10 +575,22 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                 PhotoViewer.getInstance().closePhotoAfterSelect = false;
                 PhotoViewer.getInstance().doneButtonPressed = false;
             }
-            AlertsCreator.ensurePaidMessageConfirmation(parentAlert.currentAccount, parentAlert.getDialogId(), getSelectedPhotos().size() + parentAlert.getAdditionalMessagesCount(), payStars -> {
+            final int paidGeneration = galleryPreviewValidationGeneration;
+            final long paidDialogId = parentAlert.getDialogId();
+            final HashMap<Object, Object> paidSelection = new HashMap<>(selectedPhotos);
+            final ArrayList<Object> paidOrder = new ArrayList<>(selectedPhotosOrder);
+            final ArrayList<Object> paidIdentity = gallerySelectionIdentity(index);
+            AlertsCreator.ensurePaidMessageConfirmation(parentAlert.currentAccount, paidDialogId, getSelectedPhotos().size() + parentAlert.getAdditionalMessagesCount(), payStars -> {
+                // 迟到的确认只属于原选择，不能重新捕获另一会话或新选文件后派发。
+                if (paidGeneration != galleryPreviewValidationGeneration || gallerySelectionOwner != ChatAttachAlertPhotoLayout.this
+                    || parentAlert.isDismissed() || !parentAlert.isShowing() || parentAlert.getDialogId() != paidDialogId
+                    || !paidSelection.equals(selectedPhotos) || !paidOrder.equals(selectedPhotosOrder)
+                    || !paidIdentity.equals(gallerySelectionIdentity(index))) return;
+                withReadableGalleryPreviewSelection(index, () -> {
                 if (parentAlert != null) {
                     parentAlert.setButtonPressed(true);
                 }
+                discardGallerySelectionsAwaitingRefresh();
                 parentAlert.delegate.didPressedButton(7, true, notify, scheduleDate, 0, 0, parentAlert.isCaptionAbove(), forceDocument, payStars);
                 selectedPhotos.clear();
                 cameraPhotos.clear();
@@ -576,7 +600,9 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                     PhotoViewer.getInstance().closePhoto(PhotoViewer.getInstance().closePhotoAfterSelectWithAnimation, false);
                     PhotoViewer.getInstance().doneButtonPressed = true;
                 }
+                });
             });
+                    });
         }
 
         @Override
@@ -729,6 +755,7 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         return arrayList;
     }
 
+    /** 建立原附件图库；权限按钮沿显式视觉授权数组请求，选定访问也可继续使用。 */
     public ChatAttachAlertPhotoLayout(ChatAttachAlert alert, Context context, boolean forceDarkTheme, boolean needCamera, Theme.ResourcesProvider resourcesProvider) {
         super(alert, context, resourcesProvider);
         this.forceDarkTheme = forceDarkTheme;
@@ -928,7 +955,7 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                 } else if (noGalleryPermissions) {
                     if (Build.VERSION.SDK_INT >= 33) {
                         try {
-                            fragment.getParentActivity().requestPermissions(new String[]{Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_IMAGES}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);
+                            fragment.getParentActivity().requestPermissions(MediaController.galleryPermissions(), BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);
                         } catch (Exception ignore) {}
                     } else {
                         try {
@@ -1508,10 +1535,11 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
 
 
 
+    /** 仅响应用户点击申请或扩大图库访问，不在打开和恢复时自动弹权限框。 */
     private void requestGalleryPermission() {
         try {
             if (Build.VERSION.SDK_INT >= 33) {
-                parentAlert.baseFragment.getParentActivity().requestPermissions(new String[]{Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_IMAGES}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);
+                parentAlert.baseFragment.getParentActivity().requestPermissions(MediaController.galleryPermissions(), BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 parentAlert.baseFragment.getParentActivity().requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, BasePermissionsActivity.REQUEST_CODE_EXTERNAL_STORAGE);
             }
@@ -1847,7 +1875,10 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         });
     }
 
+    /** 清空用户选择时也取消等待权限复核的项目，避免异步查询把取消项加回。 */
     public void clearSelectedPhotos() {
+        gallerySelectionOwner = this;
+        discardGallerySelectionsAwaitingRefresh();
         spoilerItem.setText(LocaleController.getString(R.string.EnablePhotoSpoiler));
         spoilerItem.setAnimatedIcon(R.raw.photo_spoiler);
         parentAlert.selectedMenuItem.showSubItem(compress);
@@ -1876,6 +1907,7 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         cameraAttachAdapter.notifyDataSetChanged();
     }
 
+    /** 重建原相册下拉；有限访问时保留用户主动选择更多项目的入口。 */
     private void updateAlbumsDropDown() {
         dropDownContainer.removeAllSubItems();
         if (mediaEnabled) {
@@ -1906,7 +1938,14 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         } else {
             dropDownAlbums = new ArrayList<>();
         }
-        if (dropDownAlbums.isEmpty()) {
+        boolean selectedAccess = mediaEnabled && MediaController.hasSelectedGalleryAccess(getContext());
+        if (selectedAccess) {
+            dropDownContainer.addSubItem(-1, LocaleController.getString(R.string.GalleryAccessAllowAccessButton)).setOnClickListener(v -> {
+                dropDownContainer.toggleSubMenu();
+                requestGalleryPermission();
+            });
+        }
+        if (dropDownAlbums.isEmpty() && !selectedAccess) {
             dropDown.setCompoundDrawablesWithIntrinsicBounds(null, null, null, null);
         } else {
             dropDown.setCompoundDrawablesWithIntrinsicBounds(null, null, dropDownDrawable, null);
@@ -2550,7 +2589,19 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         }
     }
 
+    /** Android 14 开页重新读取授权范围，旧 Android 保留已有缓存命中行为。 */
     public void loadGalleryPhotos() {
+        if (MediaController.refreshGalleryPhotosAlbums(0)) {
+            noGalleryPermissions = isNoGalleryPermissions();
+            galleryRefreshPending = true;
+            if (selectedAlbumEntry != null) galleryAlbumBeforeRefresh = selectedAlbumEntry;
+            suspendGallerySelections();
+            galleryAlbumEntry = selectedAlbumEntry = null;
+            updateAlbumsDropDown();
+            adapter.notifyDataSetChanged();
+            cameraAttachAdapter.notifyDataSetChanged();
+            return;
+        }
         MediaController.AlbumEntry albumEntry;
         if (shouldLoadAllMedia()) {
             albumEntry = MediaController.allMediaAlbumEntry;
@@ -3190,10 +3241,14 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         }
     }
 
+    /** 每次读取实时权限；Android 14 的选定项目和单类全量授权都可浏览。 */
     private boolean isNoGalleryPermissions() {
         Activity activity = AndroidUtilities.findActivity(getContext());
         if (activity == null) {
             activity = parentAlert.baseFragment.getParentActivity();
+        }
+        if (Build.VERSION.SDK_INT >= 34) {
+            return !MediaController.canReadGalleryMedia(activity, false) && !MediaController.canReadGalleryMedia(activity, true);
         }
         return Build.VERSION.SDK_INT >= 23 && (
             activity == null ||
@@ -3205,7 +3260,14 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         );
     }
 
+    /** 权限结果与前台恢复都刷新，包括同数量换选及全部撤权。 */
     public void checkStorage() {
+        if (Build.VERSION.SDK_INT >= 34) {
+            // 这是权限结果回调：即使权限位相同，也必须使重选前查询失效。
+            MediaController.loadGalleryPhotosAlbums(0);
+            loadGalleryPhotos();
+            return;
+        }
         if (noGalleryPermissions && Build.VERSION.SDK_INT >= 23) {
             noGalleryPermissions = isNoGalleryPermissions();
             if (!noGalleryPermissions) {
@@ -3607,14 +3669,19 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         return captionCount <= 1;
     }
 
+    /** 销毁图库后丢弃待核选择，不让旧查询恢复到其他附件页。 */
     @Override
     public void onDestroy() {
+        discardGallerySelectionsAwaitingRefresh();
+        if (gallerySelectionOwner == this) gallerySelectionOwner = null;
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.cameraInitied);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.albumsDidLoad);
     }
 
+    /** 后台暂停时使未完成的预览发送复核失效，保留原相机暂停处理。 */
     @Override
     public void onPause() {
+        galleryPreviewValidationGeneration++;
         if (shutterButton == null) {
             return;
         }
@@ -3636,10 +3703,12 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         }
     }
 
+    /** 恢复可见图库时重新读取授权项目，不触发权限请求。 */
     @Override
     public void onResume() {
         if (parentAlert.isShowing() && !parentAlert.isDismissed() && !PhotoViewer.getInstance().isVisible()) {
             checkCamera(false);
+            if (Build.VERSION.SDK_INT >= 34) loadGalleryPhotos();
         }
     }
 
@@ -3811,8 +3880,10 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
 
     private ViewPropertyAnimator headerAnimator;
 
+    /** 展示图库时确认缓存属于本次授权；从照片预览返回保留现有编辑选择。 */
     @Override
     public void onShow(ChatAttachAlert.AttachAlertLayout previousLayout) {
+        if (Build.VERSION.SDK_INT >= 34 && !galleryRefreshPending && !(previousLayout instanceof ChatAttachAlertPhotoLayoutPreview)) loadGalleryPhotos();
         if (headerAnimator != null) {
             headerAnimator.cancel();
         }
@@ -4071,11 +4142,14 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         checkCamera(parentAlert != null && parentAlert.baseFragment instanceof ChatActivity);
     }
 
+    /** 按钮提交或关闭结束本次选择，等待权限复核的项目不再恢复。 */
     @Override
     public void onDismissWithButtonClick(int item) {
+        discardGallerySelectionsAwaitingRefresh();
         hideCamera(item != 0 && item != 2);
     }
 
+    /** 仅实际关闭附件页时丢弃待核选择，关闭相机预览不结束图库选择。 */
     @Override
     public boolean onDismiss() {
         if (cameraAnimationInProgress) {
@@ -4085,6 +4159,7 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
             closeCamera(true);
             return true;
         }
+        discardGallerySelectionsAwaitingRefresh();
         hideCamera(true);
         return false;
     }
@@ -4223,6 +4298,7 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         return false;
     }
 
+    /** 接受最新图库结果并移除已撤权的选项，避免旧相册引用残留。 */
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
         if (id == NotificationCenter.albumsDidLoad) {
@@ -4231,6 +4307,24 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                     galleryAlbumEntry = MediaController.allMediaAlbumEntry;
                 } else {
                     galleryAlbumEntry = MediaController.allPhotosAlbumEntry;
+                }
+                if (Build.VERSION.SDK_INT >= 34) {
+                    noGalleryPermissions = isNoGalleryPermissions();
+                    MediaController.AlbumEntry previousAlbum = galleryAlbumBeforeRefresh != null ? galleryAlbumBeforeRefresh : selectedAlbumEntry;
+                    selectedAlbumEntry = galleryAlbumEntry;
+                    ArrayList<MediaController.AlbumEntry> albums = shouldLoadAllMedia() ? MediaController.allMediaAlbums : MediaController.allPhotoAlbums;
+                    if (previousAlbum != null) {
+                        for (MediaController.AlbumEntry album : albums) {
+                            if (album.bucketId == previousAlbum.bucketId && album.videoOnly == previousAlbum.videoOnly) {
+                                selectedAlbumEntry = album;
+                                break;
+                            }
+                        }
+                    }
+                    galleryAlbumBeforeRefresh = null;
+                    galleryRefreshPending = false;
+                    restoreGallerySelections();
+                    removeUnavailableGallerySelections();
                 }
                 if (selectedAlbumEntry == null || parentAlert != null && parentAlert.isStickerMode) {
                     selectedAlbumEntry = galleryAlbumEntry;
@@ -4247,7 +4341,7 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                 progressView.showTextView();
                 adapter.notifyDataSetChanged();
                 cameraAttachAdapter.notifyDataSetChanged();
-                if (!selectedPhotosOrder.isEmpty() && galleryAlbumEntry != null) {
+                if (!selectedPhotosOrder.isEmpty() && galleryAlbumEntry != null && (Build.VERSION.SDK_INT < 34 || gallerySelectionOwner == this)) {
                     for (int a = 0, N = selectedPhotosOrder.size(); a < N; a++) {
                         Integer imageId = (Integer) selectedPhotosOrder.get(a);
                         Object currentEntry = selectedPhotos.get(imageId);
@@ -4265,6 +4359,162 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
             }
         } else if (id == NotificationCenter.cameraInitied) {
             checkCamera(false);
+        }
+    }
+
+    /** 捕获原选择与当前预览的媒体身份值，防止可变对象在等待确认时复用 ID 或换路径。 */
+    private ArrayList<Object> gallerySelectionIdentity(int index) {
+        ArrayList<Object> identity = new ArrayList<>();
+        ArrayList<Object> entries = new ArrayList<>(selectedPhotos.values());
+        entries.add(getPhotoEntryAtPosition(index));
+        for (Object object : entries) {
+            identity.add(object);
+            if (object instanceof MediaController.PhotoEntry) {
+                MediaController.PhotoEntry entry = (MediaController.PhotoEntry) object;
+                identity.add(entry.imageId);
+                identity.add(entry.isVideo);
+                identity.add(entry.path);
+            }
+        }
+        return identity;
+    }
+
+    /** 有限授权预览发送沿已有后台队列定点校验，回 UI 后核对同页、同选择和代次才派发。 */
+    private void withReadableGalleryPreviewSelection(int index, Runnable send) {
+        if (Build.VERSION.SDK_INT < 34 || !MediaController.hasSelectedGalleryAccess(getContext())
+            && getContext().checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+            && getContext().checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED) {
+            send.run();
+            return;
+        }
+        ArrayList<MediaController.PhotoEntry> entries = new ArrayList<>();
+        MediaController.PhotoEntry previewEntry = getPhotoEntryAtPosition(index);
+        if (selectedPhotos.isEmpty()) {
+            if (previewEntry != null && !cameraPhotos.contains(previewEntry)) entries.add(previewEntry);
+        } else {
+            for (Object selected : selectedPhotos.values()) {
+                if (selected instanceof MediaController.PhotoEntry && !cameraPhotos.contains(selected)) entries.add((MediaController.PhotoEntry) selected);
+            }
+        }
+        // 相机自有文件不依赖图库权限；等待重新验证的图库项不得由空选择绕过。
+        final boolean missing = selectedPhotos.isEmpty() && previewEntry == null;
+        final boolean cameraOnly = entries.isEmpty() && (selectedPhotos.isEmpty()
+            ? previewEntry != null && cameraPhotos.contains(previewEntry) : cameraPhotos.containsAll(selectedPhotos.values()));
+        if (entries.isEmpty() && ((!galleryRefreshPending && !missing) || cameraOnly && gallerySelectionsAwaitingRefresh.isEmpty())) {
+            send.run();
+            return;
+        }
+        final ArrayList<MediaController.PhotoEntry> identities = new ArrayList<>();
+        for (MediaController.PhotoEntry entry : entries) {
+            // 查询只用原 ID、类型和路径的快照；编辑期间可变的原对象不跨线程读取。
+            identities.add(new MediaController.PhotoEntry(0, entry.imageId, 0, entry.path, 0, 0, entry.isVideo, 0, 0, 0));
+        }
+        final int generation = ++galleryPreviewValidationGeneration;
+        final long dialogId = parentAlert.getDialogId();
+        final HashMap<Object, Object> selection = new HashMap<>(selectedPhotos);
+        final ArrayList<Object> order = new ArrayList<>(selectedPhotosOrder);
+        final boolean pending = galleryRefreshPending;
+        Utilities.globalQueue.postRunnable(() -> {
+            final boolean readable = !pending && !missing && MediaController.areGallerySelectionsReadable(identities);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (generation != galleryPreviewValidationGeneration || gallerySelectionOwner != this
+                    || parentAlert.isDismissed() || !parentAlert.isShowing() || parentAlert.getDialogId() != dialogId
+                    || !selection.equals(selectedPhotos) || !order.equals(selectedPhotosOrder)
+                    || getPhotoEntryAtPosition(index) != previewEntry) return;
+                for (int i = 0; i < entries.size(); i++) {
+                    MediaController.PhotoEntry current = entries.get(i), identity = identities.get(i);
+                    if (current.imageId != identity.imageId || current.isVideo != identity.isVideo || !TextUtils.equals(current.path, identity.path)) return;
+                }
+                if (readable) {
+                    send.run();
+                } else {
+                    // 复用原权限说明；异步刷新供返回图库展示，不改变全屏预览导航。
+                    AlertsCreator.createSimpleAlert(getContext(), null, LocaleController.getString(R.string.PermissionStorageWithHint), resourcesProvider).show();
+                    MediaController.loadGalleryPhotosAlbums(0);
+                }
+            });
+        });
+    }
+
+    /** 相同媒体 ID 也须类型和路径一致，避免 ID 复用把旧编辑或选择套到另一文件。 */
+    private boolean isCurrentGallerySelection(MediaController.PhotoEntry selected) {
+        MediaController.PhotoEntry current = galleryAlbumEntry == null ? null : galleryAlbumEntry.photosByIds.get(selected.imageId);
+        return current != null && current.isVideo == selected.isVideo && android.text.TextUtils.equals(current.path, selected.path);
+    }
+
+    /** 结束、取消或替换当前选择时丢弃瞬时待核快照，不改变其他布局已选项。 */
+    private void discardGallerySelectionsAwaitingRefresh() {
+        galleryPreviewValidationGeneration++;
+        gallerySelectionsAwaitingRefresh.clear();
+        gallerySelectionOrderBeforeRefresh.clear();
+    }
+
+    /** 暂移除待复核的图库选择，原发送入口只能取得已确认项目；相机与其他来源不受影响。 */
+    private void suspendGallerySelections() {
+        if (gallerySelectionsAwaitingRefresh.isEmpty()) {
+            gallerySelectionOwner = this;
+            gallerySelectionOrderBeforeRefresh.clear();
+            gallerySelectionOrderBeforeRefresh.addAll(selectedPhotosOrder);
+        }
+        boolean changed = false;
+        for (int i = selectedPhotosOrder.size() - 1; i >= 0; i--) {
+            Object key = selectedPhotosOrder.get(i);
+            Object selected = selectedPhotos.get(key);
+            if (selected instanceof MediaController.PhotoEntry && !cameraPhotos.contains(selected)) {
+                gallerySelectionsAwaitingRefresh.put(key, selected);
+                selectedPhotosOrder.remove(i);
+                selectedPhotos.remove(key);
+                changed = true;
+            }
+        }
+        if (changed) {
+            updatePhotosCounter(false);
+            updateCheckedPhotoIndices();
+        }
+    }
+
+    /** 只恢复本次查询仍可见的选择及编辑状态，显式清空或撤权的项目不会回来。 */
+    private void restoreGallerySelections() {
+        if (gallerySelectionOwner != this || parentAlert.isDismissed() || !parentAlert.isShowing()) {
+            discardGallerySelectionsAwaitingRefresh();
+            return;
+        }
+        boolean changed = false;
+        for (int i = 0; i < gallerySelectionOrderBeforeRefresh.size(); i++) {
+            Object key = gallerySelectionOrderBeforeRefresh.get(i);
+            Object selected = gallerySelectionsAwaitingRefresh.get(key);
+            if (selected instanceof MediaController.PhotoEntry && isCurrentGallerySelection((MediaController.PhotoEntry) selected)
+                && !selectedPhotos.containsKey(key)) {
+                selectedPhotos.put(key, selected);
+                selectedPhotosOrder.add(Math.min(i, selectedPhotosOrder.size()), key);
+                changed = true;
+            }
+        }
+        gallerySelectionsAwaitingRefresh.clear();
+        gallerySelectionOrderBeforeRefresh.clear();
+        if (changed) {
+            updatePhotosCounter(false);
+            updateCheckedPhotoIndices();
+        }
+    }
+
+    /** 只移除新查询已不可见的图库选择，保留应用刚拍摄的媒体与非图库对象。 */
+    private void removeUnavailableGallerySelections() {
+        if (gallerySelectionOwner != this) return;
+        boolean changed = false;
+        for (int i = selectedPhotosOrder.size() - 1; i >= 0; i--) {
+            Object key = selectedPhotosOrder.get(i);
+            Object selected = selectedPhotos.get(key);
+            if (selected instanceof MediaController.PhotoEntry && !cameraPhotos.contains(selected)
+                && !isCurrentGallerySelection((MediaController.PhotoEntry) selected)) {
+                selectedPhotosOrder.remove(i);
+                selectedPhotos.remove(key);
+                changed = true;
+            }
+        }
+        if (changed) {
+            updatePhotosCounter(false);
+            updateCheckedPhotoIndices();
         }
     }
 

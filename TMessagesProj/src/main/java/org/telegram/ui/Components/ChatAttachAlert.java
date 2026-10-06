@@ -6428,7 +6428,12 @@ public class ChatAttachAlert extends BottomSheet implements NotificationCenter.N
     }
 
 
+    /** 图库有限授权可用，相机仍独立保留原权限标记。 */
     private static boolean checkPhotoAndCameraPermission(Context context) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            return (MediaController.canReadGalleryMedia(context, false) || MediaController.canReadGalleryMedia(context, true))
+                && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+        }
         if (Build.VERSION.SDK_INT >= 33) {
             return ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
                 && ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
