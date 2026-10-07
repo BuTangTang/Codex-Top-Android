@@ -2880,18 +2880,28 @@ public final class CodexRuntime {
     /** 仅更新原对话消息映射及正文重绘事件，不更改日期、未读、全局消息编号表或历史通知。 */
     private static void publishDialogPreview(int account, long epoch, long dialogId, String remote, String machine,
             DesktopConnection connection, TLRPC.Message message, MessageObject pending, java.util.Set<String> echoed) {
-        if (message.dialog_id != dialogId || !previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
+        if (message.dialog_id != dialogId || !previewCurrent(account, epoch, dialogId, remote, machine, connection)) {
+            traceHistoryPoint("preview_ui", 1);
+            return;
+        }
         MessagesController controller = MessagesController.getInstance(account);
         ArrayList<MessageObject> old = controller.dialogMessage.get(dialogId);
         MessageObject current = old == null || old.isEmpty() ? null : old.get(0);
         String localId = current == null || current.messageOwner.params == null ? null : current.messageOwner.params.get("codexLocalId");
         // 未回显的本地气泡优先；原历史已包含同身份时才释放，真实新回复不会被负编号挡住。
-        if (pending == null && localId != null && pendingMessages.get(localId) == current && !echoed.contains(localId)) return;
-        if (current != null && sameDialogPreview(current.messageOwner, message)) return;
+        if (pending == null && localId != null && pendingMessages.get(localId) == current && !echoed.contains(localId)) {
+            traceHistoryPoint("preview_ui", 2);
+            return;
+        }
+        if (current != null && sameDialogPreview(current.messageOwner, message)) {
+            traceHistoryPoint("preview_ui", 3);
+            return;
+        }
         MessageObject next = pending != null ? pending : historyObject(account, (TLRPC.TL_message) message, false);
         ArrayList<MessageObject> preview = new ArrayList<>();
         preview.add(next);
         controller.dialogMessage.put(dialogId, preview);
+        traceHistoryPoint("preview_ui", 4);
         NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_MESSAGE_TEXT);
     }
 
@@ -2967,6 +2977,9 @@ public final class CodexRuntime {
     // 只有原globalQueue消费各阶段额度；跨线程仅只读，摘要不能耗尽首次开页的诊断机会。
     private static volatile int historyPreviewQueueTraceEvents, historyCacheTraceEvents,
             historyPreviewPrepareTraceEvents, historyOpenQueueTraceEvents;
+    // 沿原诊断owner保存固定额度；read仅dialogQueue消费，其余新阶段仅UI线程消费。
+    private static volatile int historyDialogStoreTraceEvents, historyDialogsUiTraceEvents,
+            historyPreviewUiTraceEvents, historyDialogDrawTraceEvents;
 
     /** 显式开启的独立包调试才取钟；每阶段耗尽即停，诊断故障不进入业务异常路径。 */
     private static long beginHistoryTrace(String phase) {
@@ -2976,6 +2989,10 @@ public final class CodexRuntime {
             case "cache_read": if (historyCacheTraceEvents >= 32) return -1; break;
             case "preview_prepare": if (historyPreviewPrepareTraceEvents >= 32) return -1; break;
             case "open_queue": if (historyOpenQueueTraceEvents >= 32) return -1; break;
+            case "dialog_store_read": if (historyDialogStoreTraceEvents >= 32) return -1; break;
+            case "dialogs_ui_enter": if (historyDialogsUiTraceEvents >= 32) return -1; break;
+            case "preview_ui": if (historyPreviewUiTraceEvents >= 32) return -1; break;
+            case "dialog_first_draw": if (historyDialogDrawTraceEvents != 0) return -1; break;
             default: return -1;
         }
         try {
@@ -2984,7 +3001,7 @@ public final class CodexRuntime {
         } catch (Throwable ignored) { return -1; }
     }
 
-    /** 仅原globalQueue记录四种固定阶段；各31条耗时加一次截断，总计不超过128条。 */
+    /** 原globalQueue四阶段及dialogQueue列表读盘各自31条耗时加一次截断，互不消耗额度。 */
     private static void traceHistoryDuration(String phase, long startedAt) {
         if (startedAt < 0) return;
         long finishedAt = beginHistoryTrace(phase);
@@ -2996,6 +3013,7 @@ public final class CodexRuntime {
                 case "cache_read": events = ++historyCacheTraceEvents; break;
                 case "preview_prepare": events = ++historyPreviewPrepareTraceEvents; break;
                 case "open_queue": events = ++historyOpenQueueTraceEvents; break;
+                case "dialog_store_read": events = ++historyDialogStoreTraceEvents; break;
                 default: return;
             }
             if (events == 32) {
@@ -3005,6 +3023,40 @@ public final class CodexRuntime {
             android.util.Log.d("CodexHistoryStartup", "history_phase=" + phase
                     + " elapsedRealtimeMs=" + finishedAt + " durationMs=" + (finishedAt - startedAt));
         } catch (Throwable ignored) { /* 诊断不能覆盖原读取结果或异常。 */ }
+    }
+
+    /** UI线程只记固定入点及数字结果；默认关闭不取钟、不拼串，诊断故障不改发布流程。 */
+    private static void traceHistoryPoint(String phase, int reason) {
+        long at = beginHistoryTrace(phase);
+        if (at < 0) return;
+        try {
+            int events;
+            switch (phase) {
+                case "dialogs_ui_enter": events = ++historyDialogsUiTraceEvents; break;
+                case "preview_ui": events = ++historyPreviewUiTraceEvents; break;
+                case "dialog_first_draw": events = ++historyDialogDrawTraceEvents; break;
+                default: return;
+            }
+            if (events == 32) {
+                android.util.Log.d("CodexHistoryStartup", "history_phase=" + phase + " trace_limited=true");
+                return;
+            }
+            android.util.Log.d("CodexHistoryStartup", "history_phase=" + phase
+                    + " elapsedRealtimeMs=" + at + " reason=" + reason);
+        } catch (Throwable ignored) { /* 诊断不能影响原UI接纳或绘制。 */ }
+    }
+
+    /** 绘制热路径先检查原开关和一次额度，未开启时不读取View度量或时钟。 */
+    public static boolean needsHistoryDialogDrawTrace() {
+        if (!org.telegram.messenger.BuildVars.DEBUG_VERSION || historyDialogDrawTraceEvents != 0) return false;
+        try {
+            return enabled() && android.util.Log.isLoggable("CodexHistoryStartup", android.util.Log.DEBUG);
+        } catch (Throwable ignored) { return false; }
+    }
+
+    /** 仅由有效Codex摘要绘制成功后调用；整个进程最多记录一次，不等于系统已呈现像素。 */
+    public static void traceHistoryDialogDraw() {
+        traceHistoryPoint("dialog_first_draw", 0);
     }
 
     /** 从所属电脑完整恢复缓存；诊断覆盖原读取及IO回退，不改变其他异常的传播。 */
@@ -3661,6 +3713,8 @@ public final class CodexRuntime {
             publishedIds.put(remote, bindDialog(machine, remote, owner, accountEpoch));
         }
         AndroidUtilities.runOnUIThread(() -> {
+            // 0为远端批次、1为本地批次；此入点尚未通过原账号guard，不冒充接纳。
+            traceHistoryPoint("dialogs_ui_enter", cached ? 1 : 0);
             if (!isAccountCurrent(accountEpoch)) return;
             ArrayList<TLRPC.Dialog> updated = new ArrayList<>();
             Map<Long, Long> updatedAt = new HashMap<>();
@@ -3734,7 +3788,10 @@ public final class CodexRuntime {
             if (!cachedDialogsRead) {
                 cachedDialogsRead = true;
                 try {
-                    JsonObject cached = dialogStore().read();
+                    JsonObject cached;
+                    long traceReadAt = beginHistoryTrace("dialog_store_read");
+                    try { cached = dialogStore().read(); }
+                    finally { traceHistoryDuration("dialog_store_read", traceReadAt); }
                     if (cached != null) {
                         preferredMachine = cached.get("machineId").getAsString();
                         if (cached.has("machineName") && cached.get("machineName").isJsonPrimitive()

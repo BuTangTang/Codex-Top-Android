@@ -31,9 +31,13 @@ public final class RuntimePreviewLayoutTest {
             found.add(method.getNameAsString());
         }
         if (!found.equals(names)) throw new AssertionError("missing actual preview owner");
-        var digest = StaticJavaParser.parse(source.resolve("TranscriptStore.java")).getClassByName("TranscriptStore")
-                .orElseThrow().getMethodsByName("digest").get(0);
-        methods.append("static class TranscriptStore {\n").append(digest).append("\n}\n");
+        var store = StaticJavaParser.parse(source.resolve("TranscriptStore.java")).getClassByName("TranscriptStore").orElseThrow();
+        // 真实facade的目录摘要依赖原sha256/hex；只补提取依赖，不复制实现或放宽业务断言。
+        methods.append("static class TranscriptStore {\n");
+        for (String name : List.of("digest", "sha256", "hex")) methods.append(store.getMethodsByName(name).get(0)).append('\n');
+        methods.append("}\n");
+        // 该旧专项关闭日志；新增专项执行真实诊断helper，此处仅补平台边界。
+        methods.append("/** 合成Android日志保持关闭。 */ static void traceHistoryPoint(String phase,int reason){}\n");
         Path temporary = Files.createTempDirectory("runtime-preview-layout-");
         try {
             Path probe = temporary.resolve("RuntimePreviewLayoutProbe.java");

@@ -48,6 +48,8 @@ public final class RuntimeDialogPreviewTest {
         methods.append("}\n");
         // 仅本入口关闭Android诊断；放在提取结果中，不向共享FIXTURE添加方法导致其他专项重复定义。
         methods.append("/** JVM诊断未启用，不替代业务helper。 */ static long beginHistoryTrace(String phase){return -1;} static void traceHistoryDuration(String phase,long started){}\n");
+        // 该旧专项关闭日志；新增专项执行真实诊断helper，此处仅补平台边界。
+        methods.append("/** 合成Android日志保持关闭。 */ static void traceHistoryPoint(String phase,int reason){}\n");
         Path temporary = Files.createTempDirectory("codex-dialog-preview-");
         try {
             Path probe = temporary.resolve("RuntimeDialogPreviewProbe.java");

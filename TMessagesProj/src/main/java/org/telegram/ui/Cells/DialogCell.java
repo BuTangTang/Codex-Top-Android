@@ -3892,6 +3892,20 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         codexStatusProgress.drawIndeterminateAtTime(canvas, cx, cy, codexStatusFrameTimeMs);
     }
 
+    /** 成功画出真实摘要后记录一次；关闭诊断不查额外View状态，文字/语音草稿、清空与自定义占位不计首条摘要。 */
+    private void traceCodexPreviewDraw() {
+        if (!com.butang.codextop.CodexRuntime.needsHistoryDialogDrawTrace()) return;
+        try {
+            if (message != null && draftMessage == null && !draftVoice && !clearingDialog
+                    && (customMessage == null || customMessage.isEmpty()) && messageLayout != null
+                    && messageLayout.getText().length() > 0 && messageLayout.getPaint().getAlpha() > 0
+                    && isDialogCell && attachedToWindow
+                    && getWindowVisibility() == VISIBLE && isShown() && hasCodexStatusAvatar()) {
+                com.butang.codextop.CodexRuntime.traceHistoryDialogDraw();
+            }
+        } catch (Throwable ignored) { /* 诊断不得影响原列表绘制。 */ }
+    }
+
     private GradientDrawable archiveFadeGradientDrawable;
     private int archiveFadeGradientDrawableColor;
 
@@ -4378,6 +4392,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                             SpoilerEffect.clipOutCanvas(canvas, spoilers);
                             SpoilerEffect.layoutDrawMaybe(messageLayout, canvas);
                             AnimatedEmojiSpan.drawAnimatedEmojis(canvas, messageLayout, animatedEmojiStack, -.075f, spoilers, 0, 0, 0, 1f, getAdaptiveEmojiColorFilter(2, messageLayout.getPaint().getColor()));
+                            traceCodexPreviewDraw();
                             canvas.restore();
 
                             for (int i = 0; i < spoilers.size(); i++) {
@@ -4391,6 +4406,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                     } else {
                         SpoilerEffect.layoutDrawMaybe(messageLayout, canvas);
                         AnimatedEmojiSpan.drawAnimatedEmojis(canvas, messageLayout, animatedEmojiStack, -.075f, null, 0, 0, 0, 1f, getAdaptiveEmojiColorFilter(2, messageLayout.getPaint().getColor()));
+                        traceCodexPreviewDraw();
                     }
                     messageLayout.getPaint().setAlpha(oldAlpha);
                     canvas.restore();

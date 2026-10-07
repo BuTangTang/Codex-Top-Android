@@ -26,7 +26,8 @@ public class RuntimeDialogPreviewOrderTest {
   s=s.replace("static class TLRPC {","static class TLRPC {static class Dialog {long id;TL_peerUser peer;int last_message_date;}static class TL_dialog extends Dialog{}static class TL_peerUser {long user_id;}");
   s=s.replace("static class MessagesController {","static class MessagesController {boolean dialogsLoaded;final Map<Long,TLRPC.Dialog> dialogs_dict=new HashMap<>();void putDialogsEndReachedAfterRegistration(){}");
   s=s.replace("return new ArrayList<>(rows);","prepared++;outboxLists++;return new ArrayList<>(rows);");
-  Path temp=Files.createTempDirectory("preview83-owner-");
+  // 使用真实临时目录路径，保留Store对符号链的严格拒绝。
+  Path temp=Files.createTempDirectory("preview83-owner-").toRealPath();
   try {
    Path p=temp.resolve("RuntimeDialogPreviewProbe.java");Files.writeString(p,s);
    Files.writeString(temp.resolve("UserConfig.java"),"package org.telegram.messenger;public class UserConfig {public static int selectedAccount;}");
@@ -39,6 +40,10 @@ public class RuntimeDialogPreviewOrderTest {
  }
  static final String EXTRA="""
  static class HistoryView{}
+ /** 继承旧FIXTURE的日志计数叶；不改变排序或缓存业务断言。 */
+ static int lazyPreviewFailures;
+ /** 原排序专项关闭新增UI诊断；真实logger由独立专项执行。 */
+ static void traceHistoryPoint(String phase,int reason){}
  static MessageObject pending(long id,int n,String local,String body,int date){TLRPC.TL_message m=new TLRPC.TL_message();m.id=n;m.dialog_id=id;m.date=date;m.message=body;m.params.put("codexLocalId",local);MessageObject out=new MessageObject(m);pendingMessages.put(local,out);return out;}
  static final ArrayList<TLRPC.Dialog> dialogs=new ArrayList<>();static final Map<Long,String> dialogTitles=new HashMap<>();
  static java.nio.file.Path cacheRoot;static int outboxLists,prepared,cacheReads;static final ArrayList<String> readOrder=new ArrayList<>();
@@ -49,8 +54,8 @@ public class RuntimeDialogPreviewOrderTest {
  static String statusPresentation(long id){return "synthetic";}static void publishDialogFacts(long id,String machine,JsonObject c,long start,long received,boolean cached){dialogTitles.put(id,"synthetic");}static boolean publishDialogUser(int a,long id,String title){return false;}
  static JsonObject page(int count,String tag){JsonObject p=new JsonObject();JsonArray items=new JsonArray();for(int i=0;i<count;i++){JsonObject item=new JsonObject(),raw=new JsonObject(),content=new JsonObject();item.addProperty("id",tag+"-"+i);item.addProperty("createdAtMs",1000L+i);raw.addProperty("role","agent");content.addProperty("type","text");content.addProperty("text","synthetic "+"x".repeat(512));raw.add("content",content);item.add("raw",raw);items.add(item);}p.add("items",items);p.addProperty("hasMore",false);p.addProperty("historyAvailability","available");p.addProperty("tailCursor","tail-"+tag);return p;}
  static void check(boolean ok,String msg){if(!ok)throw new AssertionError(msg);}
- /** 每例只重置合成队列和数据，原账号、排序、缓存及摘要方法仍原样提取。 */
- static void reset(){Utilities.globalQueue.tasks.clear();AndroidUtilities.ui.tasks.clear();session=new PasswordLogin.Session();accountGeneration++;loggingOut=false;org.telegram.messenger.UserConfig.selectedAccount=0;desktopConnections.clear();dialogMachines.clear();remoteIds.clear();ids.clear();histories.clear();disk.clear();pendingMessages.clear();outbox.rows.clear();MessagesController.instance.dialogMessage.clear();MessagesController.instance.dialogs_dict.clear();MessagesController.instance.dialogsLoaded=false;dialogs.clear();dialogTitles.clear();readOrder.clear();tracePhases.clear();cacheReads=prepared=outboxLists=0;NotificationCenter.instance.previews=NotificationCenter.instance.other=0;nextId=0;}
+ /** 每例使用独立合成缓存子目录并重置队列；原账号、排序、缓存及摘要方法仍原样提取。 */
+ static void reset()throws Exception{cacheRoot=java.nio.file.Files.createTempDirectory(cacheRoot.getParent(),"case-");Utilities.globalQueue.tasks.clear();AndroidUtilities.ui.tasks.clear();session=new PasswordLogin.Session();accountGeneration++;loggingOut=false;org.telegram.messenger.UserConfig.selectedAccount=0;desktopConnections.clear();dialogMachines.clear();remoteIds.clear();ids.clear();histories.clear();disk.clear();pendingMessages.clear();outbox.rows.clear();MessagesController.instance.dialogMessage.clear();MessagesController.instance.dialogs_dict.clear();MessagesController.instance.dialogsLoaded=false;dialogs.clear();dialogTitles.clear();readOrder.clear();tracePhases.clear();cacheReads=prepared=outboxLists=0;NotificationCenter.instance.previews=NotificationCenter.instance.other=0;nextId=0;}
  /** 写真实临时缓存；所有正文与身份都是独立合成值。 */
  static JsonArray candidates(String machine,int count,boolean tie,boolean reverse)throws Exception{
   Map<String,Long> keys=new HashMap<>();for(int i=0;i<count;i++)keys.put("synthetic-remote-"+i,(long)i);
