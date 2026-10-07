@@ -2731,9 +2731,14 @@ public final class CodexRuntime {
         return message;
     }
 
-    /** 恢复已下载附件的原消息就绪位，不让原版再根据虚拟媒体编号查找 Telegram 缓存。 */
+    /** 聊天消息保留完整布局，并恢复附件的本地就绪位。 */
     private static MessageObject historyObject(int account, TLRPC.TL_message message) {
-        MessageObject object = new MessageObject(account, message, true, false);
+        return historyObject(account, message, true);
+    }
+
+    /** 列表摘要只省略完整聊天布局；附件仍按相同归属恢复原就绪位。 */
+    private static MessageObject historyObject(int account, TLRPC.TL_message message, boolean generateLayout) {
+        MessageObject object = new MessageObject(account, message, generateLayout, false);
         if (isAttachmentMessage(object)) object.attachPathExists = object.mediaExists = attachmentFile(object) != null;
         return object;
     }
@@ -2863,7 +2868,7 @@ public final class CodexRuntime {
         // 未回显的本地气泡优先；原历史已包含同身份时才释放，真实新回复不会被负编号挡住。
         if (pending == null && localId != null && pendingMessages.get(localId) == current && !echoed.contains(localId)) return;
         if (current != null && sameDialogPreview(current.messageOwner, message)) return;
-        MessageObject next = pending != null ? pending : historyObject(account, (TLRPC.TL_message) message);
+        MessageObject next = pending != null ? pending : historyObject(account, (TLRPC.TL_message) message, false);
         ArrayList<MessageObject> preview = new ArrayList<>();
         preview.add(next);
         controller.dialogMessage.put(dialogId, preview);
