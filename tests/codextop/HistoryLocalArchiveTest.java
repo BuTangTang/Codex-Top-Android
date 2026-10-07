@@ -33,7 +33,7 @@ public final class HistoryLocalArchiveTest {
   var searchQueryState=chat.getMethodsByName("hitSearch").get(0).getBody().orElseThrow().getStatements().stream().filter(v->v.toString().startsWith("searchItemVisible = searching =")).findFirst().orElseThrow();
   extra.append("void resetSearchQueryUi(){").append(searchQueryState).append("}");
   for(var field:chat.getFields())if(field.getVariables().stream().anyMatch(v->(v.getNameAsString().startsWith("codexHistoryInitialFill") || v.getNameAsString().equals("codexHistoryOlderContinueAvailable") || v.getNameAsString().startsWith("codexLocalHistory"))))extra.append(field.toString().replace("com.butang.codextop.CodexRuntime","RuntimeLatestSegmentProbe"));
-  for(String name:new String[]{"cancelCodexHistoryInitialFill","scheduleCodexHistoryInitialFill","canFillCodexHistoryInitialViewport","retryCodexHistoryInitialFillAfterLayout","canBridgeCodexHistoryInitialViewport"})
+  for(String name:new String[]{"cancelCodexHistoryInitialFill","scheduleCodexHistoryInitialFill","canFillCodexHistoryInitialViewport","retryCodexHistoryInitialFillAfterLayout","canBridgeCodexHistoryInitialViewport","codexHistoryInitialFillMessageCount"})
    for(var method:chat.getMethodsByName(name))extra.append(method.toString().replace("com.butang.codextop.CodexRuntime","RuntimeLatestSegmentProbe"));
   var clearFull=chat.getMethodsByName("clearChatData").get(0).getBody().orElseThrow().getStatements().stream().filter(v->v.isIfStmt()&&v.asIfStmt().getCondition().toString().equals("full")).findFirst().orElseThrow();
   extra.append("void applyRealClearLoadState(boolean full){").append(clearFull).append("}");

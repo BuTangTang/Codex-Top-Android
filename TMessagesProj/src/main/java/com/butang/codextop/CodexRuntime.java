@@ -2025,13 +2025,13 @@ public final class CodexRuntime {
         });
     }
 
-    /** 原latest交付成功排队后返回真，供首正文转换排除同批增量通知。 */
+    /** 最新页固定展示30条，不继承手动翻旧的数量；排队成功返回真以排除同批增量重复交付。 */
     private static boolean offerLatestHistory(HistoryView view, TranscriptWindow root, boolean explicit) {
         if (!historyViewCurrent(view, view.window) || root.before(0, 1).isEmpty()
                 || !explicit && (view.window == root || view.proposedWindow == root)) return false;
         if (view.window == null) view.window = root;
         view.proposedWindow = root;
-        try { deliverHistoryPage(view, root, view.count, 0, 2, -1, 0, true); return true; }
+        try { deliverHistoryPage(view, root, 30, 0, 2, -1, 0, true); return true; }
         catch (IOException error) { view.proposedWindow = null; logTranscriptFailure("latest_delivery", error, null); return false; }
     }
 
@@ -2341,7 +2341,7 @@ public final class CodexRuntime {
         }
     }
 
-    /** 每次进入先读最新；空连接等待可由ready恢复原任务，合法正文仍先交付再保存。 */
+    /** 重开先用一次合法尾页补齐小增量；积压回原最新入口，空连接等待仍由ready恢复。 */
     public static void watchConversation(int account, long dialogId) {
         if (loggingOut || !loggedIn() || !ownsConversation(dialogId)) return;
         final long accountEpoch = accountGeneration;
@@ -2353,6 +2353,7 @@ public final class CodexRuntime {
         Utilities.globalQueue.postRunnable(new Runnable() {
             private int consecutiveTailPages;
             private boolean opening = true;
+            private boolean openingTailAttempted;
             private WatchConnectionWait waiting;
             /** 到期只清本任务登记；ready恢复后仍要复核来源和连接，不能沿旧事件发出新RPC。 */
             @Override public void run() {
@@ -2386,8 +2387,12 @@ public final class CodexRuntime {
                     }
                     TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
                     if (opening && takeColdHistoryHandoff(account, dialogId, connection, history)) opening = false;
-                    final boolean latest = opening || history.needsTailBootstrap();
+                    final boolean latest = history.needsTailBootstrap()
+                            || opening && (openingTailAttempted || history.before(0, 1).isEmpty());
                     final boolean older = !latest && history.needsVisibleHistory();
+                    final boolean openingTail = opening && !latest && !older;
+                    // 每次重开至多探测一页；失败和迟回包仍沿原守卫及退避，不循环追旧增量。
+                    if (openingTail) openingTailAttempted = true;
                     final String previousCursor = history.tailCursor, previousOlderCursor = history.cursor;
                     final boolean wasLoaded = history.loaded;
                     final Runnable next = this;
@@ -2432,7 +2437,26 @@ public final class CodexRuntime {
                                             && reason.getAsJsonPrimitive().isString() && "source_discontinuity".equals(reason.getAsString())) {
                                         history.tailCursor = null;
                                         saveHistory(dialogId, remote, history);
+                                        if (openingTail) delay = 0;
                                         throw new IOException("消息来源出现断档");
+                                    }
+                                    if (openingTail) {
+                                        com.google.gson.JsonElement truncated = received.get("truncated");
+                                        com.google.gson.JsonElement availability = received.get("historyAvailability");
+                                        com.google.gson.JsonElement nextCursor = received.get("nextCursor");
+                                        boolean completeTail = truncated != null && truncated.isJsonPrimitive()
+                                                && truncated.getAsJsonPrimitive().isBoolean() && !truncated.getAsBoolean()
+                                                && (reason == null || reason.isJsonNull())
+                                                && availability != null && availability.isJsonPrimitive()
+                                                && availability.getAsJsonPrimitive().isString() && "available".equals(availability.getAsString())
+                                                && nextCursor != null && nextCursor.isJsonPrimitive()
+                                                && nextCursor.getAsJsonPrimitive().isString() && !nextCursor.getAsString().isEmpty();
+                                        // 未追到此次来源尾部不交付部分旧增量；立即复用原latest，保留旧段及游标。
+                                        if (!completeTail) {
+                                            consecutiveTailPages++;
+                                            Utilities.globalQueue.postRunnable(next);
+                                            return;
+                                        }
                                     }
                                     ArrayList<TranscriptWindow.Entry> before = history.before(0, 1);
                                     int lastId = before.isEmpty() ? 0 : before.get(0).id;
@@ -2447,7 +2471,10 @@ public final class CodexRuntime {
                                     } else if (older) {
                                         history.prependWithCachedBridge(received);
                                         added = new ArrayList<>();
-                                    } else added = history.append(received);
+                                    } else {
+                                        added = history.append(received);
+                                        if (openingTail) opening = false;
+                                    }
                                     boolean needsSave = latest || older || !added.isEmpty() || !java.util.Objects.equals(previousCursor, current.tailCursor);
                                     boolean visibleLatest = latest && !current.before(0, 1).isEmpty();
                                     if (needsSave && !visibleLatest) saveHistory(dialogId, remote, current);
@@ -2474,7 +2501,7 @@ public final class CodexRuntime {
                                 }
                             } catch (Exception error) {
                                 logTranscriptFailure("watch_merge", error, received);
-                                consecutiveTailPages = 0;
+                                consecutiveTailPages = openingTail && delay == 0 ? 1 : 0;
                             }
                             if (generation == watchGeneration && isAccountCurrent(accountEpoch))
                                 Utilities.globalQueue.postRunnable(next, delay);

@@ -3,25 +3,21 @@ import com.github.javaparser.StaticJavaParser;import com.github.javaparser.Parse
 /** 组合实际 ChatActivity 首载/收页/布局入口、MessagesController 两重载及 Runtime/Window/Store。
  * 只替代 Android 几何和事件时序；数据为合成来源，存储使用 Runtime 专项独立临时目录。
  * args[0] 可指定前像，args[1] 可选择同一行为用例，args[2] 可导出实际提取体。 */
-public final class HistoryContinueBoundaryTest {
+public final class HistoryInitialViewportFillTest {
+ private static final String DEFAULT_SCENARIOS="shortCached(1);shortCached(2);shortComplete();shortPendingComplete();shortReplacement();shortPaused();shortGuards();shortVisibleSearch();shortCancellation();shortTerminal(false);shortTerminal(true);shortInFlight();retryFailure(false);retryFailure(true);retryProgress();retryStale();retryLifecycle();retryClickRuntime();retryClickStale();retryQueuedSearch();firstVisible(false);firstVisible(true);firstVisibleLocked();firstVisiblePending();for(String k:new String[]{\"pause\",\"account\",\"mapping\",\"intent\"})firstVisibleStale(k);";
  /** 提取真实页面、布局和Controller入口；以合成Android事件驱动原Runtime进行回归。 */
  public static void main(String[] args)throws Exception{
   StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
   Path source=Path.of("TMessagesProj/src/main/java");Path chatSource=args.length>0?Path.of(args[0]):source.resolve("org/telegram/ui/ChatActivity.java");var chat=StaticJavaParser.parse(chatSource).getClassByName("ChatActivity").orElseThrow();
-  var mc=StaticJavaParser.parse(source.resolve("org/telegram/messenger/MessagesController.java")).getClassByName("MessagesController").orElseThrow();
-  // 本地浏览新增owner由同一真实提取器覆盖；89场景与断言仍只保留在本文件。
-  if(!chat.getMethodsByName("showCodexLocalHistory").isEmpty()) {
+  // 本地目录接线已由相邻真实owner夹具维护；原首屏场景共用原方法和完整Cell边界。
+  if (!chat.getMethodsByName("showCodexLocalHistory").isEmpty()) {
    String previous=System.getProperty("archive.adjacent");
-   try{System.setProperty("archive.adjacent","true");HistoryLocalArchiveTest.main(new String[]{chatSource.toString(),args.length>1?args[1]:"continueBudget();continueStates();continueStale();continueQueuedSearch();continueUiGuards();continueCompleteLatest();continueUnknownEmpty();continueEpochTerminal();continueFactReset();continueQueuedLatest();"});}
+   try{System.setProperty("archive.adjacent","true");HistoryLocalArchiveTest.main(args.length>2?new String[]{chatSource.toString(),args.length>1?args[1]:DEFAULT_SCENARIOS,args[2]}:new String[]{chatSource.toString(),args.length>1?args[1]:DEFAULT_SCENARIOS});}
    finally{if(previous==null)System.clearProperty("archive.adjacent");else System.setProperty("archive.adjacent",previous);}
    return;
   }
-  StringBuilder extra=new StringBuilder(CELL_BOUNDARY);
-  var cell=StaticJavaParser.parse(source.resolve("org/telegram/ui/Cells/ChatLoadingCell.java")).getClassByName("ChatLoadingCell").orElseThrow();
-  extra.append("static final class ChatLoadingCell extends View {FrameLayout frameLayout=new FrameLayout();Button retryButton;Runnable retryAction;int getThemedColor(int key){return key;}");
-  extra.append(cell.getMethodsByName("setProgressVisible").get(0));extra.append(cell.getMethodsByName("setRetryAction").get(0));
-  extra.append("boolean shown(){return frameLayout.visibility==VISIBLE;}boolean actionVisible(){return retryButton!=null&&retryButton.visibility==VISIBLE&&retryButton.enabled;}void tap(){if(retryButton!=null)retryButton.performClick();}}\n");
-  extra.append(UI);
+  var mc=StaticJavaParser.parse(source.resolve("org/telegram/messenger/MessagesController.java")).getClassByName("MessagesController").orElseThrow();
+  StringBuilder extra=new StringBuilder(UI);
   // SearchItemListener先发布搜索状态，随后才做动画与可选筛选；提取真实发布语句。
   var searchExpand=chat.findAll(com.github.javaparser.ast.body.MethodDeclaration.class).stream().filter(m->m.getNameAsString().equals("onSearchExpand")).findFirst().orElseThrow();
   var searchingStatement=searchExpand.getBody().orElseThrow().getStatement(0);
@@ -85,20 +81,21 @@ public final class HistoryContinueBoundaryTest {
    var extracted=method.clone();if(method.getParameters().size()==20)extracted.getBody().orElseThrow().addStatement(0,StaticJavaParser.parseStatement("calls.add(new Object[]{dialogId,count,max_id,classGuid,load_type,loadIndex,mode});"));
    extra.append(extracted.toString().replace("com.butang.codextop.CodexRuntime","RuntimeLatestSegmentProbe"));
   }
-  extra.append("}\n").append(CASES).append(CONTINUE_CASES);
+  extra.append("}\n").append(CASES);
   var runtime=StaticJavaParser.parse(source.resolve("com/butang/codextop/CodexRuntime.java")).getClassByName("CodexRuntime").orElseThrow();
   for(String name:new String[]{"isHistoryViewCurrent","isHistoryBridgeViewCurrent"})for(var method:runtime.getMethodsByName(name))extra.append(method);
   // UI与Controller必须使用真实归属映射，不能用共享夹具的固定 dialog=42 替身掩盖账号删除。
   extra.append(runtime.getMethodsByName("ownsConversation").get(0).clone().setName("actualOwnsConversation"));
   if(args.length>2)Files.writeString(Path.of(args[2]),extra.toString());
-  RuntimeLatestSegmentTest.runScenarios(source.resolve("com/butang/codextop/CodexRuntime.java"),extra.toString().replace("RuntimeLatestSegmentProbe.ownsConversation", "RuntimeLatestSegmentProbe.actualOwnsConversation"),args.length>1?args[1]:"continueBudget();continueStates();continueStale();continueQueuedSearch();continueUiGuards();continueCompleteLatest();continueUnknownEmpty();continueEpochTerminal();continueFactReset();continueQueuedLatest();");
+  RuntimeLatestSegmentTest.runScenarios(source.resolve("com/butang/codextop/CodexRuntime.java"),extra.toString().replace("RuntimeLatestSegmentProbe.ownsConversation", "RuntimeLatestSegmentProbe.actualOwnsConversation"),args.length>1?args[1]:DEFAULT_SCENARIOS);
  }
  private static final String UI="""
  static boolean enabled(){return true;}static final class MessagesController{static final int LOAD_AROUND_MESSAGE=3;}
- static final class TextUtils{enum TruncateAt{MIDDLE}static boolean isEmpty(String s){return s==null||s.isEmpty();}}
+ static final class TextUtils{static boolean isEmpty(String s){return s==null||s.isEmpty();}}
  static final class HashtagSearchController{static HashtagSearchController getInstance(int a){return new HashtagSearchController();}void searchHashtag(Object h,int g,int t,int i){throw new AssertionError("unexpected search");}}
  static final class RecyclerView{static class ItemAnimator{boolean running;boolean isRunning(){return running;}}}
  static final class RecyclerListView{static final int NO_POSITION=-1;int visible=1;int first=0;int height=500;boolean scrollUp,scrollDown,pending,computing,layoutRequested;RecyclerView.ItemAnimator animator;RecyclerView.ItemAnimator getItemAnimator(){return animator;}boolean hasPendingAdapterUpdates(){return pending;}boolean isComputingLayout(){return computing;}boolean isLayoutRequested(){return layoutRequested;}ArrayDeque<Runnable> draw=new ArrayDeque<>();int getHeight(){return height;}boolean canScrollVertically(int direction){return direction<0?scrollUp:scrollDown;}int invalidations;void invalidate(){invalidations++;}void preDraw(){while(!draw.isEmpty())draw.remove().run();}int getChildCount(){return visible;}Object getChildAt(int i){return i;}int getChildAdapterPosition(Object child){return child instanceof ChatLoadingCell?((ChatLoadingCell)child).position:first+(Integer)child;}}
+ static final class ChatLoadingCell{Object parent;int position;Runnable action;boolean progress;Object getParent(){return parent;}void setProgressVisible(boolean v){progress=v;action=null;}void setRetryAction(CharSequence text,Runnable v){action=v;}void tap(){if(action!=null)action.run();}}
  static final class Adapter{boolean isFrozen,isFiltered;int loadingUpRow=0,loadingDownRow=-5,total=1;int getItemCount(){return total;}}
  static final class Media{void loadMoreSearchMessages(boolean x){throw new AssertionError("unexpected search");}}
  static final class Bar{boolean selected,visible;boolean isActionModeShowed(){return selected;}boolean isSearchFieldVisible(){return visible;}}static final class Config{long getClientUserId(){return 1;}}
@@ -380,7 +377,7 @@ public final class HistoryContinueBoundaryTest {
  /** 真实绑定回调到原Controller/Runtime/Window链路，点击只能产生一次已有预算的读取。 */
  static void retryClickRuntime()throws Exception{try{
   Ui target=initial("A");target.dragHistory();pump();consumeSnapshot(target);check(target.codexHistoryOlderRetryRequired,"retry click failure fixture");
-  ChatLoadingCell cell=new ChatLoadingCell();cell.parent=target.chatListView;cell.position=target.chatAdapter.loadingUpRow;target.bindCodexHistoryLoadingCell(cell,cell.position);check(cell.retryAction!=null,"failed real Runtime page had no action");
+  ChatLoadingCell cell=new ChatLoadingCell();cell.parent=target.chatListView;cell.position=target.chatAdapter.loadingUpRow;target.bindCodexHistoryLoadingCell(cell,cell.position);check(cell.action!=null,"failed real Runtime page had no action");
   current.older("old-older",page("B",false,null,null));int calls=target.controller.calls.size();cell.tap();cell.tap();pump();consumeSnapshot(target);
   check(current.requests.size()==2&&target.controller.calls.size()==calls+1&&!target.loading&&!target.codexHistoryOlderRetryRequired,"click did not complete one retry");
   check(historyViews.get(7).window.before(0,10).size()==2,"retry did not keep old and newly loaded body");
@@ -405,7 +402,7 @@ public final class HistoryContinueBoundaryTest {
    if(kind.endsWith("newer"))target.forwardEndReached[0]=false;
    cell.tap();if(kind.equals("visible-search")){target.actionBar=new Bar();target.actionBar.visible=true;}else target.expandSearchUi();ui();
    check(target.controller.calls.size()==before&&Utilities.globalQueue.ready.isEmpty()&&!target.loading&&!target.loadingForward,"queued retry dispatched during search "+kind);
-   check(target.codexHistoryOlderRetryRequired&&cell.retryAction!=null,"search cancellation consumed same button qualification "+kind);
+   check(target.codexHistoryOlderRetryRequired&&cell.action!=null,"search cancellation consumed same button qualification "+kind);
    target.collapseSearchUi();if(target.actionBar!=null)target.actionBar.visible=false;
    current.older("old-older",page("B",false,null,null));cell.tap();cell.tap();ui();
    check(target.controller.calls.size()==before+1&&target.loading&&!target.loadingForward,"same button did not retry only older once "+kind);
@@ -437,118 +434,6 @@ public final class HistoryContinueBoundaryTest {
   Ui target=initial("A");current.older("old-older",page("",true,"e1",null));draw(target);Utilities.globalQueue.next();historyQueue.next();
   target.pauseCodexHistoryView(false);pump();check(current.requests.size()==1&&historyViews.get(7).window.cursor.equals("old-older"),"pause allowed next scan or stale cursor commit");
   System.out.println("PASS pause after first in-flight response cancels remaining original operation");
- }finally{cleanup();}}
- """;
-
- private static final String CELL_BOUNDARY="""
-            static class View {static final int VISIBLE=0,INVISIBLE=4,GONE=8;int position;Object parent;Object getParent(){return parent;}Object getContext(){return new Object();}void addView(View child,Object layout){child.parent=this;}}
-            static int dp(int value){return value;}static class Gravity{static final int CENTER=1;}static class LayoutHelper{static final int MATCH_PARENT=-1;static Object createFrame(int...values){return values;}}
-            static class Theme{static final int key_chat_serviceText=1,key_chat_serviceBackground=2,key_chat_serviceBackgroundSelector=3;static Object createSimpleSelectorRoundRectDrawable(int r,int c,int p){return new Object();}}
-            static class Button extends View{interface Listener{void onClick(View v);}Listener listener;int visibility=VISIBLE;boolean enabled;CharSequence text,description;Button(Object context){}void setAllCaps(boolean v){}void setTextSize(int v){}void setMinWidth(int v){}void setMinHeight(int v){}void setPadding(int a,int b,int c,int d){}void setSingleLine(boolean v){}void setEllipsize(Object v){}void setGravity(int v){}void setOnClickListener(Listener v){listener=v;}void setText(CharSequence v){text=v;}void setContentDescription(CharSequence v){description=v;}void setTextColor(int v){}void setBackground(Object v){}void setEnabled(boolean v){enabled=v;}void setVisibility(int v){visibility=v;}void performClick(){if(enabled&&visibility==VISIBLE&&listener!=null)listener.onClick(this);}}
-            static class FrameLayout extends View {int visibility=VISIBLE;/** 记录真实加载cell调用的Android可见性。 */ void setVisibility(int value){visibility=value;}}
-
- """;
- private static final String CONTINUE_CASES="""
- /** 真实原四页操作停止后绑定原Cell；不把正常进展伪装成失败。 */
- static Ui normalStopped()throws Exception{
-  Ui t=initial("A");current.older("old-older",page("",true,"e1",null));for(int i=1;i<4;i++)current.older("e"+i,page("",true,"e"+(i+1),null));
-  draw(t);pump();consumeSnapshot(t);draw(t);pump();
-  check(current.requests.size()==4&&!t.loading&&!t.endReached[0]&&!t.codexHistoryOlderRetryRequired&&!t.codexHistoryReadingLocked,"normal four-page stop changed");
-  check(historyViews.get(7).window.hasMore&&historyViews.get(7).window.cursor.equals("e4"),"normal stop lost remaining cursor");
-  return t;
- }
- /** 只替代布局挂载位置，按钮绑定和listener都执行正式owner。 */
- static ChatLoadingCell bindBoundary(Ui t){ChatLoadingCell c=new ChatLoadingCell();c.parent=t.chatListView;c.position=t.chatAdapter.loadingUpRow;t.bindCodexHistoryLoadingCell(c,c.position);return c;}
- /** 自动停止后原按钮明确可继续，但绑定/布局/普通收页均不得自行恢复网络。 */
- static void continueBudget()throws Exception{try{
-  Ui t=normalStopped();ChatLoadingCell c=bindBoundary(t);
-  check(c.actionVisible()&&!c.shown(),"normal budget stop has no actionable continuation row");
-  check("加载更早消息".contentEquals(c.retryButton.text)&&c.retryButton.text.equals(c.retryButton.description),"normal continuation falsely describes failure or lacks accessibility");
-  int calls=t.controller.calls.size(),anchor=t.maxMessageId[0];long revision=t.codexHistoryViewRevision;String epoch=t.codexHistoryEpoch;
-  for(int i=0;i<10;i++){t.resumeUi();t.originalLayoutComplete();t.checkScrollForLoad(false);draw(t);pump();}
-  check(current.requests.size()==4&&t.controller.calls.size()==calls&&!t.codexHistoryReadingLocked,"idle binding/layout woke scans");
-  current.older("e4",page("B",false,null,null));c.tap();c.tap();ui();
-  check(t.controller.calls.size()==calls+1&&t.loading&&t.codexHistoryReadingLocked,"normal click not admitted exactly once");
-  check(t.maxMessageId[0]==anchor&&t.codexHistoryViewRevision==revision&&t.codexHistoryEpoch.equals(epoch),"click reset anchor or page identity");
-  pump();consumeSnapshot(t);check(current.requests.size()==5&&ids(historyViews.get(7).window).equals("A,B")&&!t.loading&&t.endReached[0],"continue failed to preserve/complete original history");
-  t.bindCodexHistoryLoadingCell(c,c.position);check(!c.actionVisible()&&!c.shown(),"completed row retained action");
-  System.out.println("PASS normal four-page stop -> accessible real Cell -> one original Controller admission; no automatic scan or anchor reset");
- }finally{cleanup();}}
- /** 正常加载按钮与失败文案分离，已在读旧仍沿原阅读意图。 */
- static void continueStates()throws Exception{try{
-  Ui t=initial("A");ChatLoadingCell c=bindBoundary(t);check(c.actionVisible(),"idle latest missing action");int calls=t.controller.calls.size();ui();pump();check(t.controller.calls.size()==calls&&current.requests.isEmpty()&&!t.codexHistoryReadingLocked,"idle latest auto-dispatched");
-  t.loading=true;t.bindCodexHistoryLoadingCell(c,c.position);check(c.shown()&&!c.actionVisible(),"inflight action visible");t.loading=false;
-  t.codexHistoryOlderRetryRequired=true;t.bindCodexHistoryLoadingCell(c,c.position);check("未能加载更早消息 · 重试".contentEquals(c.retryButton.text),"failure text regressed");
-  t.codexHistoryOlderRetryRequired=false;t.codexHistoryReadingLocked=true;t.bindCodexHistoryLoadingCell(c,c.position);check(c.actionVisible(),"reading intent disabled manual action");
-  current.older("old-older",page("B",false,null,null));c.tap();ui();check(t.codexHistoryReadingLocked&&t.controller.calls.size()==calls+1,"existing reading click changed intent");pump();consumeSnapshot(t);
-  System.out.println("PASS latest idle has no implicit intent; inflight/failure/reading labels and actions remain distinct");
- }finally{cleanup();}}
- /** 所有点击仍经过真实Runtime归属与代次守卫，不能用页面替身掩盖退出/切账号。 */
- static void continueStale()throws Exception{for(String kind:new String[]{"generation-before","generation-queued","account-index","remote","paused-view","removed-view","remote-removed-before","remote-removed-queued"})try{
-  Ui t=normalStopped();ChatLoadingCell c=bindBoundary(t);check(c.actionVisible(),"stale fixture has no continuation");int calls=t.controller.calls.size();
-  if(kind.endsWith("-queued"))c.tap();
-  if(kind.startsWith("generation"))accountGeneration++;else if(kind.equals("account-index"))org.telegram.messenger.UserConfig.selectedAccount=1;else if(kind.equals("remote"))remoteIds.put(42L,"other");else if(kind.startsWith("remote-removed"))remoteIds.clear();else if(kind.equals("paused-view"))pauseHistoryView(7,t.codexHistoryViewToken);else historyViews.clear();
-  if(!kind.endsWith("-queued"))c.tap();ui();check(t.controller.calls.size()==calls&&Utilities.globalQueue.ready.isEmpty()&&current.requests.size()==4,"stale normal continuation dispatched "+kind);
- }finally{org.telegram.messenger.UserConfig.selectedAccount=0;cleanup();}System.out.println("PASS 8 actual Runtime generation/account/source/view guard cases");}
- /** 普通边界同样在队列执行点拒绝搜索；取消后仍可点击原同一绑定。 */
- static void continueQueuedSearch()throws Exception{for(String kind:new String[]{"query","visible","newer"})try{
-  Ui t=normalStopped();ChatLoadingCell c=bindBoundary(t);check(c.actionVisible(),"search fixture has no continuation");int calls=t.controller.calls.size();
-  if(kind.equals("newer"))t.forwardEndReached[0]=false;c.tap();if(kind.equals("visible")){t.actionBar=new Bar();t.actionBar.visible=true;}else t.expandSearchUi();ui();
-  check(t.controller.calls.size()==calls&&!t.loading&&!t.loadingForward&&!t.codexHistoryReadingLocked&&c.actionVisible(),"queued search consumed normal action/intent "+kind);
-  t.collapseSearchUi();if(t.actionBar!=null)t.actionBar.visible=false;current.older("e4",page("B",false,null,null));c.tap();c.tap();ui();
-  check(t.controller.calls.size()==calls+1&&t.loading&&!t.loadingForward,"same normal action failed after search collapse "+kind);t.forwardEndReached[0]=true;pump();consumeSnapshot(t);
- }finally{cleanup();}System.out.println("PASS 3 queued search cancellation and same-button recovery cases");}
- /** 已捕获按钮不得越过页面代次、方向、冻结、暂停或完整终态。 */
- static void continueUiGuards()throws Exception{for(String kind:new String[]{"pause","token","epoch","revision","account","detach","position","filtered","frozen","end","loading","search","visible-search"})try{
-  Ui t=normalStopped();ChatLoadingCell c=bindBoundary(t);check(c.actionVisible(),"UI guard fixture missing action");int calls=t.controller.calls.size();
-  if(kind.equals("pause"))t.paused=true;else if(kind.equals("token"))t.codexHistoryViewToken++;else if(kind.equals("epoch"))t.codexHistoryEpoch="other";else if(kind.equals("revision"))t.clearCodexHistoryScrollTargets();else if(kind.equals("account"))t.currentAccount++;else if(kind.equals("detach"))c.parent=null;else if(kind.equals("position"))c.position=-1;else if(kind.equals("filtered"))t.chatAdapter.isFiltered=true;else if(kind.equals("frozen"))t.chatAdapter.isFrozen=true;else if(kind.equals("end"))t.endReached[0]=true;else if(kind.equals("loading"))t.loading=true;else if(kind.equals("search"))t.expandSearchUi();else{t.actionBar=new Bar();t.actionBar.visible=true;}
-  c.tap();ui();check(t.controller.calls.size()==calls&&current.requests.size()==4,"stale UI action dispatched "+kind);
- }finally{cleanup();}System.out.println("PASS 13 retained button UI owner/intent/terminal guards");}
-
- /** 非空latest终态不依赖Telegram endReached假设，不能留下正常继续按钮。 */
- static void continueCompleteLatest()throws Exception{try{
-  TranscriptWindow complete=new TranscriptWindow();complete.prepend(page("A",false,null,"tail"));reset(complete);Ui t=new Ui();t.firstLoadMessages();pump();
-  for(Event e:events)if(e.type==NotificationCenter.messagesDidLoad&&(Integer)e.args[14]==0)check((Boolean)e.args[9],"terminal fixture not genuine end");
-  consumeSnapshot(t);ChatLoadingCell c=bindBoundary(t);check(!c.actionVisible(),"complete nonempty latest incorrectly offers more history");draw(t);pump();check(current.requests.isEmpty(),"complete latest fetched more");
-  System.out.println("PASS actual complete nonempty latest hides normal continuation despite native endReached semantics");
- }finally{cleanup();}}
- /** 空且未加载的原Runtime回包不能凭end=false产生普通继续资格。 */
- static void continueUnknownEmpty()throws Exception{try{
-  reset(new TranscriptWindow());DesktopConnection saved=current;current=null;Ui t=new Ui();t.firstLoadMessages();pump();
-  for(Event e:events)if(e.type==NotificationCenter.messagesDidLoad&&(Integer)e.args[14]==0)check(!(Boolean)e.args[9]&&!metadata(e).loadFailed,"unknown empty fixture changed");
-  consumeSnapshot(t);ChatLoadingCell c=bindBoundary(t);check(!c.actionVisible()&&!t.codexHistoryOlderRetryRequired,"unknown empty offered normal continuation");current=saved;
-  System.out.println("PASS real unloaded empty/no connection stays unknown with no normal continuation");
- }finally{cleanup();}}
- /** 同epoch明确终态与新epoch接纳都撤销旧事实；旧成功通知不能把按钮重新打开。 */
- static void continueEpochTerminal()throws Exception{for(boolean newEpoch:new boolean[]{false,true})try{
-  Ui t=normalStopped();ChatLoadingCell staleCell=bindBoundary(t);check(staleCell.actionVisible(),"epoch fixture has no action");
-  t.waitingForLoad.add(91);loadMessages(0,42,15,0,7,2,91,0);pump();Event oldSuccess=events.stream().filter(e->e.type==NotificationCenter.messagesDidLoad&&(Integer)e.args[14]==0).findFirst().get();events.clear();t.consume(oldSuccess);ui();
-  // 本例验证latest终态接纳，明确无tail使watch走bootstrap，不依赖旧的总latest策略。
-  if(newEpoch){histories.get(42L).tailCursor=null;current.latest=page("Z",false,null,"tail-complete");watchConversation(0,42);pump();consumeSnapshot(t);pump();}
-  else{histories.get(42L).prepend(page("A",false,null,"tail-complete"));t.waitingForLoad.add(92);loadMessages(0,42,15,0,7,2,92,0);pump();consumeSnapshot(t);}
-  int rpcBefore=current.requests.size();
-  ChatLoadingCell terminal=bindBoundary(t);check(!t.codexHistoryOlderContinueAvailable && (!terminal.actionVisible() || newEpoch && terminal.retryButton.text.toString().contains("本地记录")),"terminal latest kept network continuation newEpoch="+newEpoch);
-  // 同一旧请求已完成后重复送达；新epoch时先由真实page身份拒绝。
-  t.consume(oldSuccess);t.bindCodexHistoryLoadingCell(terminal,terminal.position);
-  check(!t.codexHistoryOlderContinueAvailable && (!terminal.actionVisible() || newEpoch && terminal.retryButton.text.toString().contains("本地记录")),"late old success reopened network continuation newEpoch="+newEpoch);
-  pump();check(current.requests.size()==rpcBefore,"terminal local boundary caused RPC");
-  int calls=t.controller.calls.size();staleCell.tap();ui();check(t.controller.calls.size()==calls,"stale retained normal button dispatched after terminal");
- }finally{cleanup();}System.out.println("PASS same/new epoch terminal facts replace old availability; duplicate/old success cannot reopen it");}
- /** 生命周期撤销只影响新按钮的事实，不能重开原自动预算或丢失旧记录。 */
- static void continueFactReset()throws Exception{for(String kind:new String[]{"clear","pause","destroy","latest"})try{
-  Ui t=normalStopped();ChatLoadingCell c=bindBoundary(t);check(c.actionVisible(),"reset fixture missing action");int rows=historyViews.get(7).window.before(0,50).size();
-  if(kind.equals("clear"))t.clearCodexHistoryScrollTargets();else if(kind.equals("pause"))t.pauseCodexHistoryView(false);else if(kind.equals("destroy"))t.pauseCodexHistoryView(true);else {t.requestCodexLatestHistory();pump();consumeSnapshot(t);}
-  if(!kind.equals("latest")){t.bindCodexHistoryLoadingCell(c,c.position);check(!c.actionVisible(),"reset retained normal fact "+kind);}
-  check(histories.get(42L).before(0,50).size()==rows,"reset changed history data "+kind);
- }finally{cleanup();}System.out.println("PASS clear/pause/destroy/latest keep data and bound action facts");}
- /** 回最新先撤销已排队的旧向按钮，不能在原UI任务执行时重新锁阅读。 */
- static void continueQueuedLatest()throws Exception{try{
-  Ui t=normalStopped();ChatLoadingCell c=bindBoundary(t);check(c.actionVisible(),"latest-cancel fixture missing action");int calls=t.controller.calls.size();
-  c.tap();t.requestCodexLatestHistory();ui();
-  check(t.controller.calls.size()==calls&&!t.loading&&!t.codexHistoryReadingLocked,"queued normal click survived explicit latest and relocked reading");
-  check(current.requests.size()==4,"latest cancel directly scanned history");
-  pump();consumeSnapshot(t);ChatLoadingCell fresh=bindBoundary(t);check(fresh.actionVisible(),"real accepted latest did not restore known continuation");
-  System.out.println("PASS queued old button canceled by explicit latest; only accepted snapshot restores continuation");
  }finally{cleanup();}}
  """;
 }
