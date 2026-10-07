@@ -845,7 +845,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         } else if (position == POSITION_CHATS) {
             Bundle args = new Bundle();
             args.putBoolean("hasMainTabs", true);
-            dialogsActivity = new DialogsActivity(args);
+            dialogsActivity = new DialogsActivity(args, true);
             dialogsActivity.setMainTabsActivityController(new MainTabsActivityControllerImpl());
             return dialogsActivity;
         } else if (position == POSITION_PROFILE) {

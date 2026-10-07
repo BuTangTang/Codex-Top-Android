@@ -2701,12 +2701,21 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         default boolean didSelectStories(DialogsActivity fragment) { return false; }
     }
 
+    /** 保留搜索、选择和恢复入口原有的玻璃来源初始化。 */
     public DialogsActivity(Bundle args) {
+        this(args, false);
+    }
+
+    /** 仅明确标记且参数仍为普通根页时复用平色来源，其他入口保持原渲染链。 */
+    DialogsActivity(Bundle args, boolean allowCodexFlatRoot) {
         super(args);
 
+        // 此时尚未解析 hasMainTabs 等字段；只接受普通根创建处传入的唯一参数。
+        final boolean flatCodexRoot = allowCodexFlatRoot && com.butang.codextop.CodexRuntime.enabled()
+                && args != null && args.size() == 1 && args.getBoolean("hasMainTabs", false);
         iBlur3SourceColor = new BlurredBackgroundSourceColor();
         iBlur3SourceColor.setColor(getThemedColor(Theme.key_windowBackgroundWhite));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !flatCodexRoot) {
             scrollableViewNoiseSuppressor = new DownscaleScrollableNoiseSuppressor();
             iBlur3SourceGlassFrosted = new BlurredBackgroundSourceRenderNode(null);
             iBlur3SourceGlassFrosted.setupRenderer(new RenderNodeWithHash.Renderer() {
