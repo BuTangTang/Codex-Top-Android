@@ -21,146 +21,8 @@ public final class TranscriptWindow {
         /** 编号仅在所属连续段内有效，段身份与源消息身份共同防止跨段误认。 */
         Entry(String epoch, int id, TranscriptText message) { this.epoch = epoch; this.id = id; this.message = message; }
     }
-    /** 不可变正文来源由持久层提供，读取失败不能伪装成缺失消息。 */
-    interface Content { TranscriptText read() throws IOException; }
-
-    /** 桥接共享正文所有权；持久化成功后释放新增正文，不缓存惰性读取结果。 */
-    static final class Body {
-        private TranscriptText resident;
-        private Content content;
-        Body(TranscriptText resident) { this.resident = java.util.Objects.requireNonNull(resident); }
-        Body(Content content) { this.content = java.util.Objects.requireNonNull(content); }
-        Content content() { return content; }
-        TranscriptText resident() { return resident; }
-        void bindPersisted(Content committed) { content = java.util.Objects.requireNonNull(committed); resident = null; }
-        private TranscriptText read() throws IOException {
-            try {
-                TranscriptText result = resident != null ? resident : content.read();
-                if (result == null) throw new IOException("缓存正文缺失");
-                return result;
-            } catch (RuntimeException invalid) { throw new IOException("缓存正文格式无效", invalid); }
-        }
-    }
-
-    /** 全量身份和顺序留在内存，正文仅在交付真实消息页时读取。 */
-    static final class RowRef {
-        final int id;
-        final String sourceId, localId;
-        final boolean outgoing;
-        final long createdAtMs;
-        final Body body;
-        private java.lang.ref.WeakReference<Entry> delivered;
-        RowRef(int id, String sourceId, String localId, boolean outgoing, long createdAtMs, Body body) {
-            this.id = id; this.sourceId = java.util.Objects.requireNonNull(sourceId); this.localId = localId;
-            this.outgoing = outgoing; this.createdAtMs = createdAtMs; this.body = java.util.Objects.requireNonNull(body);
-        }
-        private RowRef(int id, TranscriptText text) {
-            this(id, text.id, text.localId, text.outgoing, text.createdAtMs, new Body(text));
-        }
-        private RowRef renumber(int id) { return new RowRef(id, sourceId, localId, outgoing, createdAtMs, body); }
-        private Entry materialize(String epoch) throws IOException {
-            Entry cached = delivered == null ? null : delivered.get();
-            if (cached != null) return cached;
-            TranscriptText text = body.read();
-            if (!sourceId.equals(text.id) || !java.util.Objects.equals(localId, text.localId)
-                    || outgoing != text.outgoing || createdAtMs != text.createdAtMs)
-                throw new IOException("缓存正文与身份索引不一致");
-            Entry entry = new Entry(epoch, id, text);
-            delivered = new java.lang.ref.WeakReference<>(entry);
-            return entry;
-        }
-    }
-
-    /** 原子清单的完整轻量段描述；引用正文 holder，不序列化正文。 */
-    static final class IndexedSegment {
-        final String epoch, cursor, tailCursor;
-        final int oldest;
-        final boolean hasMore, loaded, complete;
-        final java.util.List<RowRef> rows;
-        final java.util.Map<String, Integer> sourceNumbers;
-        IndexedSegment(String epoch, int oldest, String cursor, String tailCursor, boolean hasMore,
-                boolean loaded, boolean complete, java.util.List<RowRef> rows, java.util.Map<String, Integer> sourceNumbers) {
-            this.epoch = epoch; this.oldest = oldest; this.cursor = cursor; this.tailCursor = tailCursor;
-            this.hasMore = hasMore; this.loaded = loaded; this.complete = complete;
-            this.rows = java.util.Collections.unmodifiableList(new ArrayList<>(rows));
-            this.sourceNumbers = java.util.Collections.unmodifiableMap(new HashMap<>(sourceNumbers));
-        }
-    }
-
-    /** 导出当前根和扁平归档，不触发任何正文读取或持久绑定。 */
-    java.util.List<IndexedSegment> exportIndexedSegments() {
-        ArrayList<IndexedSegment> result = new ArrayList<>();
-        result.add(indexedSegment());
-        for (TranscriptWindow window : archive.values()) result.add(window.indexedSegment());
-        return java.util.Collections.unmodifiableList(result);
-    }
-
-    /** 段头、身份别名和正文引用来自同一历史所属队列快照。 */
-    private IndexedSegment indexedSegment() {
-        return new IndexedSegment(epoch, oldest, cursor, tailCursor, hasMore, loaded, complete,
-                new ArrayList<>(entries.values()), sourceIds);
-    }
-
-    /** 只恢复完整轻量索引；损坏段和身份不交付半份根，正文校验留在实际查询。 */
-    static TranscriptWindow restoreIndexed(java.util.List<IndexedSegment> segments) throws IOException {
-        try {
-            if (segments == null || segments.isEmpty()) throw new IOException("缓存索引缺少根段");
-            TranscriptWindow root = null;
-            for (IndexedSegment saved : segments) {
-                if (!java.util.UUID.fromString(saved.epoch).toString().equals(saved.epoch)) throw new IOException("缓存段身份无效");
-                TranscriptWindow window = new TranscriptWindow(saved.epoch);
-                window.oldest = saved.oldest; window.cursor = saved.cursor; window.tailCursor = saved.tailCursor;
-                window.hasMore = saved.hasMore; window.loaded = saved.loaded; window.complete = saved.complete;
-                for (RowRef row : saved.rows) {
-                    if (row.id < window.oldest || window.entries.containsKey(row.id) || window.sourceIds.containsKey(row.sourceId))
-                        throw new IOException("缓存消息身份无效");
-                    if (window.containsRow(row)) continue;
-                    // 重建独立查询引用，不能把前一 Window 交付过的 Entry 冒作当前对象。
-                    RowRef restored = row.renumber(row.id);
-                    window.entries.put(restored.id, restored);
-                    window.remember(restored);
-                }
-                for (java.util.Map.Entry<String, Integer> alias : saved.sourceNumbers.entrySet()) {
-                    Integer known = window.sourceIds.get(alias.getKey());
-                    if (alias.getKey() == null || alias.getValue() == null || !window.entries.containsKey(alias.getValue())
-                            || known != null && !known.equals(alias.getValue())) throw new IOException("缓存来源别名无效");
-                    window.sourceIds.put(alias.getKey(), alias.getValue());
-                }
-                if (root == null) root = window;
-                else {
-                    if (root.segment(window.epoch) != null) throw new IOException("缓存段身份重复");
-                    root.archive.put(window.epoch, window);
-                }
-            }
-            return root;
-        } catch (RuntimeException error) { throw new IOException("缓存索引格式无效", error); }
-    }
-
-    private final Object persistenceIdentity = new Object();
-    private TranscriptPersistenceToken persistenceToken;
-
-    Object persistenceIdentity() { return persistenceIdentity; }
-    TranscriptPersistenceToken persistenceToken() { return persistenceToken; }
-
-    /** 整个扁平族一次绑定，防止归档对象误被当作新缓存根。 */
-    void validatePersistenceFamilyUnbound() throws IOException {
-        if (persistenceToken != null) throw new IOException("缓存根已绑定");
-        for (TranscriptWindow old : archive.values()) {
-            if (old.persistenceToken != null) throw new IOException("缓存归档已绑定");
-        }
-    }
-
-    void bindPersistenceFamily(TranscriptPersistenceToken token) {
-        persistenceToken = java.util.Objects.requireNonNull(token);
-        for (TranscriptWindow old : archive.values()) old.persistenceToken = token;
-    }
-
-    void bindPersistenceRoot(TranscriptPersistenceToken token) {
-        persistenceToken = java.util.Objects.requireNonNull(token);
-    }
-
     private final String epoch;
-    private final TreeMap<Integer, RowRef> entries = new TreeMap<>();
+    private final TreeMap<Integer, Entry> entries = new TreeMap<>();
     private final HashMap<String, Integer> sourceIds = new HashMap<>();
     private final HashMap<String, Integer> localIds = new HashMap<>();
     private final java.util.LinkedHashMap<String, TranscriptWindow> archive = new java.util.LinkedHashMap<>();
@@ -191,45 +53,20 @@ public final class TranscriptWindow {
     }
 
     /** 显式编号只在本段精确查找；缺项不以邻近编号代替。 */
-    public Entry findNumber(int number) throws IOException {
-        RowRef row = entries.get(number); return row == null ? null : row.materialize(epoch);
-    }
+    public Entry findNumber(int number) { return entries.get(number); }
 
     /** 仅在本段按原消息身份查找，发送身份的回退只匹配用户消息。 */
-    public Entry findSource(String sourceId, String outgoingLocalId) throws IOException {
-        RowRef row = findRow(sourceId, outgoingLocalId);
-        return row == null ? null : row.materialize(epoch);
-    }
-
-    /** 身份定位只读完整索引，书签准入不必预先加载正文。 */
-    public Integer sourceNumber(String sourceId, String outgoingLocalId) {
+    public Entry findSource(String sourceId, String outgoingLocalId) {
         Integer number = sourceId == null ? null : sourceIds.get(sourceId);
         if (number == null && outgoingLocalId != null && !outgoingLocalId.isEmpty()) number = localIds.get(outgoingLocalId);
-        return number;
-    }
-
-    /** 空段和末号依据所有已保存行，不依据当前驻留正文数量。 */
-    public boolean isEmpty() { return entries.isEmpty(); }
-    public int size() { return entries.size(); }
-    public int latestNumber() { return entries.isEmpty() ? 0 : entries.lastKey(); }
-
-    /** 精确锚点存在性只查完整索引，坏正文不能改变该编号是否已保存。 */
-    public boolean containsNumber(int number) { return entries.containsKey(number); }
-
-    /** 保持 before 的严格小于边界与零号全段语义，仅判断是否还有本地旧行。 */
-    public boolean hasBefore(int maxId) { return !entries.isEmpty() && (maxId == 0 || entries.firstKey() < maxId); }
-
-    /** 模型内部比较只访问轻量身份，不因桥接、去重或排序校验读出旧正文。 */
-    private RowRef findRow(String sourceId, String outgoingLocalId) {
-        Integer number = sourceNumber(sourceId, outgoingLocalId);
         return number == null ? null : entries.get(number);
     }
 
     /** 跨段定位始终优先当前段，再按来源身份查保留段，绝不比较不同段的本地编号。 */
     public TranscriptWindow findSegment(String sourceId, String outgoingLocalId) {
-        if (findRow(sourceId, outgoingLocalId) != null) return this;
+        if (findSource(sourceId, outgoingLocalId) != null) return this;
         for (TranscriptWindow window : archive.values())
-            if (window.findRow(sourceId, outgoingLocalId) != null) return window;
+            if (window.findSource(sourceId, outgoingLocalId) != null) return window;
         return null;
     }
 
@@ -243,9 +80,9 @@ public final class TranscriptWindow {
         final int anchorId;
         private LocalSegment(TranscriptWindow window) {
             this.window = window; epoch = window.epoch; count = window.entries.size();
-            RowRef first = window.entries.firstEntry().getValue(), last = window.entries.lastEntry().getValue();
-            firstTime = first.createdAtMs; lastTime = last.createdAtMs;
-            sourceId = last.sourceId; anchorId = last.id;
+            Entry first = window.entries.firstEntry().getValue(), last = window.entries.lastEntry().getValue();
+            firstTime = first.message.createdAtMs; lastTime = last.message.createdAtMs;
+            sourceId = last.message.id; anchorId = last.id;
         }
     }
 
@@ -270,8 +107,8 @@ public final class TranscriptWindow {
     public boolean hasMissingCachedTailAnchor() {
         for (TranscriptWindow window : archive.values()) {
             if (window.entries.isEmpty()) continue;
-            RowRef last = window.entries.lastEntry().getValue();
-            if (findRow(last.sourceId, hasLocalIdentity(last) ? last.localId : null) == null) return true;
+            TranscriptText last = window.entries.lastEntry().getValue().message;
+            if (findSource(last.id, hasLocalIdentity(last) ? last.localId : null) == null) return true;
         }
         return false;
     }
@@ -284,7 +121,7 @@ public final class TranscriptWindow {
     }
 
     /** v2 平铺保存当前段和归档，旧段不递归携带归档；消息编号及游标保持。 */
-    public JsonObject snapshot() throws IOException {
+    public JsonObject snapshot() {
         JsonObject root = segmentSnapshot();
         com.google.gson.JsonArray archived = new com.google.gson.JsonArray();
         for (TranscriptWindow window : archive.values()) archived.add(window.segmentSnapshot());
@@ -309,7 +146,7 @@ public final class TranscriptWindow {
             values.write(writer, field.getValue());
         }
         writer.name("rows").beginArray();
-        for (RowRef row : entries.values()) values.write(writer, rowSnapshot(row.materialize(epoch)));
+        for (Entry entry : entries.values()) values.write(writer, rowSnapshot(entry));
         writer.endArray();
         if (root) {
             writer.name("archive").beginArray();
@@ -320,10 +157,10 @@ public final class TranscriptWindow {
     }
 
     /** 每个段只序列化自己，避免多次断档后重复嵌套旧正文。 */
-    private JsonObject segmentSnapshot() throws IOException {
+    private JsonObject segmentSnapshot() {
         JsonObject root = segmentMetadata();
         com.google.gson.JsonArray rows = new com.google.gson.JsonArray();
-        for (RowRef row : entries.values()) rows.add(rowSnapshot(row.materialize(epoch)));
+        for (Entry entry : entries.values()) rows.add(rowSnapshot(entry));
         root.add("rows", rows);
         return root;
     }
@@ -346,25 +183,20 @@ public final class TranscriptWindow {
     private static JsonObject rowSnapshot(Entry entry) {
         JsonObject row = new JsonObject();
         row.addProperty("number", entry.id);
-        row.add("item", bodySnapshot(entry.message));
-        return row;
-    }
-
-    /** 持久正文块复用原 v2 item 格式，编号归属始终留在段索引。 */
-    static JsonObject bodySnapshot(TranscriptText message) {
         JsonObject item = new JsonObject();
-        item.addProperty("id", message.id);
-        item.addProperty("localId", message.localId);
-        item.addProperty("createdAtMs", message.createdAtMs);
+        item.addProperty("id", entry.message.id);
+        item.addProperty("localId", entry.message.localId);
+        item.addProperty("createdAtMs", entry.message.createdAtMs);
         JsonObject raw = new JsonObject();
-        raw.addProperty("role", message.outgoing ? "user" : "agent");
+        raw.addProperty("role", entry.message.outgoing ? "user" : "agent");
         JsonObject content = new JsonObject();
         content.addProperty("type", "text");
-        content.addProperty("text", message.text);
+        content.addProperty("text", entry.message.text);
         raw.add("content", content);
-        if (!message.attachments.isEmpty()) raw.add("meta", DesktopAttachment.meta(message.attachments));
+        if (!entry.message.attachments.isEmpty()) raw.add("meta", DesktopAttachment.meta(entry.message.attachments));
         item.add("raw", raw);
-        return item;
+        row.add("item", item);
+        return row;
     }
 
     /** 损坏缓存不交付半份数据；调用方可保留文件并重新读取来源。 */
@@ -491,9 +323,8 @@ public final class TranscriptWindow {
                 || window.sourceIds.containsKey(parsed.get(0).id)) throw new IOException("缓存消息身份无效");
         TranscriptText text = parsed.get(0);
         if (window.containsMessage(text)) return;
-        RowRef restored = new RowRef(number, text);
-        window.entries.put(number, restored);
-        window.remember(restored);
+        window.entries.put(number, new Entry(window.epoch, number, text));
+        window.remember(text, number);
     }
 
     /** 没有真实尾游标时重新读取最新页；不能因为旧缓存标为loaded就永久跳过。 */
@@ -510,15 +341,14 @@ public final class TranscriptWindow {
         if (!loaded || !hasMore || entries.isEmpty()) return false;
         for (TranscriptWindow cached : archive.values()) {
             if (cached.entries.isEmpty()) continue;
-            RowRef last = cached.entries.lastEntry().getValue();
-            if (findRow(last.sourceId, hasLocalIdentity(last) ? last.localId : null) == null) return true;
+            TranscriptText last = cached.entries.lastEntry().getValue().message;
+            if (findSource(last.id, hasLocalIdentity(last) ? last.localId : null) == null) return true;
         }
         return false;
     }
 
     /** 合法最新页可直接成为新连续段；仅明确缺锚点时换段，坏响应和倒序仍然拒绝。 */
     public TranscriptWindow acceptLatest(JsonObject page) throws IOException {
-        if (persistenceToken != null) persistenceToken.requireCurrent(this);
         ArrayList<TranscriptText> source = readCompletePage(page, true);
         validateRetainedOrder(source);
         int anchor = -1;
@@ -526,7 +356,7 @@ public final class TranscriptWindow {
             int latest = entries.lastKey();
             for (int i = 0; i < source.size(); i++) {
                 TranscriptText text = source.get(i);
-                RowRef known = findRow(text.id, hasLocalIdentity(text) ? text.localId : null);
+                Entry known = findSource(text.id, hasLocalIdentity(text) ? text.localId : null);
                 if (known != null && known.id == latest) { anchor = i; break; }
             }
         }
@@ -540,7 +370,6 @@ public final class TranscriptWindow {
         // 新根独占扁平归档；旧视图保留原对象、正文、编号和游标，不保留重复归档链。
         latest.archive.putAll(archive);
         latest.archive.put(epoch, this);
-        if (persistenceToken != null) persistenceToken.transferRoot(this, latest);
         archive.clear();
         return latest;
     }
@@ -552,9 +381,10 @@ public final class TranscriptWindow {
         for (TranscriptWindow cached : archive.values()) {
             int anchor = cachedPrefixAnchor(source, cached);
             if (anchor < 0) continue;
-            ArrayList<RowRef> joined = new ArrayList<>(cached.entries.values());
-            for (TranscriptText text : source.subList(anchor + 1, source.size())) joined.add(new RowRef(0, text));
-            prependRows(page, false, joined);
+            ArrayList<TranscriptText> joined = new ArrayList<>();
+            for (Entry entry : cached.entries.values()) joined.add(entry.message);
+            joined.addAll(source.subList(anchor + 1, source.size()));
+            prepend(page, false, joined);
             cursor = cached.cursor;
             hasMore = cached.hasMore;
             complete = cached.complete;
@@ -573,9 +403,9 @@ public final class TranscriptWindow {
             if (pinnedEpochs.contains(cached.epoch)) continue;
             int previous = 0;
             boolean included = true;
-            for (RowRef row : cached.entries.values()) {
-                RowRef current = findRow(row.sourceId, hasLocalIdentity(row) ? row.localId : null);
-                if (current == null || current.id <= previous || !sameKnownContent(row, current)) {
+            for (Entry row : cached.entries.values()) {
+                Entry current = findSource(row.message.id, hasLocalIdentity(row.message) ? row.message.localId : null);
+                if (current == null || current.id <= previous || !sameCachedContent(row.message, current.message)) {
                     included = false;
                     break;
                 }
@@ -584,14 +414,6 @@ public final class TranscriptWindow {
             if (included) { old.remove(); changed = true; }
         }
         return changed;
-    }
-
-    /** 共享正文引用或已驻留的等值正文才足以释放旧段，比较过程不读持久正文。 */
-    private static boolean sameKnownContent(RowRef left, RowRef right) {
-        if (left.outgoing != right.outgoing || left.createdAtMs != right.createdAtMs
-                || !java.util.Objects.equals(left.localId, right.localId)) return false;
-        return left.body == right.body || left.body.resident() != null && right.body.resident() != null
-                && sameCachedContent(left.body.resident(), right.body.resident());
     }
 
     /** 确认保留的文字、原时间和附件都已在当前段，不能只靠同号或同正文清理旧缓存。 */
@@ -605,14 +427,14 @@ public final class TranscriptWindow {
     /** 前缀必须是已缓存段的连续后缀且到达末项，不能用缺项页跨过尚未确认的缺口。 */
     private static int cachedPrefixAnchor(ArrayList<TranscriptText> source, TranscriptWindow cached) {
         if (cached.entries.isEmpty() || source.isEmpty()) return -1;
-        RowRef first = cached.findRow(source.get(0).id, hasLocalIdentity(source.get(0)) ? source.get(0).localId : null);
+        Entry first = cached.findSource(source.get(0).id, hasLocalIdentity(source.get(0)) ? source.get(0).localId : null);
         if (first == null) return -1;
-        java.util.Iterator<RowRef> expected = cached.entries.tailMap(first.id, true).values().iterator();
-        RowRef next = expected.next();
+        java.util.Iterator<Entry> expected = cached.entries.tailMap(first.id, true).values().iterator();
+        Entry next = expected.next();
         int previous = 0;
         for (int i = 0; i < source.size(); i++) {
             TranscriptText text = source.get(i);
-            RowRef known = cached.findRow(text.id, hasLocalIdentity(text) ? text.localId : null);
+            Entry known = cached.findSource(text.id, hasLocalIdentity(text) ? text.localId : null);
             if (known == null) return -1;
             if (known.id == previous) continue;
             if (known.id != next.id) return -1;
@@ -660,7 +482,7 @@ public final class TranscriptWindow {
     private void validateKnownOrder(ArrayList<TranscriptText> source) throws IOException {
         int previous = 0;
         for (TranscriptText text : source) {
-            RowRef known = findRow(text.id, hasLocalIdentity(text) ? text.localId : null);
+            Entry known = findSource(text.id, hasLocalIdentity(text) ? text.localId : null);
             if (known == null) continue;
             if (known.id < previous) throw new IOException("最新页来源顺序不连续");
             previous = known.id;
@@ -672,7 +494,7 @@ public final class TranscriptWindow {
         java.util.HashSet<String> ids = new java.util.HashSet<>(), locals = new java.util.HashSet<>();
         long latest = entries.isEmpty() ? 1_000_000_000L : entries.lastKey();
         for (TranscriptText text : source) {
-            if (findRow(text.id, hasLocalIdentity(text) ? text.localId : null) != null || !ids.add(text.id)
+            if (findSource(text.id, hasLocalIdentity(text) ? text.localId : null) != null || !ids.add(text.id)
                     || hasLocalIdentity(text) && !locals.add(text.localId)) continue;
             if (++latest > Integer.MAX_VALUE) throw new IOException("本地消息编号已满");
         }
@@ -689,9 +511,7 @@ public final class TranscriptWindow {
             prepend(page, true);
             // 缺失尾游标仍保留实际正文；下一轮必须重新恢复，不能伪造追平。
             tailCursor = tail;
-            ArrayList<Entry> restored = new ArrayList<>();
-            for (RowRef row : entries.values()) restored.add(row.materialize(epoch));
-            return restored;
+            return new ArrayList<>(entries.values());
         }
         if (tail == null || tail.isEmpty()) throw new IOException("最新页缺少尾部游标");
         if (!page.has("items") || !page.get("items").isJsonArray()) throw new IOException("最新消息格式无效");
@@ -730,34 +550,20 @@ public final class TranscriptWindow {
         if (more && (next == null || next.isEmpty() || !recoveringLatest && next.equals(cursor)))
             throw new IOException("历史游标无法继续");
         if (source == null) source = TranscriptText.read(page.getAsJsonArray("items"));
-        ArrayList<RowRef> rows = new ArrayList<>();
-        for (TranscriptText text : source) rows.add(new RowRef(0, text));
-        prependRows(page, recoveringLatest, rows);
-    }
-
-    /** 桥接只复制行引用并重编号，未交付正文不参与本地补页成本。 */
-    private void prependRows(JsonObject page, boolean recoveringLatest, java.util.List<RowRef> source) throws IOException {
-        if (!page.has("items") || !page.get("items").isJsonArray() || !page.has("hasMore"))
-            throw new IOException("历史消息格式无效");
-        boolean more = page.get("hasMore").getAsBoolean();
-        String next = page.has("nextCursor") && !page.get("nextCursor").isJsonNull()
-                ? page.get("nextCursor").getAsString() : null;
-        if (more && (next == null || next.isEmpty() || !recoveringLatest && next.equals(cursor)))
-            throw new IOException("历史游标无法继续");
-        ArrayList<RowRef> fresh = new ArrayList<>();
+        ArrayList<TranscriptText> fresh = new ArrayList<>();
         java.util.HashSet<String> seen = new java.util.HashSet<>();
         java.util.HashSet<String> seenLocal = new java.util.HashSet<>();
-        for (RowRef text : source) {
-            if (containsRow(text) || !seen.add(text.sourceId)) continue;
+        for (TranscriptText text : source) {
+            if (containsMessage(text) || !seen.add(text.id)) continue;
             if (hasLocalIdentity(text) && !seenLocal.add(text.localId)) continue;
             fresh.add(text);
         }
         if (oldest <= fresh.size()) throw new IOException("本地消息编号已满");
         int first = oldest - fresh.size();
         for (int i = 0; i < fresh.size(); i++) {
-            RowRef row = fresh.get(i).renumber(first + i);
-            entries.put(row.id, row);
-            remember(row);
+            Entry entry = new Entry(epoch, first + i, fresh.get(i));
+            entries.put(entry.id, entry);
+            remember(entry.message, entry.id);
         }
         oldest = first;
         cursor = next;
@@ -787,10 +593,10 @@ public final class TranscriptWindow {
         for (TranscriptText text : messages) {
             if (containsMessage(text)) continue;
             if (latest == Integer.MAX_VALUE) throw new IOException("本地消息编号已满");
-            RowRef row = new RowRef(++latest, text);
-            entries.put(row.id, row);
-            remember(row);
-            added.add(row.materialize(epoch));
+            Entry entry = new Entry(epoch, ++latest, text);
+            entries.put(entry.id, entry);
+            remember(text, entry.id);
+            added.add(entry);
         }
         return added;
     }
@@ -804,29 +610,15 @@ public final class TranscriptWindow {
         return true;
     }
 
-    /** 轻量行沿原用户 localId 规则去重，同时记录来源别名。 */
-    private boolean containsRow(RowRef row) {
-        if (sourceIds.containsKey(row.sourceId)) return true;
-        Integer number = hasLocalIdentity(row) ? localIds.get(row.localId) : null;
-        if (number == null) return false;
-        sourceIds.put(row.sourceId, number);
-        return true;
-    }
-
-    /** 助手携带相同 localId 仍保持独立消息身份。 */
-    private static boolean hasLocalIdentity(RowRef row) {
-        return row.outgoing && row.localId != null && !row.localId.isEmpty();
-    }
-
     /** 发送身份仅属于用户消息，助手即使携带同名字段也不能吞掉其回答。 */
     private static boolean hasLocalIdentity(TranscriptText text) {
         return text.outgoing && text.localId != null && !text.localId.isEmpty();
     }
 
     /** 正文和附件共享原消息编号与localId索引，不建立第二套消息缓存。 */
-    private void remember(RowRef row) {
-        sourceIds.put(row.sourceId, row.id);
-        if (hasLocalIdentity(row)) localIds.put(row.localId, row.id);
+    private void remember(TranscriptText text, int number) {
+        sourceIds.put(text.id, number);
+        if (hasLocalIdentity(text)) localIds.put(text.localId, number);
     }
 
     /** 仅明确分页截断且游标前进时立即追赶；空闲、来源断档及坏响应不加速。 */
@@ -842,47 +634,47 @@ public final class TranscriptWindow {
     }
 
     /** 原聊天页向新翻页的独立入口，结果仍保持从新到旧。 */
-    public ArrayList<Entry> after(int minId, int count) throws IOException {
+    public ArrayList<Entry> after(int minId, int count) {
         ArrayList<Entry> result = new ArrayList<>();
-        for (RowRef entry : entries.tailMap(minId, false).values()) {
+        for (Entry entry : entries.tailMap(minId, false).values()) {
             if (result.size() >= count) break;
-            result.add(0, entry.materialize(epoch));
+            result.add(0, entry);
         }
         return result;
     }
 
     /** 围绕锚点交付新到旧的一页，包含锚点并补齐首末；缺失时回退到相邻的本地消息。 */
-    public ArrayList<Entry> around(int anchorId, int count) throws IOException {
+    public ArrayList<Entry> around(int anchorId, int count) {
         ArrayList<Entry> result = new ArrayList<>();
         if (count <= 0 || entries.isEmpty()) return result;
-        java.util.Map.Entry<Integer, RowRef> pivot = anchorId == 0 ? entries.lastEntry() : entries.floorEntry(anchorId);
+        java.util.Map.Entry<Integer, Entry> pivot = anchorId == 0 ? entries.lastEntry() : entries.floorEntry(anchorId);
         if (pivot == null) pivot = entries.firstEntry();
-        for (RowRef entry : entries.tailMap(pivot.getKey(), false).values()) {
+        for (Entry entry : entries.tailMap(pivot.getKey(), false).values()) {
             if (result.size() >= count / 2) break;
-            result.add(0, entry.materialize(epoch));
+            result.add(0, entry);
         }
-        result.add(pivot.getValue().materialize(epoch));
-        for (RowRef entry : entries.headMap(pivot.getKey(), false).descendingMap().values()) {
+        result.add(pivot.getValue());
+        for (Entry entry : entries.headMap(pivot.getKey(), false).descendingMap().values()) {
             if (result.size() >= count) break;
-            result.add(entry.materialize(epoch));
+            result.add(entry);
         }
         // 锚点靠近最旧端时，用另一侧补满，但不越过请求的页大小。
         if (result.size() < count) {
-            for (RowRef entry : entries.tailMap(result.get(0).id, false).values()) {
+            for (Entry entry : entries.tailMap(result.get(0).id, false).values()) {
                 if (result.size() >= count) break;
-                result.add(0, entry.materialize(epoch));
+                result.add(0, entry);
             }
         }
         return result;
     }
 
     /** 原聊天页使用从新到旧的顺序，并用最早可见编号请求更旧的记录。 */
-    public ArrayList<Entry> before(int maxId, int count) throws IOException {
+    public ArrayList<Entry> before(int maxId, int count) {
         ArrayList<Entry> result = new ArrayList<>();
-        for (RowRef entry : entries.descendingMap().values()) {
+        for (Entry entry : entries.descendingMap().values()) {
             if (maxId != 0 && entry.id >= maxId) continue;
             if (result.size() >= count) break;
-            result.add(entry.materialize(epoch));
+            result.add(entry);
         }
         return result;
     }

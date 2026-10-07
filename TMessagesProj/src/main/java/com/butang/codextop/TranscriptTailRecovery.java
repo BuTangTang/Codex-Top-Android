@@ -41,7 +41,7 @@ public final class TranscriptTailRecovery {
 
     /** 只有已加载且缺少尾游标的非空缓存才需要沿旧页找锚点。 */
     public static boolean required(TranscriptWindow history) {
-        return history.needsTailBootstrap() && !history.before(0, 1).isEmpty();
+        return history.needsTailBootstrap() && !history.isEmpty();
     }
 
     /** 开始一次只属于当前连接、历史和观察代的桥接。 */

@@ -6,7 +6,7 @@ import java.nio.file.Files;
 public final class TranscriptStoreTest {
     /** 验证重启增量与各来源缓存互不覆盖，测试只使用独立临时目录。 */
     public static void main(String[] args) throws Exception {
-        var root = Files.createTempDirectory("codex-history-test");
+        var root = Files.createTempDirectory("codex-history-test").toRealPath();
         try {
             var store = new TranscriptStore(root.toFile(), "server", "account-a", "machine");
             var history = new TranscriptWindow();
@@ -45,16 +45,22 @@ public final class TranscriptStoreTest {
             var outbox = new OutboxStore(root.resolve("outbox").toFile(), "server", "a", "machine");
             outbox.put(new OutboxStore.Item("unsent", "first", "离线草稿", -9, 1000));
             var limitedRoot = root.resolve("limited");
-            long snapshotBytes = history.snapshot().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            // 新格式容量包括索引和块：真实独立写入测量一份会话，不沿用旧v2正文长度猜预算。
+            var sizingRoot = root.resolve("sizing");
+            new TranscriptStore(sizingRoot.toFile(), "server", "a", "machine").write("sizing", TranscriptWindow.restore(history.snapshot()));
+            long snapshotBytes;
+            try (var paths = Files.walk(sizingRoot)) {
+                snapshotBytes = paths.filter(Files::isRegularFile).mapToLong(path -> path.toFile().length()).sum();
+            }
             var limitedA = new TranscriptStore(limitedRoot.toFile(), "server", "a", "machine", snapshotBytes * 2);
             var limitedB = new TranscriptStore(limitedRoot.toFile(), "server", "b", "machine", snapshotBytes * 2);
-            limitedA.write("first", history);
+            limitedA.write("first", TranscriptWindow.restore(history.snapshot()));
             try (var paths = Files.walk(limitedRoot)) {
                 for (var path : paths.filter(Files::isRegularFile).toArray(java.nio.file.Path[]::new))
                     Files.setLastModifiedTime(path, java.nio.file.attribute.FileTime.fromMillis(1));
             }
-            limitedB.write("second", history);
-            limitedA.write("third", history);
+            limitedB.write("second", TranscriptWindow.restore(history.snapshot()));
+            limitedA.write("third", TranscriptWindow.restore(history.snapshot()));
             if (limitedA.read("first").loaded || !limitedB.read("second").loaded || !limitedA.read("third").loaded)
                 throw new AssertionError("容量淘汰没有保留新正文或跨账号读取");
             if (limitedA.read("second").loaded) throw new AssertionError("淘汰后账号隔离失效");
@@ -66,7 +72,7 @@ public final class TranscriptStoreTest {
                 throw new AssertionError("正文淘汰影响未发送记录");
             if (diskBytes > snapshotBytes * 2) throw new AssertionError("缓存超过总预算");
             var tooSmall = new TranscriptStore(limitedRoot.toFile(), "server", "a", "machine", snapshotBytes - 1);
-            try { tooSmall.write("third", history); throw new AssertionError("超大单会话被写入"); }
+            try { tooSmall.write("third", limitedA.read("third")); throw new AssertionError("超大单会话被写入"); }
             catch (java.io.IOException expected) { }
             if (!limitedA.read("third").loaded) throw new AssertionError("超大写入破坏旧缓存");
             System.out.println("TranscriptStore: 冷启恢复、身份去重、原子替换、账号隔离、容量淘汰与待发保护通过");

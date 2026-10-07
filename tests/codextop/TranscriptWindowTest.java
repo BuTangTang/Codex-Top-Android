@@ -87,7 +87,7 @@ public final class TranscriptWindowTest {
                 || rows.get(2).id != original.get(1).id || !"original-older".equals(window.cursor)
                 || !window.hasMore || window.complete || !"real-tail".equals(window.tailCursor)
                 || window.needsTailBootstrap()) throw new AssertionError("恢复重排旧消息、改正文编号或错误接受旧页前缀");
-        var storeRoot = java.nio.file.Files.createTempDirectory("codex-tail-recovery");
+        var storeRoot = java.nio.file.Files.createTempDirectory("codex-tail-recovery").toRealPath();
         try {
             var store = new TranscriptStore(storeRoot.toFile(), "server", "account", "machine");
             store.write("thread", window);
@@ -239,7 +239,7 @@ public final class TranscriptWindowTest {
 
     /** 附件沿原正文缓存落盘，重复localId回声不增气泡也不改稳定消息编号。 */
     private static void attachmentSnapshotsAndEchoes() throws Exception {
-        var root = java.nio.file.Files.createTempDirectory("codex-attachment-history");
+        var root = java.nio.file.Files.createTempDirectory("codex-attachment-history").toRealPath();
         try {
             var page = JsonParser.parseString("{\"items\":[" + item("attachment-source")
                     + "],\"hasMore\":false,\"historyAvailability\":\"available\"}").getAsJsonObject();

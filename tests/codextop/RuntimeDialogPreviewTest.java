@@ -19,7 +19,7 @@ public final class RuntimeDialogPreviewTest {
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
         var unit = StaticJavaParser.parse(source.resolve("CodexRuntime.java"));
         var names = Set.of("prefetchDialogs", "isAccountCurrent", "dialogConnection", "restoreDialogPreviews",
-                "publishHistoryPreview", "publishPendingPreview", "publishDialogPreview", "sameDialogPreview", "previewCurrent");
+                "publishHistoryPreview", "publishPendingPreview", "publishDialogPreview", "sameDialogPreview", "previewCurrent", "ownsConversation", "publishHistoryRoot", "offerFirstVisibleHistory");
         StringBuilder methods = new StringBuilder();
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class))
             if (names.contains(method.getNameAsString())) methods.append(method).append('\n');
@@ -31,6 +31,23 @@ public final class RuntimeDialogPreviewTest {
                 else methods.append("static void publishPendingPreview(int a,long e,long id,ArrayList<MessageObject> ms,boolean fresh){}\n");
             }
         }
+        // 冷空页协调执行真实类型、请求表和helper；不在夹具复制调度或合入算法。
+        var owner = unit.getClassByName("CodexRuntime").orElseThrow();
+        for (var member : owner.getMembers()) {
+            if (member.isClassOrInterfaceDeclaration() && (member.asClassOrInterfaceDeclaration().getNameAsString().startsWith("ColdHistory")
+                    || member.asClassOrInterfaceDeclaration().getNameAsString().equals("HistoryView")
+                    || member.asClassOrInterfaceDeclaration().getNameAsString().equals("InitialLoadWaiter"))) methods.append(member).append('\n');
+            else if (member.isMethodDeclaration() && (member.asMethodDeclaration().getNameAsString().contains("ColdHistory")
+                    || member.asMethodDeclaration().getNameAsString().equals("historyViewCurrent")
+                    || member.asMethodDeclaration().getNameAsString().equals("completeInitialLoadsFromLatest"))) methods.append(member).append('\n');
+            else if (member.isFieldDeclaration() && member.asFieldDeclaration().getVariables().stream().anyMatch(v -> v.getNameAsString().equals("coldHistoryRequests")))
+                methods.append(member).append('\n');
+        }
+        methods.append("/** 每例只清实际在途表，避免测试间共享请求。 */ static void resetColdHistoryFixture(){");
+        if (owner.getFieldByName("coldHistoryRequests").isPresent()) methods.append("coldHistoryRequests.clear();");
+        methods.append("}\n");
+        // 仅本入口关闭Android诊断；放在提取结果中，不向共享FIXTURE添加方法导致其他专项重复定义。
+        methods.append("/** JVM诊断未启用，不替代业务helper。 */ static long beginHistoryTrace(String phase){return -1;} static void traceHistoryDuration(String phase,long started){}\n");
         Path temporary = Files.createTempDirectory("codex-dialog-preview-");
         try {
             Path probe = temporary.resolve("RuntimeDialogPreviewProbe.java");
@@ -42,7 +59,7 @@ public final class RuntimeDialogPreviewTest {
             var compile = new ArrayList<String>();
             compile.addAll(java.util.List.of("-cp", System.getProperty("java.class.path"), "-d", temporary.toString(),
                     probe.toString(), flags.toString(), log.toString(), account.toString()));
-            for (String model : new String[]{"DesktopAttachment", "TranscriptText", "TranscriptWindow"})
+            for (String model : new String[]{"DesktopAttachment", "TranscriptText", "TranscriptWindow", "TranscriptPersistenceToken"})
                 compile.add(source.resolve(model + ".java").toString());
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(String[]::new)) != 0)
                 throw new AssertionError("真实摘要发布夹具编译失败");
@@ -97,17 +114,24 @@ public final class RuntimeDialogPreviewTest {
             static final Map<String,DesktopConnection> desktopConnections=new HashMap<>();
             static final Map<Long,String> dialogMachines=new HashMap<>(),remoteIds=new HashMap<>();
             static final Map<String,Long> ids=new HashMap<>();static final Map<Long,TranscriptWindow> histories=new HashMap<>();
+            static final Map<Integer,HistoryView> historyViews=new HashMap<>();
+            static final java.util.concurrent.atomic.AtomicLong historyTokens=new java.util.concurrent.atomic.AtomicLong();
             static final Map<Long,Long> prefetchedRevisions=new HashMap<>();static final Set<Long> prefetching=new HashSet<>();
             static final Map<String,MessageObject> pendingMessages=new HashMap<>();static final Map<Long,TranscriptWindow> disk=new HashMap<>();
-            static final Queue prefetchQueue=new Queue();static int reads,saves;
+            static final Queue prefetchQueue=new Queue(),historyQueue=new Queue();static int reads,saves;
             static int recentDialogLimit(){return 2;}
             static long bindDialog(String machine,String remote,PasswordLogin.Session owner,long epoch){long id=ids.computeIfAbsent(machine+":"+remote,k->++nextId);dialogMachines.put(id,machine);remoteIds.put(id,remote);return id;}
             static TranscriptWindow readHistory(long id,String remote){reads++;return disk.getOrDefault(id,new TranscriptWindow());}
             static boolean saveHistory(long id,String remote,TranscriptWindow history){saves++;return true;}
-            static void logTranscriptFailure(String phase,Exception e,JsonObject page){}
+            /** 摘要专项观察真实读取失败；聊天候选不应进入未打开的夹具。 */
+            static void offerLatestHistory(long id,TranscriptWindow history){}
+            static boolean offerLatestHistory(HistoryView view,TranscriptWindow history,boolean explicit){throw new AssertionError("unexpected opened history view");}
+            static void logTranscriptFailure(String phase,Exception e,JsonObject page){lazyPreviewFailures++;}
             // 仅替代原 Android 消息转换边界，不在测试中实现预取、发布选择或迟到校验。
             static TLRPC.TL_message historyMessage(long id,TranscriptWindow.Entry entry){TLRPC.TL_message m=new TLRPC.TL_message();m.id=entry.id;m.dialog_id=id;m.date=(int)(entry.message.createdAtMs/1000);m.message=entry.message.text;m.out=entry.message.outgoing;if(entry.message.localId!=null)m.params.put("codexLocalId",entry.message.localId);if(!entry.message.attachments.isEmpty())m.params.put("codexAttachment","synthetic media");return m;}
             static MessageObject historyObject(int account,TLRPC.TL_message message){return new MessageObject(message);}
+            /** 与原测试相同的Android构造叶；新重载不替代摘要选择或IO算法。 */
+            static MessageObject historyObject(int account,TLRPC.TL_message message,boolean layout){return historyObject(account,message);}
             static class OutboxStore {static class Item {String localId,text;int messageId,date;Item(String local,String body,int id,int date){this.localId=local;this.text=body;this.messageId=id;this.date=date;}}ArrayList<Item> rows=new ArrayList<>();ArrayList<Item> list(String remote)throws IOException{return new ArrayList<>(rows);}}
             static final OutboxStore outbox=new OutboxStore();static OutboxStore outboxStore(long id){return outbox;}
             static boolean batchEchoed(OutboxStore.Item item,Set<String> echoed){return echoed.contains(item.localId);}
@@ -116,7 +140,7 @@ public final class RuntimeDialogPreviewTest {
 
     private static final String SCENARIOS = """
             static void check(boolean value,String reason){if(!value)throw new AssertionError(reason);}
-            static void reset(){session=new PasswordLogin.Session();accountGeneration++;loggingOut=false;watchedDialog=0;nextId=0;reads=saves=0;desktopConnections.clear();dialogMachines.clear();remoteIds.clear();ids.clear();histories.clear();disk.clear();pendingMessages.clear();outbox.rows.clear();prefetchedRevisions.clear();prefetching.clear();MessagesController.instance.dialogMessage.clear();NotificationCenter.instance.previews=NotificationCenter.instance.other=0;Utilities.globalQueue.tasks.clear();AndroidUtilities.ui.tasks.clear();prefetchQueue.tasks.clear();ApplicationLoader.mainInterfacePaused=false;org.telegram.messenger.UserConfig.selectedAccount=0;}
+            static void reset(){historyViews.clear();historyQueue.tasks.clear();resetColdHistoryFixture();session=new PasswordLogin.Session();accountGeneration++;loggingOut=false;watchedDialog=0;nextId=0;reads=saves=0;desktopConnections.clear();dialogMachines.clear();remoteIds.clear();ids.clear();histories.clear();disk.clear();pendingMessages.clear();outbox.rows.clear();prefetchedRevisions.clear();prefetching.clear();MessagesController.instance.dialogMessage.clear();NotificationCenter.instance.previews=NotificationCenter.instance.other=0;Utilities.globalQueue.tasks.clear();AndroidUtilities.ui.tasks.clear();prefetchQueue.tasks.clear();ApplicationLoader.mainInterfacePaused=false;org.telegram.messenger.UserConfig.selectedAccount=0;}
             static JsonObject page(String source,String local,String role,String body,long time){JsonObject page=new JsonObject(),item=new JsonObject(),raw=new JsonObject(),content=new JsonObject();item.addProperty("id",source);if(local!=null)item.addProperty("localId",local);item.addProperty("createdAtMs",time);raw.addProperty("role",role);content.addProperty("type","text");content.addProperty("text",body);raw.add("content",content);item.add("raw",raw);JsonArray items=new JsonArray();items.add(item);page.add("items",items);page.addProperty("hasMore",false);page.addProperty("historyAvailability","available");page.addProperty("tailCursor","tail");page.addProperty("nextCursor","tail");return page;}
             static TranscriptWindow history(String source,String local,String role,String body,long time)throws Exception{TranscriptWindow h=new TranscriptWindow();h.prepend(page(source,local,role,body,time));return h;}
             static JsonArray candidates(){JsonObject c=new JsonObject();c.addProperty("remoteSessionId","qa");c.addProperty("updatedAtMs",1000);JsonArray cs=new JsonArray();cs.add(c);return cs;}
@@ -177,6 +201,40 @@ public final class RuntimeDialogPreviewTest {
                 check(visible(id)==fresh,"late outbox restore overwrote a newly created pending");
                 check(NotificationCenter.instance.other==0,"cold outbox restore generated chat or old-message notifications");
             }
-            public static void main(String[] args)throws Exception{cacheAndRevision();System.out.println("PASS cacheAndRevision");prefetchAndPending();System.out.println("PASS prefetchAndPending");lateOwners();System.out.println("PASS lateOwners");coldPending();System.out.println("PASS coldPending");}
+            /** 单行索引故障只在实际Content读取时发生，允许验证预览不清空与队列后继。 */
+            static int lazyPreviewReads,lazyPreviewFailures;
+            static TranscriptWindow badPreview()throws Exception{
+                TranscriptWindow original=history("bad-source",null,"agent","synthetic persisted",1000);
+                TranscriptWindow.IndexedSegment s=original.exportIndexedSegments().get(0);TranscriptWindow.RowRef row=s.rows.get(0);
+                TranscriptWindow.Body body=new TranscriptWindow.Body((TranscriptWindow.Content)()->{lazyPreviewReads++;throw new IOException("synthetic preview body failure");});
+                TranscriptWindow.RowRef bad=new TranscriptWindow.RowRef(row.id,row.sourceId,row.localId,row.outgoing,row.createdAtMs,body);
+                return TranscriptWindow.restoreIndexed(List.of(new TranscriptWindow.IndexedSegment(s.epoch,s.oldest,s.cursor,s.tailCursor,s.hasMore,s.loaded,s.complete,List.of(bad),s.sourceNumbers)));
+            }
+            /** 预览文件失败保留当前待发，不发空摘要；同批下一会话仍能完成。 */
+            static void lazyPreviewIo()throws Exception{
+                reset();lazyPreviewReads=lazyPreviewFailures=0;long bad=bindDialog("machine","bad",session,accountGeneration),good=bindDialog("machine","good",session,accountGeneration);
+                MessageObject retained=pending(bad,-7,"local-pending","synthetic pending remains",3);publishPendingPreview(0,accountGeneration,bad,new ArrayList<>(List.of(retained)),true);
+                TranscriptWindow broken=badPreview();disk.put(bad,broken);disk.put(good,history("good-source",null,"agent","synthetic next dialog",2000));
+                LinkedHashMap<String,Long> bindings=new LinkedHashMap<>();bindings.put("bad",bad);bindings.put("good",good);
+                restoreDialogPreviews(0,accountGeneration,"machine",bindings);pump();
+                check(visible(bad)==retained&&visible(good)!=null&&histories.get(bad)==broken,"IO changed original preview/root or stopped following dialog");
+                check(lazyPreviewReads==1&&lazyPreviewFailures==1,"restore did not report exactly one body error");
+                int notices=NotificationCenter.instance.previews;publishHistoryPreview(0,accountGeneration,bad,"bad","machine",null,broken);pump();
+                check(visible(bad)==retained&&NotificationCenter.instance.previews==notices&&lazyPreviewFailures==2,"publish error became empty successful preview");
+                check(NotificationCenter.instance.other==0,"preview IO generated chat terminal");
+                System.out.println("PASS lazy preview IO preserves pending and continues next dialog");
+            }
+            /** 账号或归属先失效时无需触碰正文，不能把不相关账号文件错误带入新会话。 */
+            static void lazyPreviewStale()throws Exception{
+                for(String kind:new String[]{"epoch","session","remote"}){
+                    reset();lazyPreviewReads=lazyPreviewFailures=0;long id=bindDialog("machine","qa",session,accountGeneration);disk.put(id,badPreview());
+                    restoreDialogPreviews(0,accountGeneration,"machine",Map.of("qa",id));
+                    if(kind.equals("epoch"))accountGeneration++;else if(kind.equals("session"))session=null;else remoteIds.put(id,"other");
+                    pump();check(lazyPreviewReads==0&&lazyPreviewFailures==0&&visible(id)==null,"stale preview read a body: "+kind);
+                }
+                System.out.println("PASS lazy preview stale guards run before body IO");
+            }
+
+            public static void main(String[] args)throws Exception{lazyPreviewIo();lazyPreviewStale();cacheAndRevision();System.out.println("PASS cacheAndRevision");prefetchAndPending();System.out.println("PASS prefetchAndPending");lateOwners();System.out.println("PASS lateOwners");coldPending();System.out.println("PASS coldPending");}
         """;
 }

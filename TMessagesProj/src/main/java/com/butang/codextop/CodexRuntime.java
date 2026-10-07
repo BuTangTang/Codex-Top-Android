@@ -1817,11 +1817,11 @@ public final class CodexRuntime {
                 return;
             }
             TranscriptWindow target = segment.target.window;
-            TranscriptWindow.Entry row = target.findSource(segment.target.sourceId, null);
+            Integer row = target.sourceNumber(segment.target.sourceId, null);
             synchronized (view) {
                 if (localHistorySelectionCurrent(selection) && histories.get(view.dialogId) == catalog.root
                         && catalog.root.segment(segment.target.epoch) == target
-                        && row != null && row.id == segment.target.anchorId) {
+                        && row != null && row == segment.target.anchorId) {
                     view.bookmarkWindow = target;
                     selection.ready = true;
                 }
@@ -1988,7 +1988,7 @@ public final class CodexRuntime {
                     || !historyViewCurrent(view, view.window) || view.intentRevision != revision || view.bookmarkRequest != request) return;
             TranscriptWindow root = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, view.remote));
             TranscriptWindow found = root.findSegment(sourceId, localId);
-            TranscriptWindow.Entry row = found == null ? null : found.findSource(sourceId, localId);
+            Integer row = found == null ? null : found.sourceNumber(sourceId, localId);
             final TranscriptWindow expected = view.window;
             view.bookmarkWindow = found;
             if (!historyViewCurrent(view, expected) || view.intentRevision != revision || view.bookmarkRequest != request) {
@@ -2004,7 +2004,7 @@ public final class CodexRuntime {
                     if (row != null) view.window = found;
                     view.bookmarkWindow = null;
                 }
-                completed.accept(new HistoryBookmark(row == null ? 0 : row.id, row == null ? null : found.epoch()));
+                completed.accept(new HistoryBookmark(row == null ? 0 : row, row == null ? null : found.epoch()));
             });
         });
     }
@@ -2027,7 +2027,7 @@ public final class CodexRuntime {
 
     /** 最新页固定展示30条，不继承手动翻旧的数量；排队成功返回真以排除同批增量重复交付。 */
     private static boolean offerLatestHistory(HistoryView view, TranscriptWindow root, boolean explicit) {
-        if (!historyViewCurrent(view, view.window) || root.before(0, 1).isEmpty()
+        if (!historyViewCurrent(view, view.window) || root.isEmpty()
                 || !explicit && (view.window == root || view.proposedWindow == root)) return false;
         if (view.window == null) view.window = root;
         view.proposedWindow = root;
@@ -2069,7 +2069,7 @@ public final class CodexRuntime {
     private static java.util.Set<HistoryView> completeInitialLoadsFromLatest(long dialogId,
             DesktopConnection connection, TranscriptWindow window) {
         java.util.Set<HistoryView> completed = new java.util.HashSet<>();
-        if (histories.get(dialogId) != window || window.before(0, 1).isEmpty()
+        if (histories.get(dialogId) != window || window.isEmpty()
                 || connection != dialogConnection(dialogId)) return completed;
         for (HistoryView view : historyViews.values()) {
             InitialLoadWaiter waiter = view.initialLoadWaiter;
@@ -2147,7 +2147,7 @@ public final class CodexRuntime {
     /** 只在 globalQueue 合并同一冷空 root 的同页请求；有正文和归档翻页仍走原入口。 */
     private static boolean joinColdHistoryRequest(int account, long epoch, long dialogId, String remote,
             DesktopConnection connection, TranscriptWindow window, boolean latest, ColdHistorySubscriber subscriber) {
-        if (histories.get(dialogId) != window || !window.before(0, 1).isEmpty()
+        if (histories.get(dialogId) != window || !window.isEmpty()
                 || latest && (window.loaded || window.cursor != null && !window.cursor.isEmpty())
                 || !latest && (!window.loaded || window.cursor == null || window.cursor.isEmpty())) return false;
         ColdHistoryRequest request = coldHistoryRequests.get(dialogId);
@@ -2235,7 +2235,7 @@ public final class CodexRuntime {
             else if (!isAccountCurrent(request.accountEpoch) || request.connection != dialogConnection(request.dialogId)
                     || !java.util.Objects.equals(request.remote, remoteIds.get(request.dialogId)))
                 throw new IOException("历史连接已更换");
-            else if (histories.get(request.dialogId) != request.window || !request.window.before(0, 1).isEmpty()
+            else if (histories.get(request.dialogId) != request.window || !request.window.isEmpty()
                     || request.loaded != request.window.loaded
                     || !java.util.Objects.equals(request.cursor, request.window.cursor)
                     || !java.util.Objects.equals(request.tailCursor, request.window.tailCursor)) {
@@ -2257,7 +2257,7 @@ public final class CodexRuntime {
                     result.bootstrapAccepted = true;
                 } else request.window.prependWithCachedBridge(received);
                 result.success = true;
-                boolean visibleLatest = request.latest && result.bootstrapAccepted && !request.window.before(0, 1).isEmpty();
+                boolean visibleLatest = request.latest && result.bootstrapAccepted && !request.window.isEmpty();
                 if (!visibleLatest) result.saved = saveHistory(request.dialogId, request.remote, request.window);
                 try {
                     for (ColdHistorySubscriber subscriber : subscribers) {
@@ -2275,7 +2275,7 @@ public final class CodexRuntime {
                     }
                     publishHistoryPreview(request.account, request.accountEpoch, request.dialogId, request.remote,
                             request.connection.machineId, request.connection, request.window);
-                    if (!request.window.before(0, 1).isEmpty()) {
+                    if (!request.window.isEmpty()) {
                         for (HistoryView view : historyViews.values()) {
                             if (view.dialogId == request.dialogId && !result.loadViews.contains(view))
                                 offerLatestHistory(view, request.window, !request.latest);
@@ -2388,7 +2388,7 @@ public final class CodexRuntime {
                     TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
                     if (opening && takeColdHistoryHandoff(account, dialogId, connection, history)) opening = false;
                     final boolean latest = history.needsTailBootstrap()
-                            || opening && (openingTailAttempted || history.before(0, 1).isEmpty());
+                            || opening && (openingTailAttempted || history.isEmpty());
                     final boolean older = !latest && history.needsVisibleHistory();
                     final boolean openingTail = opening && !latest && !older;
                     // 每次重开至多探测一页；失败和迟回包仍沿原守卫及退避，不循环追旧增量。
@@ -2406,12 +2406,18 @@ public final class CodexRuntime {
                                 opening = false;
                                 takeColdHistoryHandoff(account, dialogId, connection, history);
                             }
-                            ArrayList<TranscriptWindow.Entry> added = latest
-                                    ? history.after(0, Integer.MAX_VALUE) : new ArrayList<>();
-                            java.util.Collections.reverse(added);
-                            deliverWatchedHistory(account, dialogId, generation, history, added, result.loadViews);
-                            delay = history.needsVisibleHistory() && ++consecutiveTailPages < 4 ? 0 : 2000;
-                            if (delay != 0) consecutiveTailPages = 0;
+                            try {
+                                ArrayList<TranscriptWindow.Entry> added = latest
+                                        ? history.after(0, Integer.MAX_VALUE) : new ArrayList<>();
+                                java.util.Collections.reverse(added);
+                                deliverWatchedHistory(account, dialogId, generation, history, added, result.loadViews);
+                                delay = history.needsVisibleHistory() && ++consecutiveTailPages < 4 ? 0 : 2000;
+                                if (delay != 0) consecutiveTailPages = 0;
+                            } catch (IOException error) {
+                                // 保留原退避并报告正文读取失败，不向聊天交付空成功。
+                                logTranscriptFailure("watch_delivery", error, null);
+                                consecutiveTailPages = 0;
+                            }
                         } else consecutiveTailPages = 0;
                         Utilities.globalQueue.postRunnable(next, delay);
                     }))) return;
@@ -2458,8 +2464,8 @@ public final class CodexRuntime {
                                             return;
                                         }
                                     }
-                                    ArrayList<TranscriptWindow.Entry> before = history.before(0, 1);
-                                    int lastId = before.isEmpty() ? 0 : before.get(0).id;
+                                    boolean wasEmpty = history.isEmpty();
+                                    int lastId = history.latestNumber();
                                     TranscriptWindow current = history;
                                     ArrayList<TranscriptWindow.Entry> added;
                                     if (latest) {
@@ -2476,16 +2482,16 @@ public final class CodexRuntime {
                                         if (openingTail) opening = false;
                                     }
                                     boolean needsSave = latest || older || !added.isEmpty() || !java.util.Objects.equals(previousCursor, current.tailCursor);
-                                    boolean visibleLatest = latest && !current.before(0, 1).isEmpty();
+                                    boolean visibleLatest = latest && !current.isEmpty();
                                     if (needsSave && !visibleLatest) saveHistory(dialogId, remote, current);
                                     try {
                                         publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, current);
                                         java.util.Set<HistoryView> initialLoads = latest
                                                 ? completeInitialLoadsFromLatest(dialogId, connection, current) : java.util.Collections.emptySet();
                                         // 只处理同根空转非空；后续普通增量仍沿原通知，不反复清屏或重开额度。
-                                        if (latest && current == history && before.isEmpty() && visibleLatest)
+                                        if (latest && current == history && wasEmpty && visibleLatest)
                                             offerFirstVisibleHistory(dialogId, current, initialLoads);
-                                        if (older && before.isEmpty() && !current.before(0, 1).isEmpty()) {
+                                        if (older && wasEmpty && !current.isEmpty()) {
                                             for (HistoryView view : historyViews.values())
                                                 if (view.dialogId == dialogId) offerLatestHistory(view, current, true);
                                         } else offerLatestHistory(dialogId, current);
@@ -2780,7 +2786,15 @@ public final class CodexRuntime {
                 }
                 long tracePreparedAt = beginHistoryTrace("preview_prepare");
                 java.util.Set<String> echoed = history.allOutgoingLocalIds();
-                ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
+                final ArrayList<TranscriptWindow.Entry> latest;
+                try { latest = history.before(0, 1); }
+                catch (IOException error) {
+                    // 坏正文保留原摘要并继续下一会话，不能用空历史冒充本地恢复成功。
+                    logTranscriptFailure("preview_history_restore", error, null);
+                    traceHistoryDuration("preview_prepare", tracePreparedAt);
+                    continueNext();
+                    return;
+                }
                 OutboxStore.Item newest = null;
                 try {
                     ArrayList<OutboxStore.Item> queued = outboxStore(dialogId).list(remote);
@@ -2836,7 +2850,13 @@ public final class CodexRuntime {
     private static void publishHistoryPreview(int account, long epoch, long dialogId, String remote, String machine,
             DesktopConnection connection, TranscriptWindow history) {
         if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
-        ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
+        final ArrayList<TranscriptWindow.Entry> latest;
+        try { latest = history.before(0, 1); }
+        catch (IOException error) {
+            // 预览失败不阻断已验证的新消息合入，也不清掉当前列表摘要。
+            logTranscriptFailure("preview_history", error, null);
+            return;
+        }
         if (latest.isEmpty()) return;
         TLRPC.TL_message message = historyMessage(dialogId, latest.get(0));
         java.util.Set<String> echoed = history.allOutgoingLocalIds();
@@ -3032,7 +3052,7 @@ public final class CodexRuntime {
             }
             boolean pruned = history.pruneMergedSegments(pinned);
             if (pruneOnly && !pruned) return true;
-            transcriptStore(dialogId).write(remote, history);
+            transcriptStore(dialogId).write(remote, history, new ArrayList<>(histories.values()));
             // 这里只减少已重复保存的内容，不借关闭页面改变原待发确认时序。
             if (pruneOnly) return true;
             // 先确认历史已落盘，之后才能删除同一发送编号的待发记录。
@@ -3139,9 +3159,9 @@ public final class CodexRuntime {
                     boolean newer = loadType == 1, around = loadType == 3;
                     ArrayList<TranscriptWindow.Entry> selected = around ? history.around(maxId, count)
                             : newer ? history.after(maxId, count + 1) : history.before(maxId, count + 1);
-                    boolean anchorFound = around && history.findNumber(maxId) != null;
+                    boolean anchorFound = around && history.containsNumber(maxId);
                     boolean missingOlderAnchor = around && count > 0 && maxId > 0 && !anchorFound
-                            && history.before(maxId, 1).isEmpty();
+                            && !history.hasBefore(maxId);
                     DesktopConnection connection = dialogConnection(dialogId);
                     // 普通首屏已有可见正文即交付，空投影仍沿原预算找正文；主动翻旧和定位保持补页。
                     boolean visibleLatest = mode == 0 && loadType == 2 && maxId == 0 && count > 0 && !selected.isEmpty();
@@ -3215,14 +3235,13 @@ public final class CodexRuntime {
         boolean newer = loadType == 1, around = loadType == 3;
         ArrayList<TranscriptWindow.Entry> selected = around ? history.around(maxId, count)
                 : newer ? history.after(maxId, count + 1) : history.before(maxId, count + 1);
-        boolean anchorFound = around && history.findNumber(maxId) != null;
+        boolean anchorFound = around && history.containsNumber(maxId);
         // 无后续游标只代表当前可读边界；本地仍有下一页时继续，不能把不完整来源标成complete。
         boolean end = around ? anchorFound && history.complete && !selected.isEmpty()
-                && history.before(selected.get(selected.size() - 1).id, 1).isEmpty()
+                && !history.hasBefore(selected.get(selected.size() - 1).id)
                 : (newer ? history.loaded && history.tailCursor != null : history.complete || !history.hasMore) && selected.size() <= count;
         if (newer && selected.size() > count) selected.remove(0);
-        ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
-        int loadedAnchor = maxId == 0 && loadType == 2 && !latest.isEmpty() ? latest.get(0).id : maxId;
+        int loadedAnchor = maxId == 0 && loadType == 2 && !history.isEmpty() ? history.latestNumber() : maxId;
         TranscriptWindow root = histories.get(view.dialogId);
         java.util.Set<String> echoed = (root == null ? history : root).allOutgoingLocalIds();
         ArrayList<OutboxStore.Item> restored = maxId == 0 && loadType == 2
@@ -3284,7 +3303,13 @@ public final class CodexRuntime {
             if (!historyViewCurrent(view, page.to) || view.intentRevision != page.acceptedRevision) return;
             TranscriptWindow root = histories.get(view.dialogId);
             if (root == null || !root.containsSegment(page.to)) return;
-            ArrayList<TranscriptWindow.Entry> extra = page.to.after(deliveredLastId, Integer.MAX_VALUE);
+            final ArrayList<TranscriptWindow.Entry> extra;
+            try { extra = page.to.after(deliveredLastId, Integer.MAX_VALUE); }
+            catch (IOException error) {
+                // 保留已经接纳的可见页；不可把未读取的尾部当空成功并确认待发。
+                logTranscriptFailure("accepted_history", error, null);
+                return;
+            }
             java.util.Collections.reverse(extra);
             java.util.Set<String> echoed = root.allOutgoingLocalIds();
             ArrayList<OutboxStore.Item> queued;
@@ -3443,7 +3468,7 @@ public final class CodexRuntime {
                                 publishHistoryRoot(dialogId, current);
                             } else if (older) history.prependWithCachedBridge(received);
                             else history.append(received);
-                            boolean visibleLatest = latestPage && !current.before(0, 1).isEmpty();
+                            boolean visibleLatest = latestPage && !current.isEmpty();
                             boolean saved = false;
                             if (!visibleLatest) saved = saveHistory(dialogId, remote, current);
                             try {

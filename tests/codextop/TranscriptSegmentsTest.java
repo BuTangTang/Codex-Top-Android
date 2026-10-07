@@ -79,7 +79,7 @@ public final class TranscriptSegmentsTest {
         check(legacy.equals(migratedFields), "v1 fields changed");
         String oldEpoch = migrated.epoch();
         TranscriptWindow latest = migrated.acceptLatest(page(true, "before-e", "tail-f", "e", "f"));
-        var directory = Files.createTempDirectory("transcript-segments-");
+        var directory = Files.createTempDirectory("transcript-segments-").toRealPath();
         try {
             TranscriptStore store = new TranscriptStore(directory.toFile(), "synthetic-server", "synthetic-account", "synthetic-machine");
             store.write("synthetic-thread", latest);
@@ -274,7 +274,7 @@ public final class TranscriptSegmentsTest {
     }
 
     /** 按用户实际看到的新到旧顺序比较真实来源身份。 */
-    private static String ids(TranscriptWindow window) {
+    private static String ids(TranscriptWindow window) throws IOException {
         java.util.StringJoiner result = new java.util.StringJoiner(",");
         for (TranscriptWindow.Entry entry : window.before(0, 1000)) result.add(entry.message.id);
         return result.toString();

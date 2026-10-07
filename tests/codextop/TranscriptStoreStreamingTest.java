@@ -22,14 +22,14 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import javax.tools.ToolProvider;
 
-/** 用真实窗口、UTF-8编码器和私有临时目录验证逐行缓存，与原snapshot字节直接对照。 */
+/** 新格式常态持久化另测；此专项验证真实Window逐行v2导出及独立回退文件，与冻结95字节对照。 */
 public final class TranscriptStoreStreamingTest {
     private static int scenarios;
     private static final String SERVER = "synthetic-server", ACCOUNT = "synthetic-account", MACHINE = "synthetic-machine";
 
     /** 新测试和实际模型均可用Java8编译；不访问账号、网络或真实消息。 */
     public static void main(String[] args) throws Exception {
-        Path root = Files.createTempDirectory("codex-stream-store-");
+        Path root = Files.createTempDirectory("codex-stream-store-").toRealPath();
         try {
             emptyFieldOrderAndNulls();
             escapedTextAndSplitSurrogates();
@@ -40,7 +40,7 @@ public final class TranscriptStoreStreamingTest {
             moveFailureCleansTemporary(root.resolve("move-failure"));
             readingKeepsOriginalParserAndDecoder(root.resolve("reader"));
             if (args.length > 0) originalSerializerOracle(java.nio.file.Paths.get(args[0]), root.resolve("baseline-classes"));
-            System.out.println("TranscriptStoreStreaming: scenarios=" + scenarios + " failures=0; Java8 synthetic file tests");
+            System.out.println("TranscriptStoreStreaming explicit rollback export: scenarios=" + scenarios + " failures=0; Java8 synthetic file tests");
         } finally {
             try (Stream<Path> paths = Files.walk(root)) {
                 for (Path path : paths.sorted(Comparator.reverseOrder()).toArray(Path[]::new)) Files.delete(path);
@@ -98,50 +98,59 @@ public final class TranscriptStoreStreamingTest {
         pass("v1 restore then v2 exact bytes");
     }
 
-    /** maxBytes按真实编码字节验正负一边界，包括最后close才排空的小文件，不能只数Java字符。 */
+    /** 显式回退导出按真实UTF8字节验正负一；新正常写入是索引+body，不把v2专项冒称正常保存。 */
     private static void exactByteBudget(Path root) throws Exception {
         TranscriptWindow window = window("budget", "汉🌌\n\"", null, 5, null);
         byte[] expected = window.snapshot().toString().getBytes(StandardCharsets.UTF_8);
         check(expected.length > window.snapshot().toString().length(), "fixture has no multibyte content");
-        TranscriptStore exact = store(root, expected.length);
-        exact.write("thread", window);
-        check(Arrays.equals(Files.readAllBytes(target(root, "thread")), expected), "exact byte budget failed");
-        store(root, expected.length + 1).write("thread", window);
-        FileTime modified = Files.getLastModifiedTime(target(root, "thread"));
-        expectWriteFailure(store(root, expected.length - 1), "thread", window);
-        check(Arrays.equals(Files.readAllBytes(target(root, "thread")), expected)
-                && modified.equals(Files.getLastModifiedTime(target(root, "thread"))), "close-time overflow changed old cache");
+        Path cache=root.resolve("cache"),exported=root.resolve("exported");
+        store(cache,64L*1024*1024).write("thread",window);
+        TranscriptStore exact = store(cache, expected.length);
+        exact.exportForRollback("thread",window,exported);
+        check(Arrays.equals(Files.readAllBytes(target(exported,"thread")), expected), "exact byte budget failed");
+        store(cache, expected.length + 1).exportForRollback("thread",window,exported);
+        FileTime modified = Files.getLastModifiedTime(target(exported,"thread"));
+        expectExportFailure(store(cache, expected.length - 1), "thread", window,exported);
+        check(Arrays.equals(Files.readAllBytes(target(exported,"thread")), expected)
+                && modified.equals(Files.getLastModifiedTime(target(exported,"thread"))), "close-time overflow changed old export");
         assertNoTemporary(root);
-        pass("exact UTF8 bytes and plus/minus one boundary");
+        pass("explicit export exact UTF8 bytes and plus/minus one boundary");
     }
 
-    /** 大于全部输出缓冲后才触发上限，旧文件、其他会话及待发均保留，失败不触发总预算淘汰。 */
+    /** 大于全部输出缓冲后才触发导出上限，旧导出、其他会话及待发保留，正式索引不受影响。 */
     private static void midWriteFailurePreservesOldAndOutbox(Path root) throws Exception {
+        Path cache=root.resolve("cache"),exported=root.resolve("exported");
         TranscriptWindow old = window("old", "cached", "old-local", 6, null);
-        TranscriptStore store = store(root, 12000);
-        store.write("thread", old); store.write("other", old);
-        byte[] before = Files.readAllBytes(target(root, "thread")), other = Files.readAllBytes(target(root, "other"));
-        OutboxStore outbox = new OutboxStore(root.resolve("outbox").toFile(), SERVER, ACCOUNT, MACHINE);
+        TranscriptStore store = store(cache,64L*1024*1024);
+        store.write("thread",old);TranscriptWindow otherWindow=TranscriptWindow.restore(old.snapshot());store.write("other",otherWindow);
+        TranscriptStore exporter=store(cache,12000);
+        exporter.exportForRollback("thread",old,exported);exporter.exportForRollback("other",otherWindow,exported);
+        byte[] before = Files.readAllBytes(target(exported,"thread")), other = Files.readAllBytes(target(exported,"other"));
+        OutboxStore outbox = new OutboxStore(exported.resolve("outbox").toFile(), SERVER, ACCOUNT, MACHINE);
         outbox.put(new OutboxStore.Item("pending", "thread", "synthetic pending", -1, 1));
-        TranscriptWindow large = window("large", repeat("汉🌌abc", 9000), null, 7, null);
-        expectWriteFailure(store, "thread", large);
-        check(Arrays.equals(before, Files.readAllBytes(target(root, "thread")))
-                && Arrays.equals(other, Files.readAllBytes(target(root, "other"))), "mid-write overflow replaced/trimmed cache");
-        check(outbox.list("thread").size() == 1 && "pending".equals(outbox.list("thread").get(0).localId), "write failure touched outbox");
-        check(store.read("thread").findSource("old", "old-local") != null, "old cache no longer reopens");
+        TranscriptWindow large=store.read("thread");large.append(page("large", repeat("汉🌌abc", 9000), null, 7, null));store.write("thread",large);
+        Path current=target(cache,"thread").resolveSibling(TranscriptStore.digest("thread")+".window");byte[] committed=Files.readAllBytes(current);
+        expectExportFailure(exporter, "thread", large,exported);
+        check(Arrays.equals(before, Files.readAllBytes(target(exported,"thread")))
+                && Arrays.equals(other, Files.readAllBytes(target(exported,"other"))), "mid-write overflow replaced/trimmed export");
+        check(Arrays.equals(committed,Files.readAllBytes(current)),"failed export changed live index");
+        check(outbox.list("thread").size() == 1 && "pending".equals(outbox.list("thread").get(0).localId), "export failure touched outbox");
+        check(store(exported,12000).read("thread").findSource("old", "old-local") != null, "old export no longer reopens");
         assertNoTemporary(root);
-        pass("mid-write overflow preserves old file/other/outbox and cleans tmp");
+        pass("mid-export overflow preserves old file/other/outbox and live index");
     }
 
-    /** 实际原子move失败也必须清临时文件，不清理原目标或先运行淘汰。 */
+    /** 独立导出的真实原子move失败必须清pending，非空原目标保留；没有常态v2写入假象。 */
     private static void moveFailureCleansTemporary(Path root) throws Exception {
-        Path directoryTarget = target(root, "thread");
+        Path cache=root.resolve("cache"),exported=root.resolve("exported");
+        TranscriptWindow window=window("move", "text", null, 8, null);TranscriptStore source=store(cache,100000);source.write("thread",window);
+        Path directoryTarget = target(exported, "thread");
         Files.createDirectories(directoryTarget);
         Path retained = directoryTarget.resolve("retained"); Files.write(retained, new byte[]{1, 2, 3});
-        expectWriteFailure(store(root, 100000), "thread", window("move", "text", null, 8, null));
-        check(Arrays.equals(Files.readAllBytes(retained), new byte[]{1, 2, 3}), "move failure changed previous target");
+        expectExportFailure(source, "thread", window,exported);
+        check(Arrays.equals(Files.readAllBytes(retained), new byte[]{1, 2, 3}), "move failure changed previous export target");
         assertNoTemporary(root);
-        pass("atomic move failure and temporary cleanup");
+        pass("explicit export atomic move failure and pending cleanup");
     }
 
     /** 与旧new String+parseString逐项比较，含非法UTF8替换、BOM、空白、宽松语法及尾随坏数据。 */
@@ -269,12 +278,12 @@ public final class TranscriptStoreStreamingTest {
 
     private static TranscriptStore store(Path root, long limit) { return new TranscriptStore(root.toFile(), SERVER, ACCOUNT, MACHINE, limit); }
     private static Path target(Path root, String thread) { return root.resolve(TranscriptStore.digest(SERVER + "\n" + ACCOUNT + "\n" + MACHINE)).resolve(TranscriptStore.digest(thread) + ".json"); }
-    private static void expectWriteFailure(TranscriptStore store, String thread, TranscriptWindow window) throws Exception {
-        try { store.write(thread, window); throw new AssertionError("expected bounded/atomic write failure"); }
+    private static void expectExportFailure(TranscriptStore store, String thread, TranscriptWindow window,Path destination) throws Exception {
+        try { store.exportForRollback(thread, window,destination); throw new AssertionError("expected bounded/atomic write failure"); }
         catch (IOException expected) { }
     }
     private static void assertNoTemporary(Path root) throws Exception {
-        try (Stream<Path> files = Files.walk(root)) { check(!files.anyMatch(path -> path.getFileName().toString().endsWith(".tmp")), "temporary file survived failure"); }
+        try (Stream<Path> files = Files.walk(root)) { check(!files.anyMatch(path -> (path.getFileName().toString().endsWith(".tmp")||path.getFileName().toString().endsWith(".pending"))), "temporary file survived failure"); }
     }
     private static String repeat(String value, int count) { StringBuilder result = new StringBuilder(); for (int i = 0; i < count; i++) result.append(value); return result.toString(); }
     private static void check(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
