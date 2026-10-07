@@ -54,7 +54,36 @@ public final class TranscriptTextTest {
         if (attached.size() != 2 || attached.get(1).outgoing || attached.get(1).attachments.get(0).isAvailable())
             throw new AssertionError("助手纯附件的不可用引用没有保留");
         multipleAttachmentRows();
+        assistantCitationBoundaries();
         System.out.println("TranscriptText: 主对话文字、来源身份与工具过滤通过");
+    }
+
+    /** 无精确标签的文字保持原样；带标签的内嵌、未闭合和末尾完整块仍沿原规则。 */
+    private static void assistantCitationBoundaries() {
+        String block = "<oai-mem-citation><citation_entries>synthetic</citation_entries>"
+                + "<rollout_ids></rollout_ids></oai-mem-citation>";
+        String[][] cases = {
+                {"普通文字🙂\n第二行\r\n", "普通文字🙂\n第二行\r\n"},
+                {"<oai-mem-citatio>", "<oai-mem-citatio>"},
+                {"<OAI-MEM-CITATION>", "<OAI-MEM-CITATION>"},
+                {"＜oai-mem-citation＞", "＜oai-mem-citation＞"},
+                {"内嵌 " + block, "内嵌 " + block},
+                {"正文\n<oai-mem-citation>", "正文\n<oai-mem-citation>"},
+                {"正文\n" + block + " 后文", "正文\n" + block + " 后文"},
+                {"正文\r\n" + block + "\r\n \t", "正文"},
+                {"正文\n" + block + "\n" + block, "正文"},
+                {block, ""}
+        };
+        for (int i = 0; i < cases.length; i++) {
+            for (String role : new String[]{"agent", "user"}) {
+                JsonArray items = new JsonArray();
+                items.add(item("boundary-" + i, role, "text", cases[i][0], null));
+                var rows = TranscriptText.read(items);
+                String expected = "user".equals(role) ? cases[i][0] : cases[i][1];
+                if (expected.isEmpty() ? !rows.isEmpty() : rows.size() != 1 || !rows.get(0).text.equals(expected))
+                    throw new AssertionError("引用边界改变正文或用户内容: " + i + "/" + role);
+            }
+        }
     }
 
     /** 同批文件仅在本地展开，第一行保留说明和原身份，其余行逐个派生身份。 */

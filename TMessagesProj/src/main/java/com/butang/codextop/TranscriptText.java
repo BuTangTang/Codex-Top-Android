@@ -79,8 +79,9 @@ public final class TranscriptText {
         return index == 0 || base == null || base.isEmpty() ? base : base + ":attachment:" + index;
     }
 
-    /** 仅移除独立位于回复末尾的完整内部引用块；正文中引用或未闭合内容原样保留。 */
+    /** 缺少必要字面开标签时跳过正则；存在时仍仅移除原规则认定的完整末尾引用块。 */
     private static String visibleAssistantText(String text) {
+        if (!text.contains("<oai-mem-citation>")) return text;
         return text.replaceFirst("(?s)(?:\\A|\\r?\\n)[\\t \\r\\n]*<oai-mem-citation>\\s*<citation_entries>.*?</citation_entries>\\s*<rollout_ids>.*?</rollout_ids>\\s*</oai-mem-citation>\\s*$", "");
     }
 
