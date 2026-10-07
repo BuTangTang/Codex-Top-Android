@@ -53,6 +53,15 @@ public final class GoalDisplayStore {
             this.records = Collections.unmodifiableList(new ArrayList<>(records));
             this.diagnostic = diagnostic;
         }
+
+        /** 同批次复用已验证的被动快照；匹配仍包含电脑、远端和实际来源。 */
+        public Record find(String machine, String remote, String sourceKind, String sourceHome) {
+            for (Record record : records)
+                if (machine.equals(record.machine) && remote.equals(record.remote)
+                        && sourceKind.equals(record.sourceKind) && sourceHome.equals(record.sourceHome))
+                    return record;
+            return null;
+        }
     }
 
     /** 先看文件大小，超限不解析。坏文件返回空投影和固定诊断。 */
@@ -70,11 +79,7 @@ public final class GoalDisplayStore {
 
     /** 按电脑、远端和实际来源查找。不把 goal.source 的 desktop 当作来源。 */
     public Record find(String machine, String remote, String sourceKind, String sourceHome) {
-        for (Record record : read().records)
-            if (machine.equals(record.machine) && remote.equals(record.remote)
-                    && sourceKind.equals(record.sourceKind) && sourceHome.equals(record.sourceHome))
-                return record;
-        return null;
+        return read().find(machine, remote, sourceKind, sourceHome);
     }
 
     /**

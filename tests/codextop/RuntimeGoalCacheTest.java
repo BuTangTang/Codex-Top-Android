@@ -22,7 +22,12 @@ public final class RuntimeGoalCacheTest {
         int found = 0;
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class))
             if (names.contains(method.getNameAsString())) { extracted.append(method).append('\n'); found++; }
-        if (found != names.size()) throw new AssertionError("原目标缓存入队或恢复方法缺失");
+        if (found != names.size() + 2) throw new AssertionError("原目标缓存入队或恢复方法缺失");
+        var batch = unit.getClassByName("CodexRuntime").orElseThrow().getMembers().stream()
+                .filter(member -> member.isClassOrInterfaceDeclaration()
+                        && member.asClassOrInterfaceDeclaration().getNameAsString().equals("GoalRestoreBatch"))
+                .findFirst().orElseThrow();
+        extracted.append(batch).append('\n');
         Path temporary = Files.createTempDirectory("codex-goal-runtime-");
         try {
             Path probe = temporary.resolve("RuntimeGoalCacheProbe.java");
@@ -118,8 +123,8 @@ public final class RuntimeGoalCacheTest {
                 observe("{\\"availability\\":\\"none\\",\\"source\\":\\"desktop\\"}", 330);
                 watchedDialog = 7;
                 stopWatching(7);
-                check(Utilities.globalQueue.tasks.size() == 1, "返回取消了已确认的无目标写入");
-                Utilities.globalQueue.next();
+                check(Utilities.globalQueue.tasks.size() == 2, "返回取消了已确认的无目标写入或没有安排watch收尾");
+                Utilities.globalQueue.all();
                 check("none".equals(goalDisplayStore(owner).find("machine", "remote", "codexHome", "user").availability), "返回后没有落地明确无目标");
                 dialogMachines.put(15L, "machine"); remoteIds.put(15L, "remote");
                 publishDialogFacts(15, "machine", row("remote"), 10, 11, true);
@@ -293,6 +298,9 @@ public final class RuntimeGoalCacheTest {
             static final java.util.List<Object> dialogs = new ArrayList<>();
             static final SessionStatus.Store statuses = new SessionStatus.Store();
             static final org.telegram.messenger.DispatchQueue statusQueue = new org.telegram.messenger.DispatchQueue("status"), dialogQueue = new org.telegram.messenger.DispatchQueue("dialog"), sendQueue = new org.telegram.messenger.DispatchQueue("send"), approvalQueue = new org.telegram.messenger.DispatchQueue("approval"), transcriptQueue = new org.telegram.messenger.DispatchQueue("transcript"), historyQueue = new org.telegram.messenger.DispatchQueue("history"), prefetchQueue = new org.telegram.messenger.DispatchQueue("prefetch");
+            static final Map<Object, Object> historyViews = new HashMap<>(), coldHistoryRequests = new HashMap<>();
+            static final class WatchConnectionWait { long generation, dialogId; Runnable runnable; }
+            static WatchConnectionWait watchConnectionWait;
             static Runnable statusPoll;
             static DesktopConnection observationOwner;
             static long observationDialog, observationRenewAt;

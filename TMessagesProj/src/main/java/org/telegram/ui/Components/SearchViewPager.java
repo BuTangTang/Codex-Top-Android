@@ -1239,6 +1239,17 @@ public class SearchViewPager extends ViewPagerFixed implements FilteredSearchVie
         }
     }
 
+    /** 切换显式搜索意图时撤旧查询并重建原页目录，不复用上一页的过滤条件或位置。 */
+    public void resetCodexSearchMode() {
+        lastSearchString = null;
+        currentSearchFilters.clear();
+        expandedPublicPosts = false;
+        showOnlyDialogsAdapter = parent.isCodexDirectorySearch();
+        dialogsSearchAdapter.resetCodexSearch();
+        updateTabs();
+        setPosition(0);
+    }
+
     public void reset() {
         setPosition(0);
         if (dialogsSearchAdapter.getItemCount() > 0) {
@@ -1538,9 +1549,13 @@ public class SearchViewPager extends ViewPagerFixed implements FilteredSearchVie
             updateItems();
         }
 
+        /** 本地目录模式仅保留原会话页，避免其余标签启动 Telegram 搜索。 */
         public void updateItems() {
             items.clear();
             items.add(new Item(DIALOGS_TYPE));
+            if (parent.isCodexDirectorySearch()) {
+                return;
+            }
             if (communityId != 0) {
                 return;
             }

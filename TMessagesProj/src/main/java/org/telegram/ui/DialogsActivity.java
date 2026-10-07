@@ -328,6 +328,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
     private boolean canShowFilterTabsView;
     private int initialSearchType = -1;
+    private boolean codexSpecialSearchIntent;
 
     private final String ACTION_MODE_SEARCH_DIALOGS_TAG = "search_dialogs_action_mode";
     private boolean rightFragmentTransitionInProgress;
@@ -7411,6 +7412,26 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
+    /** 普通 Codex 首页仅搜索本地目录；显式下载或媒体入口保留原搜索。 */
+    public boolean isCodexDirectorySearch() {
+        return isCodexSearchRoot() && !codexSpecialSearchIntent;
+    }
+
+    /** 同一普通根的本地目录和显式媒体搜索共用查询代次，其他页面不受影响。 */
+    public boolean isCodexSearchRoot() {
+        return shouldDeferCodexSearchPreload();
+    }
+
+    /** 原搜索入口携带媒体或下载意图；关闭后恢复普通本地目录，重复展开保留当前意图。 */
+    private void updateCodexSearchIntent(boolean show, boolean startFromDownloads) {
+        if (!shouldDeferCodexSearchPreload()) return;
+        boolean special = show && (startFromDownloads || initialSearchType >= 0
+                || searchIsShowed && codexSpecialSearchIntent);
+        if (codexSpecialSearchIntent == special) return;
+        codexSpecialSearchIntent = special;
+        if (searchViewPager != null) searchViewPager.resetCodexSearchMode();
+    }
+
     /** 只延后普通 Codex 三栏首页的隐藏搜索树，不改变归档、选择、预置搜索或预览。 */
     private boolean shouldDeferCodexSearchPreload() {
         return com.butang.codextop.CodexRuntime.enabled() && hasMainTabs
@@ -7542,7 +7563,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         showSearch(show, startFromDownloads, animated, false);
     }
 
+    /** 沿原搜索开关展示页面，先确定普通目录与显式媒体入口的意图。 */
     private void showSearch(boolean show, boolean startFromDownloads, boolean animated, boolean forceNotOnlyDialogs) {
+        updateCodexSearchIntent(show, startFromDownloads);
         animatorSearchVisible.setValue(show, animated);
 
         if (!show) {
@@ -7561,7 +7584,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         blur3_InvalidateBlur();
         if (show) {
             boolean onlyDialogsAdapter;
-            if (searchFiltersWasShowed || forceNotOnlyDialogs) {
+            if (isCodexDirectorySearch()) {
+                onlyDialogsAdapter = true;
+            } else if (shouldDeferCodexSearchPreload() && codexSpecialSearchIntent || searchFiltersWasShowed || forceNotOnlyDialogs) {
                 onlyDialogsAdapter = false;
             } else {
                 onlyDialogsAdapter = onlyDialogsAdapter();
@@ -12757,7 +12782,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         return isArchive() || rightSlidingDialogContainer.isOpenned ? INavigationLayout.BackButtonState.BACK : INavigationLayout.BackButtonState.MENU;
     }
 
+    /** 保留原媒体搜索跳转；已展开的本地目录也先切回原媒体页再应用查询。 */
     public void setShowSearch(String query, int i) {
+        if (shouldDeferCodexSearchPreload() && i >= 0) {
+            initialSearchType = i;
+            updateCodexSearchIntent(true, false);
+            if (searching) showSearch(true, false, false, true);
+        }
         if (!searching) {
             initialSearchType = i;
             fragmentSearchField.editText.setText(query);

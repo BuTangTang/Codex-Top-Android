@@ -305,6 +305,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         return false;
     }
 
+    /** 保留原适配器；本地目录模式不加载 Telegram recent/hints。 */
     public DialogsSearchAdapter(Context context, DialogsActivity dialogsActivity, int messagesSearch, int type, DefaultItemAnimator itemAnimator, boolean allowGlobalSearch, Theme.ResourcesProvider resourcesProvider) {
         this.itemAnimator = itemAnimator;
         this.dialogsActivity = dialogsActivity;
@@ -317,7 +318,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         };
         searchAdapterHelper.setDelegate(new SearchAdapterHelper.SearchAdapterHelperDelegate() {
             @Override
+            /** 忽略已切回本地目录或失效查询的 Telegram 完成通知。 */
             public void onDataSetChanged(int searchId) {
+                if (dialogsActivity.isCodexDirectorySearch()) return;
                 waitingResponseCount--;
                 lastGlobalSearchId = searchId;
                 if (lastLocalSearchId != searchId) {
@@ -337,7 +340,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
             }
 
             @Override
+            /** 本地目录不接纳迟到的 Telegram 标签提示。 */
             public void onSetHashtags(ArrayList<SearchAdapterHelper.HashtagObject> arrayList, HashMap<String, SearchAdapterHelper.HashtagObject> hashMap) {
+                if (dialogsActivity.isCodexDirectorySearch()) return;
                 for (int a = 0; a < arrayList.size(); a++) {
                     searchResultHashtags.add(arrayList.get(a).hashtag);
                 }
@@ -348,8 +353,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
             }
 
             @Override
+            /** 旧远端结果不得写入本地目录或另一查询。 */
             public boolean canApplySearchResults(int searchId) {
-                return searchId == lastSearchId;
+                return !dialogsActivity.isCodexDirectorySearch() && searchId == lastSearchId;
             }
         });
         searchAdapterHelper.setAllowGlobalResults(allowGlobalSearch);
@@ -357,8 +363,10 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         needMessagesSearch = messagesSearch;
         dialogsType = type;
         selfUserId = UserConfig.getInstance(currentAccount).getClientUserId();
-        loadRecentSearch();
-        MediaDataController.getInstance(currentAccount).loadHints(true);
+        if (!dialogsActivity.isCodexDirectorySearch()) {
+            loadRecentSearch();
+            MediaDataController.getInstance(currentAccount).loadHints(true);
+        }
     }
 
     public RecyclerListView getInnerListView() {
@@ -373,7 +381,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         return (delegate.getSearchForumDialogId() == 0 || localMessagesSearchEndReached) && messagesSearchEndReached;
     }
 
+    /** 本地目录模式不启动 Telegram 搜索或 recent 读取，其他入口不变。 */
     public void loadMoreSearchMessages() {
+        if (dialogsActivity.isCodexDirectorySearch()) return;
         if (reqForumId != 0 && reqId != 0) {
             return;
         }
@@ -391,6 +401,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         return lastMessagesSearchString;
     }
 
+    /** 沿原论坛请求链工作；普通根清空时不复用旧请求编号。 */
     private void searchForumMessagesInternal(final String query, int searchId) {
         if (delegate == null || delegate.getSearchForumDialogId() == 0) {
             return;
@@ -406,7 +417,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
             filteredRecentQuery = null;
             searchResultMessages.clear();
             searchForumResultMessages.clear();
-            lastForumReqId = 0;
+            lastForumReqId = dialogsActivity.isCodexSearchRoot() ? lastForumReqId + 1 : 0;
             lastMessagesSearchString = null;
             searchWas = false;
             notifyDataSetChanged();
@@ -515,6 +526,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         notifyDataSetChanged();
     }
 
+    /** 沿原消息请求链工作；普通根清空时不复用旧请求编号。 */
     private void searchMessagesInternal(final String query, int searchId) {
         if (needMessagesSearch == 0 || TextUtils.isEmpty(lastMessagesSearchString) && TextUtils.isEmpty(query)) {
             return;
@@ -527,7 +539,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
             filteredRecentQuery = null;
             searchResultMessages.clear();
             searchForumResultMessages.clear();
-            lastReqId = 0;
+            lastReqId = dialogsActivity.isCodexSearchRoot() ? lastReqId + 1 : 0;
             lastMessagesSearchString = null;
             lastMessagesSearchFilterFlags = 0;
             searchWas = false;
@@ -719,7 +731,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         return needMessagesSearch != 2 && hasRecentSearch();
     }
 
+    /** 本地目录模式不启动 Telegram 搜索或 recent 读取，其他入口不变。 */
     public void loadRecentSearch() {
+        if (dialogsActivity.isCodexDirectorySearch()) return;
         if (dialogsType == DialogsActivity.DIALOGS_TYPE_BOT_REQUEST_PEER) {
             return;
         }
@@ -926,7 +940,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         searchAdapterHelper.addHashtagsFromMessage(message);
     }
 
+    /** 本地目录不接纳先前 Telegram recent 异步读取，原特殊入口仍可恢复它。 */
     private void setRecentSearch(ArrayList<RecentSearchObject> arrayList, LongSparseArray<RecentSearchObject> hashMap) {
+        if (dialogsActivity.isCodexDirectorySearch()) return;
         recentSearchObjects = arrayList;
         recentSearchObjectsById = hashMap;
         for (int a = 0; a < recentSearchObjects.size(); a++) {
@@ -943,13 +959,14 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         notifyDataSetChanged();
     }
 
+    /** 保留原数据库搜索；迟到的过滤提示不得影响当前本地目录。 */
     private void searchDialogsInternal(final String query, final int searchId) {
         if (needMessagesSearch == 2) {
             return;
         }
         String q = query.trim().toLowerCase();
         if (q.length() == 0) {
-            lastSearchId = 0;
+            lastSearchId = dialogsActivity.isCodexSearchRoot() ? lastSearchId + 1 : 0;
             updateSearchResults(new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), new ArrayList<>(), lastSearchId);
             return;
         }
@@ -967,7 +984,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                 localTipArchive = true;
             }
             AndroidUtilities.runOnUIThread(() -> {
-                if (filtersDelegate != null) {
+                if (!dialogsActivity.isCodexDirectorySearch() && (!dialogsActivity.isCodexSearchRoot() || searchId == lastSearchId) && filtersDelegate != null) {
                     filtersDelegate.updateFiltersView(false, null, localTipDates, localTipArchive);
                 }
             });
@@ -975,8 +992,10 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
     }
 
 
+    /** 只接纳仍属当前 Telegram 查询的本地数据库结果，先拒迟回再变更计数和行。 */
     private void updateSearchResults(final ArrayList<Object> result, final ArrayList<CharSequence> names, final ArrayList<TLRPC.User> encUsers,  final ArrayList<ContactsController.Contact> contacts, final int searchId) {
         AndroidUtilities.runOnUIThread(() -> {
+            if (dialogsActivity.isCodexDirectorySearch()) return;
             waitingResponseCount--;
             if (searchId != lastSearchId) {
                 return;
@@ -1075,9 +1094,81 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         notifyDataSetChanged();
     }
 
+    /** 只读当前目录元数据并复用原用户身份和结果列表，不读取正文或请求网络。 */
+    private void searchCodexDirectory(String text, int folderId) {
+        if (searchRunnable != null) { Utilities.searchQueue.cancelRunnable(searchRunnable); searchRunnable = null; }
+        if (searchRunnable2 != null) { AndroidUtilities.cancelRunOnUIThread(searchRunnable2); searchRunnable2 = null; }
+        if (searchHashtagRunnable != null) { AndroidUtilities.cancelRunOnUIThread(searchHashtagRunnable); searchHashtagRunnable = null; }
+        if (reqId != 0) { ConnectionsManager.getInstance(currentAccount).cancelRequest(reqId, true); reqId = 0; }
+        if (reqForumId != 0) { ConnectionsManager.getInstance(currentAccount).cancelRequest(reqForumId, true); reqForumId = 0; }
+        if (sponsoredReqId != 0) { ConnectionsManager.getInstance(currentAccount).cancelRequest(sponsoredReqId, true); sponsoredReqId = 0; }
+        if (searchHashtagRequest >= 0) { ConnectionsManager.getInstance(currentAccount).cancelRequest(searchHashtagRequest, true); searchHashtagRequest = -1; }
+        lastReqId++;
+        lastForumReqId++;
+        // 原 helper 同时撤销 pending 请求；先失效旧查询，再允许它同步清理结果。
+        lastSearchId++;
+        searchAdapterHelper.queryServerSearch(null, true, true, true, true, false, 0, true, 0, lastSearchId, 0);
+        sponsoredQuery = null;
+        lastSearchText = text;
+        lastMessagesSearchString = text;
+        this.folderId = folderId;
+        waitingResponseCount = 0;
+        String query = text == null ? "" : text.trim().toLowerCase(java.util.Locale.ROOT);
+        searchWas = !query.isEmpty();
+        searchResult.clear();
+        searchResultNames.clear();
+        searchResultMessages.clear();
+        searchForumResultMessages.clear();
+        searchResultHashtags.clear();
+        searchContacts.clear();
+        searchTopics.clear();
+        publicPosts.clear();
+        sponsoredPeers.clear();
+        searchAdapterHelper.clear();
+        searchAdapterHelper.getPhoneSearch().clear();
+        messagesSearchEndReached = localMessagesSearchEndReached = true;
+        forceLoadingMessages = false;
+        currentMessagesFilter = Filter.All;
+        if (!query.isEmpty() && currentAccount == UserConfig.selectedAccount
+                && com.butang.codextop.CodexRuntime.loggedIn()) {
+            MessagesController controller = MessagesController.getInstance(currentAccount);
+            for (TLRPC.Dialog dialog : com.butang.codextop.CodexRuntime.dialogs()) {
+                if (!com.butang.codextop.CodexRuntime.ownsConversation(dialog.id)) continue;
+                TLRPC.User user = controller.getUser(dialog.id);
+                if (user == null) continue;
+                com.butang.codextop.CodexRuntime.ConversationInfo info = com.butang.codextop.CodexRuntime.conversationInfo(dialog.id);
+                if (info.title.toLowerCase(java.util.Locale.ROOT).contains(query)
+                        || info.machineName.toLowerCase(java.util.Locale.ROOT).contains(query)
+                        || info.workingDirectory.toLowerCase(java.util.Locale.ROOT).contains(query)) {
+                    searchResult.add(user);
+                    searchResultNames.add(info.title);
+                }
+            }
+        }
+        notifyDataSetChanged();
+        if (delegate != null) {
+            delegate.searchStateChanged(false, true);
+            delegate.runResultsEnterAnimation();
+        }
+    }
+
+    /** 只在普通根的搜索意图改变时调用；特殊入口按原方式加载 recent/hints。 */
+    public void resetCodexSearch() {
+        searchCodexDirectory(null, folderId);
+        if (!dialogsActivity.isCodexDirectorySearch()) {
+            loadRecentSearch();
+            MediaDataController.getInstance(currentAccount).loadHints(true);
+        }
+    }
+
     int waitingResponseCount;
 
+    /** 普通 Codex 根同步搜索现有目录；Telegram 搜索仍走原异步请求链。 */
     public void searchDialogs(String text, int folderId, boolean allowPublicPosts) {
+        if (dialogsActivity.isCodexDirectorySearch()) {
+            searchCodexDirectory(text, folderId);
+            return;
+        }
         if (text != null && text.equals(lastSearchText) && (folderId == this.folderId || TextUtils.isEmpty(text))) {
             return;
         }
@@ -1118,7 +1209,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
             } else {
                 final TLRPC.TL_contacts_getSponsoredPeers req = new TLRPC.TL_contacts_getSponsoredPeers();
                 req.q = sponsoredQuery = query;
+                final int sponsoredSearchId = lastSearchId + 1;
                 sponsoredReqId = ConnectionsManager.getInstance(currentAccount).sendRequest(req, (res, err) -> AndroidUtilities.runOnUIThread(() -> {
+                    if (dialogsActivity.isCodexDirectorySearch() || dialogsActivity.isCodexSearchRoot() && sponsoredSearchId != lastSearchId) return;
                     sponsoredReqId = 0;
                     if (res instanceof TLRPC.TL_contacts_sponsoredPeersEmpty) {
                         if (!sponsoredPeers.isEmpty()) {
@@ -1162,7 +1255,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                 );
             }
             searchWas = false;
-            lastSearchId = 0;
+            lastSearchId = dialogsActivity.isCodexSearchRoot() ? lastSearchId + 1 : 0;
             waitingResponseCount = 0;
             globalSearchCollapsed = true;
             phoneCollapsed = true;
@@ -1326,7 +1419,9 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
         }
     }
 
+    /** 本地目录结果不混入 Telegram recent/hints，保持原行号对应关系。 */
     public int getRecentItemsCount() {
+        if (dialogsActivity.isCodexDirectorySearch()) return 0;
         ArrayList<RecentSearchObject> recent = searchWas ? filtered2RecentSearchObjects : filteredRecentSearchObjects;
         return (!recent.isEmpty() ? recent.size() + 1 : 0) + (hasHints() ? 1 : 0);
     }
@@ -1710,6 +1805,7 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
 
     private int messagesSectionPosition = -1;
 
+    /** 普通 Codex 目录显式绑定任务呈现；媒体、下载和 Telegram 搜索继续原联系人行。 */
     @Override
     public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
         switch (holder.getItemViewType()) {
@@ -1916,7 +2012,10 @@ public class DialogsSearchAdapter extends RecyclerListView.SelectionAdapter {
                 cell.allowBotOpenButton(isRecent, this::openBotApp);
                 cell.setOnSponsoredOptionsClick(this::openSponsoredOptions);
                 cell.setAd(obj instanceof TLRPC.TL_sponsoredPeer ? (TLRPC.TL_sponsoredPeer) obj : null);
-                cell.setData(user != null ? user : chat, encryptedChat, name, username, true, savedMessages);
+                boolean codexResult = dialogsActivity.isCodexDirectorySearch() && user != null
+                        && currentAccount == UserConfig.selectedAccount
+                        && com.butang.codextop.CodexRuntime.ownsConversation(user.id);
+                cell.setData(user != null ? user : chat, encryptedChat, name, username, true, savedMessages, codexResult);
                 cell.setChecked(delegate.isSelected(cell.getDialogId()), oldDialogId == cell.getDialogId());
                 break;
             }

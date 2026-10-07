@@ -80,6 +80,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
     public ImageReceiver avatarImage;
     private AvatarDrawable avatarDrawable;
     private CharSequence subLabel;
+    private boolean codexDirectoryResult;
     private Theme.ResourcesProvider resourcesProvider;
     private TLRPC.TL_sponsoredPeer ad;
 
@@ -210,16 +211,29 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
     public void setAllowEmojiStatus(boolean allowEmojiStatus) {
         this.allowEmojiStatus = allowEmojiStatus;
     }
+    /** 普通联系人绑定总是清除本地目录模式，保证回收复用回到 Telegram 原行为。 */
     public void setData(Object object, TLRPC.EncryptedChat ec, CharSequence n, CharSequence s, boolean needCount, boolean saved) {
+        setData(object, ec, n, s, needCount, saved, false);
+    }
+
+    /** 只有普通 Codex 本地目录显式启用任务行；保留原用户对象和点击身份。 */
+    public void setData(Object object, TLRPC.EncryptedChat ec, CharSequence n, CharSequence s, boolean needCount, boolean saved, boolean codexDirectoryResult) {
+        boolean modeChanged = this.codexDirectoryResult != (codexDirectoryResult && object instanceof TLRPC.User);
+        this.codexDirectoryResult = codexDirectoryResult && object instanceof TLRPC.User;
+        if (this.codexDirectoryResult) {
+            avatarStoryParams.reset();
+            actionButton = null;
+            actionLayout = null;
+        }
         currentName = n;
         if (object instanceof TLRPC.User) {
             user = (TLRPC.User) object;
             chat = null;
             contact = null;
-            final TL_account.RequirementToContact r = showPremiumBlocked && user != null ? MessagesController.getInstance(currentAccount).isUserContactBlocked(user.id) : null;
+            final TL_account.RequirementToContact r = !this.codexDirectoryResult && showPremiumBlocked && user != null ? MessagesController.getInstance(currentAccount).isUserContactBlocked(user.id) : null;
             premiumBlocked = DialogObject.isPremiumBlocked(r);
             starsPriceBlocked = DialogObject.getMessagesStarsPrice(r);
-            setOpenBotButton(allowBotOpenButton && user.bot_has_main_app);
+            setOpenBotButton(!this.codexDirectoryResult && allowBotOpenButton && user.bot_has_main_app);
         } else if (object instanceof TLRPC.Chat) {
             chat = (TLRPC.Chat) object;
             user = null;
@@ -241,9 +255,10 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         }
         encryptedChat = ec;
         subLabel = s;
-        drawCount = needCount;
-        savedMessages = saved;
+        drawCount = needCount && !this.codexDirectoryResult;
+        savedMessages = saved && !this.codexDirectoryResult;
         update(0);
+        if (modeChanged) requestLayout();
     }
 
     public void setSubLabel(CharSequence subLabel) {
@@ -391,6 +406,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), callCellStyle ? dp(56) : (dp(60) + (useSeparator ? 1 : 0)));
     }
 
+    /** 本地任务行把选择框放在尾侧；普通联系人仍按头像角标定位。 */
     @Override
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         if (user == null && chat == null && encryptedChat == null && contact == null) {
@@ -399,6 +415,10 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         if (checkBox != null) {
             int x = LocaleController.isRTL ? (right - left) - dp(42) : dp(42);
             int y = dp(36);
+            if (codexDirectoryResult) {
+                x = LocaleController.isRTL ? dp(14) : right - left - dp(14) - checkBox.getMeasuredWidth();
+                y = (bottom - top - checkBox.getMeasuredHeight()) / 2;
+            }
             checkBox.layout(x, y, x + checkBox.getMeasuredWidth(), y + checkBox.getMeasuredHeight());
         }
         if (changed) {
@@ -419,6 +439,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         sublabelOffsetY = y;
     }
 
+    /** 沿原两行文字排版；本地目录去头像槽，状态及来源只读原 Runtime。 */
     public void buildLayout() {
         CharSequence nameString = null;
         TextPaint currentNamePaint;
@@ -462,9 +483,9 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
                 nameLeft = dp(11);
             }
             nameLockTop = dp(21);
-            drawCheck = user.verified;
-            drawPremium = !savedMessages && MessagesController.getInstance(currentAccount).isPremiumUser(user);
-            updateStatus(drawCheck, user, null, false);
+            drawCheck = !codexDirectoryResult && user.verified;
+            drawPremium = !codexDirectoryResult && !savedMessages && MessagesController.getInstance(currentAccount).isPremiumUser(user);
+            updateStatus(drawCheck, codexDirectoryResult ? null : user, null, false);
         } else if (contact != null) {
             dialog_id = 0;
             if (!LocaleController.isRTL) {
@@ -488,6 +509,10 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
             statusLeft = dp(AndroidUtilities.leftBaseline);
         } else {
             statusLeft = dp(11);
+        }
+
+        if (codexDirectoryResult) {
+            nameLeft = statusLeft = dp(16);
         }
 
         if (ad != null) {
@@ -558,6 +583,17 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
             statusWidth = nameWidth = getMeasuredWidth() - nameLeft - dp(14);
         } else {
             statusWidth = nameWidth = getMeasuredWidth() - nameLeft - dp(AndroidUtilities.leftBaseline);
+        }
+        if (codexDirectoryResult) {
+            statusWidth = nameWidth = getMeasuredWidth() - dp(32);
+            if (checkBox != null && checkBox.isChecked()) {
+                statusWidth -= dp(32);
+                nameWidth -= dp(32);
+                if (LocaleController.isRTL) {
+                    nameLeft += dp(32);
+                    statusLeft += dp(32);
+                }
+            }
         }
         if (drawNameLock) {
             nameWidth -= dp(6) + Theme.dialogs_lockDrawable.getIntrinsicWidth();
@@ -668,7 +704,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
                     }
                 }
             }
-            if (savedMessages || UserObject.isReplyUser(user)) {
+            if (!codexDirectoryResult && (savedMessages || UserObject.isReplyUser(user))) {
                 statusString = null;
                 nameTop = dp(20);
             }
@@ -822,9 +858,22 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         rectangularAvatar = value;
     }
 
+    /** 本地任务刷新真实状态时不走联系人头像或在线状态；其他绑定保留原更新掩码。 */
     public void update(int mask) {
         TLRPC.FileLocation photo = null;
-        if (user != null) {
+        if (codexDirectoryResult) {
+            avatarImage.setImageBitmap((Drawable) null);
+            String subtitle = "状态暂不可用";
+            if (user != null && currentAccount == UserConfig.selectedAccount
+                    && com.butang.codextop.CodexRuntime.ownsConversation(user.id)) {
+                com.butang.codextop.CodexRuntime.ConversationInfo info = com.butang.codextop.CodexRuntime.conversationInfo(user.id);
+                subtitle = com.butang.codextop.CodexRuntime.statusText(user.id);
+                if (!TextUtils.isEmpty(info.machineName)) subtitle += " · " + info.machineName;
+            }
+            // 真值标签可在 TL_user 未变时更新，不借用联系人 status.expires 判断。
+            if (!TextUtils.equals(subLabel, subtitle)) mask = 0;
+            subLabel = subtitle;
+        } else if (user != null) {
             avatarDrawable.setInfo(currentAccount, user);
             if (UserObject.isReplyUser(user)) {
                 avatarDrawable.setAvatarType(AvatarDrawable.AVATAR_TYPE_REPLIES);
@@ -881,7 +930,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
                     continueUpdate = true;
                 }
             }
-            if (!continueUpdate && (mask & MessagesController.UPDATE_MASK_EMOJI_STATUS) != 0 && (user != null || chat != null)) {
+            if (!codexDirectoryResult && !continueUpdate && (mask & MessagesController.UPDATE_MASK_EMOJI_STATUS) != 0 && (user != null || chat != null)) {
                 updateStatus(user != null ? user.verified : chat.verified, user, chat, true);
             }
             if (!continueUpdate && ((mask & MessagesController.UPDATE_MASK_NAME) != 0 && user != null) || (mask & MessagesController.UPDATE_MASK_CHAT_NAME) != 0 && chat != null) {
@@ -935,6 +984,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
     private PremiumGradient.PremiumGradientTools premiumGradient;
     private Drawable lockDrawable;
 
+    /** 本地目录只绘制任务文字和原选择态，不绘制头像、故事或联系人付费角标。 */
     @Override
     protected void onDraw(Canvas canvas) {
         if (user == null && chat == null && encryptedChat == null && contact == null) {
@@ -950,9 +1000,9 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
                 dividerPaint = Theme.dividerPaint;
             }
             if (LocaleController.isRTL) {
-                canvas.drawLine(0, getMeasuredHeight() - 1, getMeasuredWidth() - dp(AndroidUtilities.leftBaseline), getMeasuredHeight() - 1, dividerPaint);
+                canvas.drawLine(0, getMeasuredHeight() - 1, getMeasuredWidth() - dp(codexDirectoryResult ? 16 : AndroidUtilities.leftBaseline), getMeasuredHeight() - 1, dividerPaint);
             } else {
-                canvas.drawLine(dp(AndroidUtilities.leftBaseline), getMeasuredHeight() - 1, getMeasuredWidth(), getMeasuredHeight() - 1, dividerPaint);
+                canvas.drawLine(dp(codexDirectoryResult ? 16 : AndroidUtilities.leftBaseline), getMeasuredHeight() - 1, getMeasuredWidth(), getMeasuredHeight() - 1, dividerPaint);
             }
         }
 
@@ -1051,7 +1101,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
             canvas.restore();
         }
 
-        if (dontDrawAvatar) {
+        if (codexDirectoryResult || dontDrawAvatar) {
 
         } else if (chat != null && chat.monoforum) {
             if (bubbleClip == null) {
@@ -1079,7 +1129,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         }
 
         final float lockT = premiumBlockedT.set(premiumBlocked);
-        if (lockT > 0) {
+        if (!codexDirectoryResult && lockT > 0) {
             final float top = avatarImage.getCenterY() + dp(14);
             final float left = avatarImage.getCenterX() + dp(16);
 
@@ -1154,11 +1204,17 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         return dialog_id;
     }
 
+    /** 保留任务行选择与无障碍；尾侧选择框即时切换以免退场动画压住扩展文字。 */
     public void setChecked(boolean checked, boolean animated) {
         if (checkBox == null) {
             return;
         }
-        checkBox.setChecked(checked, animated);
+        boolean changed = checkBox.isChecked() != checked;
+        checkBox.setChecked(checked, animated && !codexDirectoryResult);
+        if (codexDirectoryResult && changed) {
+            update(0);
+            requestLayout();
+        }
     }
 
     @Override
@@ -1166,6 +1222,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
         return onTouchEvent(ev);
     }
 
+    /** 本地任务仍由原列表处理点击和长按，不把空头像区域交给故事触摸。 */
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         if (openBot && onOpenButtonClick != null && user != null) {
@@ -1201,7 +1258,7 @@ public class ProfileSearchCell extends BaseCell implements NotificationCenter.No
             if (hit || adBounce.isPressed())
                 return true;
         }
-        if ((user != null || chat != null) && avatarStoryParams.checkOnTouchEvent(event, this)) {
+        if (!codexDirectoryResult && (user != null || chat != null) && avatarStoryParams.checkOnTouchEvent(event, this)) {
             return true;
         }
         if (actionButton != null && actionButton.checkTouchEvent(event)) {

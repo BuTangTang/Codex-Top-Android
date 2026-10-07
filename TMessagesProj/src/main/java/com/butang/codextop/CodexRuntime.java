@@ -1450,15 +1450,41 @@ public final class CodexRuntime {
         });
     }
 
-    /** 绑定之后把上次目标填进尚未确认的槽。磁盘任务不读取内存状态，界面线程才写回事实。 */
+    /** 一次列表发布的局部快照；只在原globalQueue惰性读取，批次结束后不保留。 */
+    private static final class GoalRestoreBatch {
+        final PasswordLogin.Session owner;
+        final long epoch;
+        private GoalDisplayStore.Loaded loaded;
+
+        GoalRestoreBatch(PasswordLogin.Session owner, long epoch) {
+            this.owner = owner;
+            this.epoch = epoch;
+        }
+
+        GoalDisplayStore.Record find(String machine, String remote, String sourceKind, String sourceHome) {
+            if (loaded == null) loaded = goalDisplayStore(owner).read();
+            return loaded.find(machine, remote, sourceKind, sourceHome);
+        }
+    }
+
+    /** 非批次调用保持原单条恢复入口。 */
     private static void scheduleGoalRestore(long dialogId, String machine, String remote, PasswordLogin.Session owner, long epoch) {
+        scheduleGoalRestore(dialogId, machine, remote, owner, epoch, null);
+    }
+
+    /** 绑定之后把上次目标填进尚未确认的槽。磁盘任务不读取内存状态，界面线程才写回事实。 */
+    private static void scheduleGoalRestore(long dialogId, String machine, String remote, PasswordLogin.Session owner, long epoch,
+            GoalRestoreBatch batch) {
         final String linked = linkedSessions.get(dialogId);
         JsonObject source = DesktopConnection.userCodexSource();
         final String sourceKind = source.get("kind").getAsString();
         final String sourceHome = source.get("home").getAsString();
         Utilities.globalQueue.postRunnable(() -> {
             if (!goalCacheIdentityCurrent(epoch, owner, dialogId, machine, remote, linked, sourceKind, sourceHome)) return;
-            GoalDisplayStore.Record record = goalDisplayStore(owner).find(machine, remote, sourceKind, sourceHome);
+            if (batch != null && (batch.owner != owner || batch.epoch != epoch)) return;
+            GoalDisplayStore.Record record = batch == null
+                    ? goalDisplayStore(owner).find(machine, remote, sourceKind, sourceHome)
+                    : batch.find(machine, remote, sourceKind, sourceHome);
             if (record == null) return;
             AndroidUtilities.runOnUIThread(() -> {
                 if (!goalCacheIdentityCurrent(epoch, owner, dialogId, machine, remote, linked, sourceKind, sourceHome)) return;
@@ -3639,13 +3665,19 @@ public final class CodexRuntime {
     /** 列表和电脑子页共用候选消费点；缓存只补缺失元数据，不能覆盖别处已取得的新事实。 */
     private static void publishDialogFacts(long dialogId, String machine, JsonObject candidate,
             long startedAt, long receivedAt, boolean cached) {
+        publishDialogFacts(dialogId, machine, candidate, startedAt, receivedAt, cached, null);
+    }
+
+    /** 同一列表批次只共享被动磁盘快照，事实、认领和回写守卫仍逐条执行。 */
+    private static void publishDialogFacts(long dialogId, String machine, JsonObject candidate,
+            long startedAt, long receivedAt, boolean cached, GoalRestoreBatch batch) {
         statuses.candidate(dialogId, machine, candidate, startedAt, receivedAt, cached);
         com.google.gson.JsonElement remoteValue = candidate.get("remoteSessionId");
         String remote = remoteValue != null && remoteValue.isJsonPrimitive() && remoteValue.getAsJsonPrimitive().isString()
                 ? remoteValue.getAsString() : "";
         PasswordLogin.Session owner = session;
         if (owner != null && !remote.isEmpty() && statuses.claimGoalRestore(dialogId, machine))
-            scheduleGoalRestore(dialogId, machine, remote, owner, accountGeneration);
+            scheduleGoalRestore(dialogId, machine, remote, owner, accountGeneration, batch);
         String title = candidate.has("title") && candidate.get("title").isJsonPrimitive()
                 ? candidate.get("title").getAsString() : "未命名对话";
         if (cached) {
@@ -3720,12 +3752,13 @@ public final class CodexRuntime {
             Map<Long, Long> updatedAt = new HashMap<>();
             MessagesController controller = MessagesController.getInstance(account);
             boolean presentationChanged = !controller.dialogsLoaded, statusChanged = false;
+            GoalRestoreBatch goalBatch = new GoalRestoreBatch(owner, accountEpoch);
             for (com.google.gson.JsonElement entry : candidates) {
                 JsonObject candidate = entry.getAsJsonObject();
                 long local = publishedIds.get(candidate.get("remoteSessionId").getAsString());
                 if (local == 0) continue;
                 String before = statusPresentation(local);
-                publishDialogFacts(local, machine, candidate, startedAt, receivedAt, cached);
+                publishDialogFacts(local, machine, candidate, startedAt, receivedAt, cached, goalBatch);
                 statusChanged |= !before.equals(statusPresentation(local));
                 presentationChanged |= publishDialogUser(account, local, dialogTitles.get(local));
                 TLRPC.Dialog dialog = controller.dialogs_dict.get(local);
