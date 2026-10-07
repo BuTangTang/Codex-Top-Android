@@ -16,6 +16,8 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.view.Gravity;
+import android.text.TextUtils;
+import android.widget.Button;
 import android.view.View;
 import android.widget.FrameLayout;
 
@@ -28,6 +30,8 @@ public class ChatLoadingCell extends FrameLayout {
 
     private FrameLayout frameLayout;
     private RadialProgressView progressBar;
+    private Button retryButton;
+    private Runnable retryAction;
     private Theme.ResourcesProvider resourcesProvider;
 
     public ChatLoadingCell(Context context, View parent, Theme.ResourcesProvider resourcesProvider) {
@@ -88,8 +92,47 @@ public class ChatLoadingCell extends FrameLayout {
         super.onMeasure(MeasureSpec.makeMeasureSpec(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(dp(44), MeasureSpec.EXACTLY));
     }
 
+    /** 普通加载状态同时撤销复用单元中的旧重试入口，原 Telegram 行保持原样。 */
     public void setProgressVisible(boolean value) {
+        setRetryAction(null, null);
         frameLayout.setVisibility(value ? VISIBLE : INVISIBLE);
+    }
+
+    /** 本行继续加载或明确失败重试共用按钮；沿原 44dp 高度和服务文字主题，回收时清理可点击状态。 */
+    public void setRetryAction(CharSequence text, Runnable action) {
+        retryAction = action;
+        if (action == null) {
+            if (retryButton != null) {
+                retryButton.setVisibility(GONE);
+                retryButton.setEnabled(false);
+            }
+            return;
+        }
+        if (retryButton == null) {
+            retryButton = new Button(getContext());
+            retryButton.setAllCaps(false);
+            retryButton.setTextSize(14);
+            retryButton.setMinWidth(0);
+            retryButton.setMinHeight(0);
+            retryButton.setPadding(dp(12), 0, dp(12), 0);
+            retryButton.setSingleLine(true);
+            retryButton.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            retryButton.setGravity(Gravity.CENTER);
+            // 只执行当前绑定的动作，单元复用后不能保留上一次的重试回调。
+            retryButton.setOnClickListener(view -> {
+                Runnable current = retryAction;
+                if (current != null) current.run();
+            });
+            addView(retryButton, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.CENTER, 12, 0, 12, 0));
+        }
+        retryButton.setText(text);
+        retryButton.setContentDescription(text);
+        retryButton.setTextColor(getThemedColor(Theme.key_chat_serviceText));
+        retryButton.setBackground(Theme.createSimpleSelectorRoundRectDrawable(dp(18),
+                getThemedColor(Theme.key_chat_serviceBackground), getThemedColor(Theme.key_chat_serviceBackgroundSelector)));
+        retryButton.setEnabled(true);
+        retryButton.setVisibility(VISIBLE);
+        frameLayout.setVisibility(INVISIBLE);
     }
 
     private int getThemedColor(int key) {

@@ -823,6 +823,31 @@ public class ChatActivity extends BaseFragment implements
     private Runnable pendingWebPageTimeoutRunnable;
     private Runnable waitingForCharaterEnterRunnable;
     private Runnable codexDraftSaveRunnable;
+    private long codexHistoryViewToken;
+    private long codexHistoryPausedToken;
+    private long codexHistoryViewRevision;
+    private String codexHistoryEpoch;
+    private boolean codexHistoryReadingLocked;
+    private boolean codexHistoryOlderRetryRequired;
+    /** 只保留当前已接纳普通历史的继续事实；空未知或换页不得推断尚有正文。 */
+    private boolean codexHistoryOlderContinueAvailable;
+    private com.butang.codextop.CodexRuntime.LocalHistoryBoundary codexLocalHistoryBoundary;
+    private String codexLocalHistoryBoundaryEpoch;
+    private Object codexLocalHistoryRequest;
+    private com.butang.codextop.CodexRuntime.LocalHistorySelection codexLocalHistorySelection;
+    private boolean codexLocalHistoryAwaitingInput;
+    // 仅本地选段的首次around消费此锚；换页或离页随原滚动目标撤销。
+    private int codexLocalHistoryInitialAnchorId;
+
+    private boolean codexHistoryLatestAvailable;
+    private long codexHistoryInitialFillToken;
+    private long codexHistoryInitialFillUsedToken;
+    // 短屏每view一次、明确跨段每epoch一次；同一view同一epoch共享一次派发。
+    private String codexHistoryInitialFillUsedEpoch;
+    private String codexHistoryInitialFillGapEpoch;
+    private Object codexHistoryInitialFillTicket;
+    // 仅主线程三个固定观察点消费额度；默认关闭，每阶段每进程最多32条。
+    private static int codexViewportScheduleTraces, codexViewportDrawTraces, codexViewportReplaceTraces;
     private boolean codexApprovalBusy;
     private boolean codexQuestionBusy;
     private AlertDialog codexQuestionDialog;
@@ -833,6 +858,740 @@ public class ChatActivity extends BaseFragment implements
     private long codexQuestionUiGeneration;
     private final HashMap<String, java.util.LinkedHashMap<String, String>> codexQuestionDrafts = new HashMap<>();
     private final HashMap<String, String> codexQuestionCustomDrafts = new HashMap<>();
+
+    /** 只为电脑普通聊天绑定历史段，原Telegram及排期等页面沿原处理。 */
+    private boolean isCodexHistoryView() {
+        return chatMode == MODE_DEFAULT && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id);
+    }
+
+    /** 加载行只反映当前页面对应方向的请求，不把尚可翻页误作正在请求。 */
+    private boolean isCodexHistoryLoadingCell(int position) {
+        return !paused && codexHistoryViewToken != 0 && position >= 0
+                && (position == chatAdapter.loadingUpRow && loading
+                || position == chatAdapter.loadingDownRow && loadingForward);
+    }
+
+    /** 仅在请求状态变化时直接同步已挂载的加载行，避免等待重新绑定或新增轮询。 */
+    private void updateCodexHistoryLoadingCells() {
+        if (!isCodexHistoryView() || chatAdapter == null || chatAdapter.isFiltered || chatListView == null) return;
+        for (int i = 0; i < chatListView.getChildCount(); i++) {
+            View child = chatListView.getChildAt(i);
+            if (child instanceof ChatLoadingCell) {
+                bindCodexHistoryLoadingCell((ChatLoadingCell) child, chatListView.getChildAdapterPosition(child));
+            }
+        }
+    }
+
+    /** 普通历史尚未到可读边界时沿原加载行继续，只有明确失败才显示重试文案。 */
+    private boolean canRetryCodexHistoryLoadingCell(int position) {
+        return isCodexHistoryView() && !paused && chatAdapter != null && !chatAdapter.isFrozen && !chatAdapter.isFiltered
+                && !waitingForGetDifference && chatLayoutManager != null && codexHistoryViewToken != 0
+                && (codexHistoryOlderRetryRequired || codexHistoryOlderContinueAvailable)
+                && !loading && !endReached[0] && !searching
+                && (actionBar == null || !actionBar.isSearchFieldVisible())
+                && position >= 0 && position == chatAdapter.loadingUpRow;
+    }
+
+    /** 仅已接纳的同段快照决定本地边界，不把hasMore或缺少网络当作存在旧段。 */
+    private boolean hasCodexLocalHistoryBoundary(boolean older) {
+        return isCodexHistoryView() && codexLocalHistoryBoundary != null
+                && java.util.Objects.equals(codexLocalHistoryBoundaryEpoch, codexHistoryEpoch)
+                && (older ? codexLocalHistoryBoundary.hasOtherLocalSegments : !codexLocalHistoryBoundary.showingLatestRoot);
+    }
+
+    /** 本地查看同样尊重暂停、搜索和选择；未绑定初页不冒充没有缓存。 */
+    private boolean canBrowseCodexLocalHistory() {
+        return isCodexHistoryView() && !isThreadChat() && !isTopic && !paused && getParentActivity() != null
+                && !waitingForGetDifference && !loading && !loadingForward && !searching && !hasTextSelection()
+                && chatAdapter != null && !chatAdapter.isFrozen && !chatAdapter.isFiltered
+                && chatListView != null && chatLayoutManager != null
+                && (actionBar == null || !actionBar.isActionModeShowed() && !actionBar.isSearchFieldVisible())
+                && com.butang.codextop.CodexRuntime.isHistoryViewCurrent(currentAccount, dialog_id, classGuid,
+                        codexHistoryViewToken, codexHistoryEpoch);
+    }
+
+    /** 本地按钮仍固定原位置及同段事实，复用/回最新清理后的旧控件不能重开目录。 */
+    private boolean isCodexLocalHistoryCellCurrent(ChatLoadingCell cell, int position, int account, long token, String epoch, long revision) {
+        return cell.getParent() == chatListView && chatListView != null && currentAccount == account
+                && chatListView.getChildAdapterPosition(cell) == position
+                && isCodexHistoryScrollCurrent(token, epoch, revision) && canBrowseCodexLocalHistory()
+                && (position == chatAdapter.loadingUpRow && hasCodexLocalHistoryBoundary(true)
+                || position == chatAdapter.loadingDownRow && hasCodexLocalHistoryBoundary(false));
+    }
+
+    /** 取消只释放本次选择句柄；旧回调不能清掉后来者的pin或改现有正文。 */
+    private void cancelCodexLocalHistorySelection() {
+        codexLocalHistoryRequest = null;
+        com.butang.codextop.CodexRuntime.LocalHistorySelection selection = codexLocalHistorySelection;
+        codexLocalHistorySelection = null;
+        com.butang.codextop.CodexRuntime.cancelLocalHistorySelection(selection);
+    }
+
+    /** 异步目录与选择共用UI意图检查，正常失败保持原窗口和阅读位置。 */
+    private boolean isCodexLocalHistoryRequestCurrent(Object request, int account, long token, String epoch, long revision) {
+        return request == codexLocalHistoryRequest && currentAccount == account && canBrowseCodexLocalHistory()
+                && isCodexHistoryScrollCurrent(token, epoch, revision);
+    }
+
+    /** 目录只显示本地段内时间和数量，不按日期推断中间连续或自动联网补齐。 */
+    private void showCodexLocalHistory(ChatLoadingCell cell) {
+        if (!canBrowseCodexLocalHistory()) return;
+        cancelCodexLocalHistorySelection();
+        final Object request = codexLocalHistoryRequest = new Object();
+        final int account = currentAccount;
+        final long token = codexHistoryViewToken, revision = codexHistoryViewRevision;
+        final String epoch = codexHistoryEpoch;
+        com.butang.codextop.CodexRuntime.requestLocalHistorySegments(account, dialog_id, classGuid, token, epoch, catalog -> {
+            if (!isCodexLocalHistoryRequestCurrent(request, account, token, epoch, revision)) return;
+            if (catalog == null) { showCodexLocalHistoryUnavailable(); return; }
+            ArrayList<CharSequence> labels = new ArrayList<>();
+            ArrayList<Runnable> actions = new ArrayList<>();
+            if (!catalog.showingLatestRoot) {
+                labels.add("回到最新"); actions.add(this::requestCodexLatestHistory);
+            }
+            if (cell != null && isCodexHistoryRetryBindingCurrent(cell, account, token, epoch, revision)) {
+                labels.add(codexHistoryOlderRetryRequired ? "重试加载更早消息" : "继续加载更早消息");
+                actions.add(() -> retryCodexHistoryFromCell(cell, account, token, epoch, revision));
+            }
+            for (com.butang.codextop.CodexRuntime.LocalHistorySegment segment : catalog.segments) {
+                labels.add(codexLocalHistoryTime(segment.firstTime) + " — "
+                        + codexLocalHistoryTime(segment.lastTime) + " · " + segment.count + "条");
+                actions.add(() -> selectCodexLocalHistory(catalog, segment));
+            }
+            AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                    .setTitle("本地记录")
+                    .setMessage(labels.isEmpty() ? "当前没有其他已保存的本地记录段。" : "这些记录已保存在手机，点选即可查看。")
+                    .setNegativeButton("取消", null);
+            builder.setItems(labels.toArray(new CharSequence[0]), (dialog, which) -> {
+                if (!isCodexLocalHistoryRequestCurrent(request, account, token, epoch, revision)) return;
+                if (!com.butang.codextop.CodexRuntime.isLocalHistoryCatalogCurrent(catalog)) { showCodexLocalHistoryUnavailable(); return; }
+                codexLocalHistoryRequest = null;
+                actions.get(which).run();
+            });
+            AlertDialog dialog = builder.create();
+            if (showDialog(dialog, dismissed -> { if (codexLocalHistoryRequest == request) cancelCodexLocalHistorySelection(); }) == null
+                    && codexLocalHistoryRequest == request) cancelCodexLocalHistorySelection();
+        });
+    }
+
+    /** 异常时间明确未知，不用缓存日期去猜来源完整性。 */
+    private String codexLocalHistoryTime(long milliseconds) {
+        if (milliseconds <= 0) return "时间未知";
+        return new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(new java.util.Date(milliseconds));
+    }
+
+    /** 失效选择只提示重新打开目录，既不清原页也不自动改用相邻段。 */
+    private void showCodexLocalHistoryUnavailable() {
+        if (getParentActivity() != null && !paused) showDialog(new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle("本地记录").setMessage("本地记录或页面状态已变化，请重新打开。")
+                .setPositiveButton("关闭", null).create());
+    }
+
+    /** 两阶段选择先pin再由UI接受，成功后复用原精确epoch定位与返回最新入口。 */
+    private void selectCodexLocalHistory(com.butang.codextop.CodexRuntime.LocalHistoryCatalog catalog,
+            com.butang.codextop.CodexRuntime.LocalHistorySegment segment) {
+        if (!canBrowseCodexLocalHistory()) return;
+        cancelCodexLocalHistorySelection();
+        final Object request = codexLocalHistoryRequest = new Object();
+        final int account = currentAccount;
+        final long token = codexHistoryViewToken, revision = codexHistoryViewRevision;
+        final String epoch = codexHistoryEpoch;
+        codexLocalHistorySelection = com.butang.codextop.CodexRuntime.resolveLocalHistorySegment(catalog, segment, selection -> {
+            if (!isCodexLocalHistoryRequestCurrent(request, account, token, epoch, revision)) {
+                com.butang.codextop.CodexRuntime.cancelLocalHistorySelection(selection); return;
+            }
+            com.butang.codextop.CodexRuntime.HistoryBookmark bookmark = com.butang.codextop.CodexRuntime.acceptLocalHistorySelection(selection);
+            if (bookmark == null) { cancelCodexLocalHistorySelection(); showCodexLocalHistoryUnavailable(); return; }
+            codexLocalHistorySelection = null;
+            clearCodexHistoryScrollTargets();
+            codexLocalHistoryEpochReset(bookmark.epoch);
+            clearChatData(true);
+            codexHistoryReadingLocked = true;
+            codexHistoryLatestAvailable = true;
+            codexLocalHistoryAwaitingInput = true;
+            startLoadFromMessageId = bookmark.messageId;
+            codexLocalHistoryInitialAnchorId = bookmark.messageId;
+            startLoadFromMessageOffset = Integer.MAX_VALUE;
+            firstMessagesLoaded = false;
+            firstLoadMessages();
+            updatePagedownButtonVisibility(true);
+        });
+        if (codexLocalHistorySelection == null) { cancelCodexLocalHistorySelection(); showCodexLocalHistoryUnavailable(); }
+    }
+
+    /** 切换明确段身份时清本地边界快照；普通同段布局不撤销仍有效的事实。 */
+    private void codexLocalHistoryEpochReset(String epoch) {
+        codexHistoryEpoch = epoch;
+        codexLocalHistoryBoundary = null;
+        codexLocalHistoryBoundaryEpoch = null;
+    }
+
+    /** 原绑定与已挂载单元共用一处状态更新；回调固定本次绑定身份，复用后不可误操作旧页。 */
+    private void bindCodexHistoryLoadingCell(ChatLoadingCell cell, int position) {
+        cell.setProgressVisible(isCodexHistoryLoadingCell(position));
+        if (canBrowseCodexLocalHistory() && position >= 0) {
+            final long localToken = codexHistoryViewToken, localRevision = codexHistoryViewRevision;
+            final String localEpoch = codexHistoryEpoch;
+            final int localAccount = currentAccount;
+            if (position == chatAdapter.loadingDownRow && hasCodexLocalHistoryBoundary(false)) {
+                cell.setRetryAction("本地记录 · 回到最新", () -> {
+                    if (isCodexLocalHistoryCellCurrent(cell, position, localAccount, localToken, localEpoch, localRevision))
+                        requestCodexLatestHistory();
+                });
+                return;
+            }
+            if (position == chatAdapter.loadingUpRow && hasCodexLocalHistoryBoundary(true)) {
+                cell.setRetryAction(codexLocalHistoryBoundary.missingCachedTailAnchor ? "中间尚未接齐 · 查看本地记录" : "查看本地记录", () -> {
+                    if (isCodexLocalHistoryCellCurrent(cell, position, localAccount, localToken, localEpoch, localRevision))
+                        showCodexLocalHistory(cell);
+                });
+                return;
+            }
+        }
+        if (!canRetryCodexHistoryLoadingCell(position)) return;
+        final long token = codexHistoryViewToken, revision = codexHistoryViewRevision;
+        final String epoch = codexHistoryEpoch;
+        final int account = currentAccount;
+        cell.setRetryAction(codexHistoryOlderRetryRequired ? "未能加载更早消息 · 重试" : "加载更早消息",
+                () -> retryCodexHistoryFromCell(cell, account, token, epoch, revision));
+    }
+
+    /** 点击前与原队列执行时共用绑定校验，失效控件不能落入搜索或其它页面的分页路径。 */
+    private boolean isCodexHistoryRetryBindingCurrent(ChatLoadingCell cell, int account, long token, String epoch, long revision) {
+        return chatListView != null && cell.getParent() == chatListView && currentAccount == account
+                && isCodexHistoryScrollCurrent(token, epoch, revision)
+                && canRetryCodexHistoryLoadingCell(chatListView.getChildAdapterPosition(cell))
+                && com.butang.codextop.CodexRuntime.isHistoryViewCurrent(account, dialog_id, classGuid, token, epoch);
+    }
+
+    /** 点击沿原翻旧队列继续或重试；执行时才确认阅读意图，搜索或页面变化取消后仍可再次点击。 */
+    private void retryCodexHistoryFromCell(ChatLoadingCell cell, int account, long token, String epoch, long revision) {
+        if (!isCodexHistoryRetryBindingCurrent(cell, account, token, epoch, revision)) return;
+        checkScrollForLoad(true, () -> {
+            if (!isCodexHistoryRetryBindingCurrent(cell, account, token, epoch, revision)) return false;
+            lockCodexHistoryReading();
+            codexLocalHistoryAwaitingInput = false;
+            codexHistoryOlderRetryRequired = false;
+            cell.setRetryAction(null, null);
+            return true;
+        });
+    }
+
+    /** 合法定位回包提前结束时也释放该方向的请求指示，普通 Telegram 与过滤搜索保持原处理。 */
+    private void finishCodexHistoryLoading(int loadType) {
+        if (!isCodexHistoryView() || chatAdapter == null || chatAdapter.isFiltered) return;
+        if (loadType == 3) codexLocalHistoryInitialAnchorId = 0;
+        if (loadType == 1) loadingForward = false;
+        else loading = false;
+        updateCodexHistoryLoadingCells();
+    }
+
+    /** 仅本次旧页合并暂存原对象；不拥有发送记录、网络请求或跨回调状态。 */
+    private static final class CodexPendingHistoryRows {
+        final ArrayList<MessageObject> before = new ArrayList<>();
+        final ArrayList<MessageObject> pending = new ArrayList<>();
+        final HashMap<String, ArrayList<MessageObject>> emptyDays = new HashMap<>();
+        MessageObject anchor;
+        int offset;
+    }
+
+    /** 只识别显式恢复的原负编号；新发送、正编号回显及普通Telegram均不借此重排。 */
+    private boolean isCodexRestoredHistoryPending(MessageObject object) {
+        return object != null && object.getId() < 0 && !object.scheduled && object.messageOwner.params != null
+                && "true".equals(object.messageOwner.params.get("codexRestoredPending"));
+    }
+
+    /** 日期标题与视频转换/未读服务行不同，后两者不得作为普通日期头移走。 */
+    private boolean isCodexHistoryDateHeader(MessageObject object) {
+        return object.isDateObject && object.type == MessageObject.TYPE_DATE && !object.isVideoConversionObject;
+    }
+
+    /** 原旧页按尾邻居追加前暂取恢复项和空日标题；字典、组对象、发送身份与状态不动。 */
+    private CodexPendingHistoryRows takeCodexPendingHistoryRows(int loadType, int loadIndex) {
+        if (!isCodexHistoryView() || loadType != 0 || loadIndex != 0 || chatAdapter == null || chatAdapter.isFiltered) return null;
+        CodexPendingHistoryRows saved = null;
+        for (MessageObject object : messages) {
+            if (!isCodexRestoredHistoryPending(object)) continue;
+            if (saved == null) saved = new CodexPendingHistoryRows();
+            saved.pending.add(object);
+        }
+        if (saved == null) return null;
+        saved.before.addAll(messages);
+        if (clearOnLoadAndScrollMessageId < 0 && !first && !scrollToTopOnResume && !forceScrollToTop
+                && scrollToMessage == null && chatListView != null) for (int i = 0; i < chatListView.getChildCount(); i++) {
+            View child = chatListView.getChildAt(i);
+            if (child instanceof ChatMessageCell) saved.anchor = ((ChatMessageCell) child).getMessageObject();
+            else if (child instanceof ChatActionCell) saved.anchor = ((ChatActionCell) child).getMessageObject();
+            if (saved.anchor != null) { saved.offset = getScrollingOffsetForView(child); break; }
+        }
+        for (MessageObject object : saved.pending) {
+            messages.remove(object);
+            ArrayList<MessageObject> day = messagesByDays.get(object.dateKey);
+            if (day != null) {
+                day.remove(object);
+                if (day.isEmpty()) {
+                    saved.emptyDays.put(object.dateKey, day);
+                    messagesByDays.remove(object.dateKey);
+                    messagesByDaysSorted.remove(object.dateKeyInt);
+                }
+            }
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            MessageObject object = messages.get(i);
+            if (isCodexHistoryDateHeader(object) && saved.emptyDays.containsKey(object.dateKey)) messages.remove(i);
+        }
+        return saved;
+    }
+
+    /** 原旧页完成后只归位暂取项，正编号相对顺序不变；混合组优先沿原组邻居，不拆组或重跑发送入口。 */
+    private void restoreCodexPendingHistoryRows(CodexPendingHistoryRows saved) {
+        if (saved == null) return;
+        for (MessageObject object : saved.pending) {
+            int position = -1;
+            long groupId = object.getGroupId();
+            if (groupId != 0) {
+                int original = saved.before.indexOf(object);
+                for (int i = original + 1; i < saved.before.size(); i++) {
+                    MessageObject neighbour = saved.before.get(i);
+                    if (neighbour.getGroupId() == groupId && messages.contains(neighbour)) {
+                        position = messages.indexOf(neighbour); break;
+                    }
+                }
+                if (position < 0) for (int i = original - 1; i >= 0; i--) {
+                    MessageObject neighbour = saved.before.get(i);
+                    if (neighbour.getGroupId() == groupId && messages.contains(neighbour)) {
+                        position = messages.indexOf(neighbour) + 1; break;
+                    }
+                }
+            }
+            if (position < 0) {
+                position = messages.size();
+                for (int i = 0; i < messages.size(); i++) {
+                    MessageObject other = messages.get(i);
+                    if (other.isDateObject || other.type < 0 || other.messageOwner.date <= 0) continue;
+                    if (other.messageOwner.date < object.messageOwner.date
+                            || other.messageOwner.date == object.messageOwner.date
+                            && (other.getId() >= 0 || object.getId() < other.getId())) {
+                        position = i;
+                        long otherGroup = other.getGroupId();
+                        if (otherGroup != 0) while (position > 0
+                                && messages.get(position - 1).getGroupId() == otherGroup) position--;
+                        break;
+                    }
+                }
+            }
+            messages.add(position, object);
+            ArrayList<MessageObject> day = messagesByDays.get(object.dateKey);
+            if (day == null) {
+                day = saved.emptyDays.get(object.dateKey);
+                if (day == null) day = new ArrayList<>();
+                messagesByDays.put(object.dateKey, day);
+                messagesByDaysSorted.put(object.dateKeyInt, day);
+            }
+            day.add(object);
+        }
+        // 只移动已有日期对象；同日旧标题优先复用，避免空日恢复后出现重复标题。
+        HashMap<String, MessageObject> headers = new HashMap<>();
+        for (MessageObject object : saved.before) if (isCodexHistoryDateHeader(object)) headers.put(object.dateKey, object);
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            MessageObject object = messages.get(i);
+            if (isCodexHistoryDateHeader(object)) {
+                if (!headers.containsKey(object.dateKey)) headers.put(object.dateKey, object);
+                messages.remove(i);
+            }
+        }
+        java.util.HashSet<MessageObject> dayMembers = new java.util.HashSet<>();
+        for (ArrayList<MessageObject> day : messagesByDays.values()) { dayMembers.addAll(day); day.clear(); }
+        HashMap<String, Integer> lastInDay = new HashMap<>();
+        for (int i = 0; i < messages.size(); i++) {
+            MessageObject object = messages.get(i);
+            if (dayMembers.contains(object)) messagesByDays.get(object.dateKey).add(object);
+            if (headers.containsKey(object.dateKey)) lastInDay.put(object.dateKey, i);
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            MessageObject object = messages.get(i);
+            if (Integer.valueOf(i).equals(lastInDay.get(object.dateKey))) messages.add(i + 1, headers.get(object.dateKey));
+        }
+    }
+
+    /** 整刷新后沿同一个可见气泡和像素偏移恢复，负编号和列表第零项也可作锚。 */
+    private void restoreCodexPendingHistoryAnchor(CodexPendingHistoryRows saved) {
+        if (saved == null || saved.anchor == null || chatAdapter == null || chatLayoutManager == null) return;
+        int index = messages.indexOf(saved.anchor);
+        if (index >= 0) chatLayoutManager.scrollToPositionWithOffset(chatAdapter.messagesStartRow + index, saved.offset);
+    }
+
+    /** 初次入口的裸整数没有历史段身份，不能拿它命中新段同号消息；日期意图继续保留。 */
+    private void resetCodexUnscopedInitialAnchor() {
+        if (!isCodexHistoryView()) return;
+        startLoadFromMessageId = startLoadFromMessageIdSaved = highlightMessageId = 0;
+        startLoadFromMessageOffset = Integer.MAX_VALUE;
+        startFromVideoMessageId = 0;
+        startFromVideoTimestamp = -1;
+        historyPreloaded = false;
+        scrollToTopOnResume = scrollToTopUnReadOnResume = false;
+    }
+
+    /** 首次读取前注册，暂停后由原Runtime复用阅读段并发新令牌。 */
+    private void openCodexHistoryView() {
+        if (!isCodexHistoryView() || codexHistoryViewToken != 0) return;
+        codexHistoryViewToken = com.butang.codextop.CodexRuntime.openHistoryView(currentAccount, dialog_id, classGuid);
+        if (codexHistoryViewToken != 0) codexHistoryPausedToken = 0;
+    }
+
+    /** 恢复同片段时保留原阅读视窗；尚未完成的显式定位在新令牌下重读，普通入口请求最新段。 */
+    private void resumeCodexHistoryView() {
+        if (!isCodexHistoryView()) return;
+        boolean reopening = codexHistoryViewToken == 0 && codexHistoryPausedToken != 0;
+        openCodexHistoryView();
+        if (!reopening || codexHistoryViewToken == 0) return;
+        int anchor = startLoadFromMessageId, offset = startLoadFromMessageOffset, date = startLoadFromDate;
+        clearCodexHistoryScrollTargets();
+        waitingForLoad.clear();
+        loading = false;
+        loadingForward = false;
+        updateCodexHistoryLoadingCells();
+        if (!codexHistoryReadingLocked) {
+            com.butang.codextop.CodexRuntime.requestLatestHistory(currentAccount, dialog_id, classGuid, codexHistoryViewToken);
+        } else if (messages.isEmpty()) {
+            if (anchor != 0 || date != 0) {
+                startLoadFromMessageId = anchor;
+                startLoadFromMessageOffset = offset;
+                startLoadFromDate = date;
+                firstMessagesLoaded = false;
+                firstLoadMessages();
+            } else restoreCodexHistoryBookmark();
+        }
+    }
+
+    /** 暂停仅撤销回包资格，销毁才释放绑定；不让旧令牌在恢复后继续生效。 */
+    private void pauseCodexHistoryView(boolean destroy) {
+        cancelCodexLocalHistorySelection();
+        codexLocalHistoryInitialAnchorId = 0;
+        cancelCodexHistoryInitialFill();
+        codexHistoryOlderRetryRequired = false;
+        codexHistoryOlderContinueAvailable = false;
+        long token = codexHistoryViewToken != 0 ? codexHistoryViewToken : codexHistoryPausedToken;
+        if (token == 0) return;
+        if (destroy) {
+            com.butang.codextop.CodexRuntime.closeHistoryView(classGuid, token);
+            codexHistoryPausedToken = 0;
+        } else if (codexHistoryViewToken != 0) {
+            com.butang.codextop.CodexRuntime.pauseHistoryView(classGuid, token);
+            codexHistoryPausedToken = token;
+        }
+        codexHistoryViewToken = 0;
+        updateCodexHistoryLoadingCells();
+    }
+
+    /** 换页时递增本地布局代次；同段重置也丢弃旧滚动目标，输入框及草稿保持。 */
+    private void clearCodexHistoryScrollTargets() {
+        cancelCodexLocalHistorySelection();
+        codexLocalHistoryInitialAnchorId = 0;
+        codexHistoryViewRevision++;
+        cancelCodexHistoryInitialFill();
+        codexHistoryOlderRetryRequired = false;
+        codexHistoryOlderContinueAvailable = false;
+        if (chatScrollHelper != null) chatScrollHelper.cancel();
+        scrollToMessage = null;
+        scrollToMessagePosition = -10000;
+        scrollToTopOnResume = false;
+        scrollToTopUnReadOnResume = false;
+        startLoadFromMessageId = 0;
+        startLoadFromMessageIdSaved = 0;
+        startLoadFromMessageOffset = Integer.MAX_VALUE;
+        startLoadFromDate = 0;
+        postponedScrollToLastMessageQueryIndex = 0;
+        postponedScrollMessageId = 0;
+        postponedScrollIsCanceled = true;
+        fakePostponedScroll = false;
+        nextScrollToMessageId = 0;
+        nextScrollFromMessageId = 0;
+        forceNextPinnedMessageId = 0;
+        returnToMessageId = 0;
+        returnToLoadIndex = 0;
+        clearOnLoad = false;
+        clearOnLoadAndScrollMessageId = -1;
+        clearOnLoadAndScrollOffset = 0;
+    }
+
+    /** 排队滚动除了同令牌、同段，还必须属于同一次列表布局，避免同段换页复用旧坐标。 */
+    private boolean isCodexHistoryScrollCurrent(long token, String epoch, long revision) {
+        return !isCodexHistoryView() || token != 0 && token == codexHistoryViewToken
+                && java.util.Objects.equals(epoch, codexHistoryEpoch) && revision == codexHistoryViewRevision;
+    }
+
+    /** 先验令牌与段身份，再接收Runtime明确提供的新页；不改共享通知参数或按整数猜测新段。 */
+    private Object[] prepareCodexHistoryPage(Object[] received) {
+        if (!isCodexHistoryView() || received.length < 15 || (Integer) received[10] != classGuid
+                || (Integer) received[14] != MODE_DEFAULT) return received;
+        if (codexHistoryViewToken == 0 || received.length < 16
+                || !(received[15] instanceof com.butang.codextop.CodexRuntime.HistoryPage)) return null;
+        com.butang.codextop.CodexRuntime.HistoryPage page = (com.butang.codextop.CodexRuntime.HistoryPage) received[15];
+        if (page.token != codexHistoryViewToken || TextUtils.isEmpty(page.fromEpoch) || TextUtils.isEmpty(page.toEpoch)
+                || !com.butang.codextop.CodexRuntime.isHistoryPageCurrent(page)) return null;
+        if (!page.replaceLatest) {
+            if (!page.fromEpoch.equals(page.toEpoch) || codexHistoryEpoch != null && !codexHistoryEpoch.equals(page.toEpoch)) return null;
+            codexHistoryEpoch = page.toEpoch;
+            return received;
+        }
+        if (codexHistoryEpoch != null && !codexHistoryEpoch.equals(page.fromEpoch)) return null;
+        // 正在选择正文或多选消息也是阅读意图，不能在选中途中清屏换段。
+        if (hasTextSelection() || actionBar != null && actionBar.isActionModeShowed()) codexHistoryReadingLocked = true;
+        if (codexHistoryReadingLocked) {
+            // 旧段底部也保留回最新入口；不让普通滚动判定把新内容入口藏掉。
+            codexHistoryLatestAvailable = true;
+            updatePagedownButtonVisibility(true);
+            return null;
+        }
+        if (!com.butang.codextop.CodexRuntime.acceptLatestHistory(page)) return null;
+        traceCodexHistoryViewport("replace", null, !java.util.Objects.equals(codexHistoryEpoch, page.toEpoch));
+        codexLocalHistoryEpochReset(page.toEpoch);
+        codexLocalHistoryAwaitingInput = false;
+        codexHistoryLatestAvailable = false;
+        clearCodexHistoryScrollTargets();
+        clearChatData(true);
+        Object[] accepted = received.clone();
+        int loadIndex = lastLoadIndex++;
+        waitingForLoad.add(loadIndex);
+        accepted[8] = 2;
+        accepted[11] = loadIndex;
+        return accepted;
+    }
+
+    /** 只撤销尚未开始的首屏补页；同一view已经用过的自动额度不会重新开放。 */
+    private void cancelCodexHistoryInitialFill() {
+        codexHistoryInitialFillToken = 0;
+        codexHistoryInitialFillTicket = null;
+    }
+
+    /** 已接收的缺末锚快照只绑定当前最新根，显式定位和原恢复滚动意图不能被自动接桥打断。 */
+    private boolean canBridgeCodexHistoryInitialViewport() {
+        return codexHistoryInitialFillGapEpoch != null && codexHistoryInitialFillGapEpoch.equals(codexHistoryEpoch)
+                && !java.util.Objects.equals(codexHistoryInitialFillUsedEpoch, codexHistoryEpoch)
+                && !first && !scrollToTopOnResume && !forceScrollToTop && scrollToMessage == null
+                && com.butang.codextop.CodexRuntime.isHistoryBridgeViewCurrent(currentAccount, dialog_id, classGuid,
+                        codexHistoryViewToken, codexHistoryEpoch);
+    }
+
+    /** 自动补页只接收真实来源正文；短屏沿原view额度，明确跨段每epoch仅共享一次原四页操作。 */
+    private boolean canFillCodexHistoryInitialViewport() {
+        if (!isCodexHistoryView() || isThreadChat() || isTopic || paused || waitingForGetDifference
+                || chatListView == null || chatLayoutManager == null || chatAdapter == null
+                || chatAdapter.isFrozen || chatAdapter.isFiltered || loading || loadingForward || endReached[0]
+                || codexHistoryReadingLocked || searching || hasTextSelection()
+                || actionBar != null && (actionBar.isActionModeShowed() || actionBar.isSearchFieldVisible())
+                || codexHistoryInitialFillToken == 0 || codexHistoryInitialFillToken != codexHistoryViewToken
+                || codexHistoryInitialFillUsedToken == codexHistoryViewToken && !canBridgeCodexHistoryInitialViewport()
+                || maxMessageId[0] <= 0 || maxMessageId[0] == Integer.MAX_VALUE
+                || !com.butang.codextop.CodexRuntime.isHistoryViewCurrent(currentAccount, dialog_id, classGuid,
+                        codexHistoryViewToken, codexHistoryEpoch)) return false;
+        for (MessageObject message : messages) {
+            if (message.getId() > 0 && message.messageOwner.params != null
+                    && !TextUtils.isEmpty(message.messageOwner.params.get("codexSourceId"))) return true;
+        }
+        return false;
+    }
+
+    /** 只读短屏准入状态与原滚动度量；关闭时不取钟、不读几何、不拼串，诊断失败不影响页面。 */
+    private void traceCodexHistoryViewport(String phase, Object expectedTicket, boolean changedEpoch) {
+        try {
+            if (!BuildVars.DEBUG_VERSION || !android.util.Log.isLoggable("CodexHistoryViewport", android.util.Log.DEBUG)
+                    || !isCodexHistoryView()) return;
+            int event;
+            switch (phase) {
+                case "schedule": if (codexViewportScheduleTraces >= 32) return; event = ++codexViewportScheduleTraces; break;
+                case "draw": if (codexViewportDrawTraces >= 32) return; event = ++codexViewportDrawTraces; break;
+                case "replace": if (codexViewportReplaceTraces >= 32) return; event = ++codexViewportReplaceTraces; break;
+                default: return;
+            }
+            if (event == 32) {
+                android.util.Log.d("CodexHistoryViewport", "viewport_phase=" + phase + " trace_limited=true");
+                return;
+            }
+            final RecyclerListView list = chatListView;
+            final boolean used = codexHistoryViewToken != 0 && codexHistoryInitialFillUsedToken == codexHistoryViewToken;
+            int mask = (codexHistoryViewToken != 0 ? 1 : 0)
+                    | (codexHistoryInitialFillToken != 0 && codexHistoryInitialFillToken == codexHistoryViewToken ? 1 << 1 : 0)
+                    | (used ? 1 << 2 : 0) | (codexHistoryInitialFillTicket != null ? 1 << 3 : 0)
+                    | (expectedTicket != null && expectedTicket == codexHistoryInitialFillTicket ? 1 << 4 : 0)
+                    | (paused ? 1 << 5 : 0) | (loading ? 1 << 6 : 0) | (loadingForward ? 1 << 7 : 0)
+                    | (endReached[0] ? 1 << 8 : 0) | (codexHistoryReadingLocked ? 1 << 9 : 0)
+                    | (searching ? 1 << 10 : 0) | (hasTextSelection() ? 1 << 11 : 0)
+                    | (actionBar != null && actionBar.isActionModeShowed() ? 1 << 12 : 0)
+                    | (actionBar != null && actionBar.isSearchFieldVisible() ? 1 << 13 : 0)
+                    | (chatAdapter != null && chatAdapter.isFrozen ? 1 << 14 : 0)
+                    | (chatAdapter != null && chatAdapter.isFiltered ? 1 << 15 : 0)
+                    | (waitingForGetDifference ? 1 << 16 : 0) | (list != null ? 1 << 17 : 0)
+                    | (chatLayoutManager != null ? 1 << 18 : 0) | (chatAdapter != null ? 1 << 19 : 0)
+                    | (list != null && list.hasPendingAdapterUpdates() ? 1 << 20 : 0)
+                    | (list != null && list.isComputingLayout() ? 1 << 21 : 0)
+                    | (list != null && list.isLayoutRequested() ? 1 << 22 : 0)
+                    | (changedEpoch ? 1 << 23 : 0)
+                    | (maxMessageId[0] > 0 && maxMessageId[0] != Integer.MAX_VALUE ? 1 << 24 : 0);
+            android.util.Log.d("CodexHistoryViewport", "viewport_phase=" + phase
+                    + " elapsedRealtimeMs=" + android.os.SystemClock.elapsedRealtime() + " mask=" + mask
+                    + " height=" + (list == null ? -1 : list.getHeight()) + " children=" + (list == null ? -1 : list.getChildCount())
+                    + " scrollUp=" + (list != null && list.canScrollVertically(-1) ? 1 : 0)
+                    + " scrollDown=" + (list != null && list.canScrollVertically(1) ? 1 : 0)
+                    + " range=" + (list == null ? -1 : list.computeVerticalScrollRange())
+                    + " offset=" + (list == null ? -1 : list.computeVerticalScrollOffset())
+                    + " extent=" + (list == null ? -1 : list.computeVerticalScrollExtent())
+                    + " messages=" + messages.size() + " used=" + (used ? 1 : 0));
+        } catch (Throwable ignored) { /* 诊断不能改变首屏补页、阅读或异常处理。 */ }
+    }
+
+    /** 稳定布局后的短屏或明确跨段共用原翻旧操作；失败与四页无交集均消费本epoch额度。 */
+    private void scheduleCodexHistoryInitialFill() {
+        traceCodexHistoryViewport("schedule", null, false);
+        if (codexHistoryInitialFillTicket != null || !canFillCodexHistoryInitialViewport()) return;
+        final Object ticket = codexHistoryInitialFillTicket = new Object();
+        final long token = codexHistoryViewToken, revision = codexHistoryViewRevision;
+        final String epoch = codexHistoryEpoch;
+        final int account = currentAccount;
+        final RecyclerListView list = chatListView;
+        AndroidUtilities.doOnPreDraw(list, () -> AndroidUtilities.runOnUIThread(() -> {
+            traceCodexHistoryViewport("draw", ticket, false);
+            if (codexHistoryInitialFillTicket != ticket) return;
+            codexHistoryInitialFillTicket = null;
+            if (chatListView != list || currentAccount != account
+                    || !isCodexHistoryScrollCurrent(token, epoch, revision) || !canFillCodexHistoryInitialViewport()
+                    || list.getItemAnimator() != null && list.getItemAnimator().isRunning()
+                    || list.hasPendingAdapterUpdates() || list.isComputingLayout() || list.isLayoutRequested()
+                    || list.getHeight() <= 0 || list.getChildCount() == 0
+                    || (list.canScrollVertically(-1) || list.canScrollVertically(1)) && !canBridgeCodexHistoryInitialViewport()) return;
+            codexHistoryInitialFillUsedToken = token;
+            codexHistoryInitialFillUsedEpoch = epoch;
+            codexHistoryInitialFillToken = 0;
+            loading = true;
+            updateCodexHistoryLoadingCells();
+            waitingForLoad.add(lastLoadIndex);
+            getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 50, maxMessageId[0], 0,
+                    !cacheEndReached[0], minDate[0], classGuid, 0, 0, chatMode, threadMessageId,
+                    replyMaxReadId, lastLoadIndex++, isTopic);
+        }));
+        list.invalidate();
+    }
+
+    /** 仅原布局和动画事件重验；短屏保留新view额度，同view同epoch与已用桥接额度不重开。 */
+    private void retryCodexHistoryInitialFillAfterLayout() {
+        if (codexHistoryInitialFillToken != 0 && codexHistoryInitialFillToken == codexHistoryViewToken
+                && codexHistoryInitialFillTicket == null && canFillCodexHistoryInitialViewport()) {
+            scheduleCodexHistoryInitialFill();
+        }
+    }
+
+    /** watch增量只进入其原绑定段；没有段元数据的本机待发仍沿既有路径显示。 */
+    private boolean acceptsCodexHistoryIncrement(Object[] args) {
+        if (!isCodexHistoryView() || args.length < 5 || !Long.valueOf(dialog_id).equals(args[0])) return true;
+        if (!(args[4] instanceof com.butang.codextop.CodexRuntime.HistoryPage)) return false;
+        com.butang.codextop.CodexRuntime.HistoryPage page = (com.butang.codextop.CodexRuntime.HistoryPage) args[4];
+        return codexHistoryViewToken != 0 && page.token == codexHistoryViewToken && !page.replaceLatest
+                && com.butang.codextop.CodexRuntime.isHistoryPageCurrent(page)
+                && codexHistoryEpoch != null && codexHistoryEpoch.equals(page.fromEpoch) && codexHistoryEpoch.equals(page.toEpoch);
+    }
+
+    /** 真实拖动锁定当前阅读段，不以程序滚动或旧整数偏好推断用户意图。 */
+    private void lockCodexHistoryReading() {
+        if (isCodexHistoryView()) {
+            codexHistoryReadingLocked = true;
+            cancelCodexHistoryInitialFill();
+        }
+    }
+
+    /** 只有用户点击回到最新才解除阅读锁，候选页仍须通过同一接收校验。 */
+    private boolean requestCodexLatestHistory() {
+        if (!isCodexHistoryView()) return false;
+        cancelCodexLocalHistorySelection();
+        codexLocalHistoryInitialAnchorId = 0;
+        codexLocalHistoryBoundary = null;
+        codexLocalHistoryBoundaryEpoch = null;
+        codexLocalHistoryAwaitingInput = false;
+        cancelCodexHistoryInitialFill();
+        codexHistoryOlderRetryRequired = false;
+        codexHistoryOlderContinueAvailable = false;
+        codexHistoryReadingLocked = false;
+        clearCodexHistoryBookmark();
+        openCodexHistoryView();
+        if (codexHistoryViewToken != 0)
+            com.butang.codextop.CodexRuntime.requestLatestHistory(currentAccount, dialog_id, classGuid, codexHistoryViewToken);
+        // 回最新已撤销旧读取代次；本入口只取已有最新段，不能继续展示旧请求的加载圈。
+        if (chatAdapter == null || !chatAdapter.isFiltered) {
+            loading = false;
+            loadingForward = false;
+            updateCodexHistoryLoadingCells();
+        }
+        return true;
+    }
+
+    /** 书签复用原偏好owner，但键包含真实服务、账号、电脑和会话身份。 */
+    private String codexHistoryBookmarkPrefix() {
+        String scope = com.butang.codextop.CodexRuntime.historyBookmarkKey(currentAccount, dialog_id);
+        return TextUtils.isEmpty(scope) ? null : "codexReading:" + scope + ":";
+    }
+
+    /** 回到最新不留下自动恢复入口；不读取或重用旧diditem整数。 */
+    private void clearCodexHistoryBookmark() {
+        String prefix = codexHistoryBookmarkPrefix();
+        if (prefix != null) MessagesController.getNotificationsSettings(currentAccount).edit()
+                .remove(prefix + "source").remove(prefix + "local").remove(prefix + "offset").apply();
+    }
+
+    /** 仅保存主动阅读的真实来源身份与原底部偏移，不把待发负号或日期行当书签。 */
+    private void saveCodexHistoryBookmark() {
+        if (!isCodexHistoryView() || chatLayoutManager == null || chatListView == null) return;
+        if (!codexHistoryReadingLocked) {
+            clearCodexHistoryBookmark();
+            return;
+        }
+        String prefix = codexHistoryBookmarkPrefix();
+        if (prefix == null) return;
+        int position = chatLayoutManager.findFirstVisibleItemPosition();
+        RecyclerView.ViewHolder holder = chatListView.findViewHolderForAdapterPosition(position);
+        if (holder == null || !(holder.itemView instanceof ChatMessageCell))
+            holder = chatListView.findViewHolderForAdapterPosition(position + 1);
+        if (holder == null || !(holder.itemView instanceof ChatMessageCell)) return;
+        MessageObject message = ((ChatMessageCell) holder.itemView).getMessageObject();
+        if (message == null || message.messageOwner == null || message.messageOwner.params == null
+                || !java.util.Objects.equals(codexHistoryEpoch, message.messageOwner.params.get("codexHistoryEpoch"))) return;
+        String source = message.messageOwner.params.get("codexSourceId");
+        if (TextUtils.isEmpty(source)) return;
+        String local = message.isOut() ? message.messageOwner.params.get("codexLocalId") : null;
+        MessagesController.getNotificationsSettings(currentAccount).edit().putString(prefix + "source", source)
+                .putString(prefix + "local", local).putInt(prefix + "offset", holder.itemView.getBottom() - chatListView.getMeasuredHeight()).apply();
+    }
+
+    /** 书签不可用时读取原绑定段首页，不把整数邻居伪装成原位置。 */
+    private void reloadCodexBoundHistory() {
+        clearCodexHistoryScrollTargets();
+        clearChatData(true);
+        firstMessagesLoaded = false;
+        firstLoadMessages();
+    }
+
+    /** 仅恢复本片段尚在阅读的来源书签；解析失败不借相邻整数消息冒充原位置。 */
+    private void restoreCodexHistoryBookmark() {
+        if (!isCodexHistoryView() || !codexHistoryReadingLocked || codexHistoryViewToken == 0 || !messages.isEmpty()) return;
+        String prefix = codexHistoryBookmarkPrefix();
+        if (prefix == null) { reloadCodexBoundHistory(); return; }
+        SharedPreferences preferences = MessagesController.getNotificationsSettings(currentAccount);
+        String source = preferences.getString(prefix + "source", null);
+        if (TextUtils.isEmpty(source)) { reloadCodexBoundHistory(); return; }
+        String local = preferences.getString(prefix + "local", null);
+        int offset = preferences.getInt(prefix + "offset", 0);
+        long token = codexHistoryViewToken;
+        com.butang.codextop.CodexRuntime.resolveHistoryBookmark(currentAccount, dialog_id, classGuid, token, source, local, bookmark -> {
+            if (token != codexHistoryViewToken || !codexHistoryReadingLocked) return;
+            if (bookmark.messageId == 0 || TextUtils.isEmpty(bookmark.epoch)) { reloadCodexBoundHistory(); return; }
+            codexHistoryEpoch = bookmark.epoch;
+            clearCodexHistoryScrollTargets();
+            clearChatData(true);
+            startLoadFromMessageId = bookmark.messageId;
+            startLoadFromMessageOffset = offset;
+            firstMessagesLoaded = false;
+            firstLoadMessages();
+        });
+    }
 
     /** 原会话信息展示完整来源及STATUS只读目标，原待回复与审批按钮保持不变。 */
     public void showCodexConversationInfo() {
@@ -855,6 +1614,8 @@ public class ChatActivity extends BaseFragment implements
             builder.setPositiveButton("回答问题", (dialog, which) -> showCodexQuestions());
             builder.setNegativeButton("关闭", null);
         }
+        if (canBrowseCodexLocalHistory()) builder.setItems(new CharSequence[]{"查看本地记录"},
+                (dialog, which) -> showCodexLocalHistory(null));
         showDialog(builder.create());
     }
 
@@ -3285,6 +4046,7 @@ public class ChatActivity extends BaseFragment implements
         }
 
         dialog_id_Long = dialog_id;
+        resetCodexUnscopedInitialAnchor();
 
         transitionAnimationGlobalIndex = NotificationCenter.getGlobalInstance().setAnimationInProgress(transitionAnimationGlobalIndex, new int[0]);
 
@@ -3461,7 +4223,7 @@ public class ChatActivity extends BaseFragment implements
                 }
                 getMessagesController().loadPeerSettings(currentUser, currentChat);
 
-                if (startLoadFromMessageId == 0) {
+                if (startLoadFromMessageId == 0 && !isCodexHistoryView()) {
                     SharedPreferences sharedPreferences = MessagesController.getNotificationsSettings(currentAccount);
                     int messageId = sharedPreferences.getInt("diditem" + NotificationsController.getSharedPrefKey(dialog_id, getTopicId()), 0);
                     if (messageId != 0) {
@@ -3470,7 +4232,7 @@ public class ChatActivity extends BaseFragment implements
                         startLoadFromMessageOffset = sharedPreferences.getInt("diditemo" + NotificationsController.getSharedPrefKey(dialog_id, getTopicId()), 0);
                         startLoadFromMessageId = messageId;
                     }
-                } else {
+                } else if (startLoadFromMessageId != 0) {
                     showScrollToMessageError = true;
                     needSelectFromMessageId = true;
                 }
@@ -3680,6 +4442,10 @@ public class ChatActivity extends BaseFragment implements
         if (firstMessagesLoaded) {
             return;
         }
+        if (isCodexHistoryView()) {
+            codexHistoryReadingLocked |= startLoadFromMessageId != 0 || startLoadFromDate != 0;
+            openCodexHistoryView();
+        }
         firstMessagesLoaded = true;
         final Runnable load = () -> {
             waitingForLoad.add(lastLoadIndex);
@@ -3782,6 +4548,7 @@ public class ChatActivity extends BaseFragment implements
 
     @Override
     public void onFragmentDestroy() {
+        pauseCodexHistoryView(true);
         super.onFragmentDestroy();
         if (messageMetricsView != null) {
             messageMetricsView.finish();
@@ -6887,6 +7654,7 @@ public class ChatActivity extends BaseFragment implements
                     chatActivityEnterView.runEmojiPanelAnimation();
                 }
 
+                /** 原动画收尾后重验尚未消费的首屏补页，通知恢复顺序保持。 */
                 @Override
                 protected void onAllAnimationsDone() {
                     super.onAllAnimationsDone();
@@ -6903,10 +7671,12 @@ public class ChatActivity extends BaseFragment implements
                         if (BuildVars.LOGS_ENABLED) {
                             FileLog.d("chatItemAnimator enable notifications");
                         }
+                        retryCodexHistoryInitialFillAfterLayout();
                     });
                 }
 
 
+                /** 强制结束也沿原UI收尾事件重验首屏，覆盖没有普通完成通知的路径。 */
                 @Override
                 public void endAnimations() {
                     super.endAnimations();
@@ -6922,6 +7692,7 @@ public class ChatActivity extends BaseFragment implements
                         if (BuildVars.LOGS_ENABLED) {
                             FileLog.d("chatItemAnimator enable notifications");
                         }
+                        retryCodexHistoryInitialFillAfterLayout();
                     });
                 }
             };
@@ -7042,6 +7813,13 @@ public class ChatActivity extends BaseFragment implements
                     }
                 }
                 return false;
+            }
+
+            /** 原布局完成后只登记一次绘制检查，真正派发仍由首屏owner和单次额度决定。 */
+            @Override
+            public void onLayoutCompleted(RecyclerView.State state) {
+                super.onLayoutCompleted(state);
+                retryCodexHistoryInitialFillAfterLayout();
             }
 
             @Override
@@ -7200,6 +7978,7 @@ public class ChatActivity extends BaseFragment implements
             private boolean scrollUp;
             private final int scrollValue = AndroidUtilities.dp(100);
 
+            /** 保留原滚动状态处理，并让 Codex 短列表的真实拖动能发起分页检查。 */
             @Override
             public void onScrollStateChanged(RecyclerView recyclerView, int newState) {
                 if (newState == RecyclerView.SCROLL_STATE_IDLE) {
@@ -7234,6 +8013,14 @@ public class ChatActivity extends BaseFragment implements
                         wasManualScroll = true;
                         scrollingChatListView = true;
                     } else if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+                        codexLocalHistoryAwaitingInput = false;
+                        lockCodexHistoryReading();
+                        // 短列表拖动可能没有位移回调，真实拖动入口补一次旧页检查；过滤搜索保留原触发时机。
+                        if (isCodexHistoryView() && !chatAdapter.isFiltered) {
+                            // 失败后只准许新一次真实拖动重试；持续拖动的位移或程序滚动不能解除门禁。
+                            codexHistoryOlderRetryRequired = false;
+                            checkScrollForLoad(true);
+                        }
                         pollHintCell = null;
                         wasManualScroll = true;
                         scrollingFloatingDate = true;
@@ -11059,6 +11846,7 @@ public class ChatActivity extends BaseFragment implements
     private boolean forceScrollToMessageBottom;
 
     public void onPageDownClicked() {
+        if (requestCodexLatestHistory()) return;
         wasManualScroll = true;
         textSelectionHelper.cancelTextSelectionRunnable();
         final Runnable inCaseLoading = () -> {
@@ -14220,10 +15008,12 @@ public class ChatActivity extends BaseFragment implements
         return contentView.getKeyboardHeight() > AndroidUtilities.dp(20);
     }
 
-    private void checkScrollForLoad(boolean scroll) {
+    /** 检查可见区分页；显式重试在同一个原队列执行点准入，普通滚动沿原路径。 */
+    private void checkScrollForLoad(boolean scroll, java.util.function.BooleanSupplier codexRetryAdmission) {
         if (chatLayoutManager == null || paused || chatAdapter.isFrozen || waitingForGetDifference) {
             return;
         }
+        if (isCodexHistoryView() && codexHistoryViewToken == 0) return;
         int firstVisibleItem = RecyclerListView.NO_POSITION;
         int lastVisibleItem = RecyclerListView.NO_POSITION;
         int visibleItemCount = 0;
@@ -14267,10 +15057,28 @@ public class ChatActivity extends BaseFragment implements
             return;
         }
 
+        final long codexQueuedToken = codexHistoryViewToken;
+        final boolean codexQueuedView = isCodexHistoryView();
+        final int codexQueuedAccount = currentAccount;
+        final String codexQueuedEpoch = codexHistoryEpoch;
+        final long codexQueuedRevision = codexHistoryViewRevision;
         AndroidUtilities.runOnUIThread(() -> {
-            if (totalItemCount - firstVisibleItemFinal - visibleItemCountFinal <= checkLoadCount && !loading) {
+            if (!isCodexHistoryScrollCurrent(codexQueuedToken, codexQueuedEpoch, codexQueuedRevision)) return;
+            // 点击后到实际执行之间也可能退出账号；仅核验现有绑定，不让旧控件重建页面。
+            if (codexQueuedView && (currentAccount != codexQueuedAccount || !isCodexHistoryView()
+                    || !com.butang.codextop.CodexRuntime.isHistoryViewCurrent(
+                    codexQueuedAccount, dialog_id, classGuid, codexQueuedToken, codexQueuedEpoch))) return;
+            // 刚查看本地段只展示本地定位结果；真实拖动或明确继续后才恢复原双向分页。
+            if (codexQueuedView && codexLocalHistoryAwaitingInput && codexRetryAdmission == null) return;
+            // 执行时重新读取阅读意图，回到最新可撤销已排队的旧向检查；普通 Telegram 保留原路径。
+            if (totalItemCount - firstVisibleItemFinal - visibleItemCountFinal <= checkLoadCount && !loading
+                    && (!isCodexHistoryView() || (codexHistoryReadingLocked || codexRetryAdmission != null)
+                    && (!codexHistoryOlderRetryRequired || codexRetryAdmission != null))) {
+                // 只有实际能派发旧页时才消费按钮资格；拒绝时退出，不能顺带发起向新请求。
+                if (codexRetryAdmission != null && !codexRetryAdmission.getAsBoolean()) return;
                 if (!endReached[0]) {
                     loading = true;
+                    updateCodexHistoryLoadingCells();
                     waitingForLoad.add(lastLoadIndex);
                     if (messagesByDays.size() != 0) {
                         getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 50, maxMessageId[0], 0, !cacheEndReached[0], minDate[0], classGuid, 0, 0, chatMode, threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
@@ -14279,22 +15087,32 @@ public class ChatActivity extends BaseFragment implements
                     }
                 } else if (mergeDialogId != 0 && !endReached[1]) {
                     loading = true;
+                    updateCodexHistoryLoadingCells();
                     waitingForLoad.add(lastLoadIndex);
                     getMessagesController().loadMessages(mergeDialogId, 0, false, 50, maxMessageId[1], 0, !cacheEndReached[1], minDate[1], classGuid, 0, 0, chatMode, threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
                 }
             }
+            // 按钮只重试旧向；原滚动调用仍保留下面独立的向新加载语义。
+            if (codexRetryAdmission != null) return;
             if (visibleItemCountFinal > 0 && !loadingForward && firstVisibleItemFinal <= 10) {
                 if (mergeDialogId != 0 && !forwardEndReached[1]) {
                     waitingForLoad.add(lastLoadIndex);
                     getMessagesController().loadMessages(mergeDialogId, 0, false, 50, minMessageId[1], 0, true, maxDate[1], classGuid, 1, 0, chatMode, threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
                     loadingForward = true;
+                    updateCodexHistoryLoadingCells();
                 } else if (!forwardEndReached[0]) {
                     waitingForLoad.add(lastLoadIndex);
                     getMessagesController().loadMessages(dialog_id, mergeDialogId, false, 50, minMessageId[0], 0, true, maxDate[0], classGuid, 1, 0, chatMode, threadMessageId, replyMaxReadId, lastLoadIndex++, isTopic);
                     loadingForward = true;
+                    updateCodexHistoryLoadingCells();
                 }
             }
         });
+    }
+
+    /** 原有滚动和生命周期入口不携带重试资格，保持其既有派发方向与预算。 */
+    private void checkScrollForLoad(boolean scroll) {
+        checkScrollForLoad(scroll, null);
     }
 
     private void processSelectedAttach(int which) {
@@ -16052,6 +16870,7 @@ public class ChatActivity extends BaseFragment implements
         return () -> getMessagesController().doDeleteShowOnceTask(taskId, dialog_id, messageObject.getId());
     }
 
+    /** 保留原清屏与分页状态重置，并同步 Codex 当前加载行。 */
     private void clearChatData(boolean full) {
         messages.clear();
         messagesByDays.clear();
@@ -16098,6 +16917,7 @@ public class ChatActivity extends BaseFragment implements
         if (chatAdapter != null && !chatAdapter.isFiltered) {
             chatAdapter.notifyDataSetChanged(false);
         }
+        updateCodexHistoryLoadingCells();
     }
 
     public void scrollToLastMessage(boolean skipSponsored, boolean top) {
@@ -17267,6 +18087,8 @@ public class ChatActivity extends BaseFragment implements
         if (waitingForGetDifference) {
             return;
         }
+        // 已打开页面中的明确定位沿当前段阅读，不被后台最新段候选抢走。
+        if (id != 0) lockCodexHistoryReading();
         if (id == 0 || NotificationCenter.getInstance(currentAccount).isAnimationInProgress() || getParentActivity() == null) {
             if (NotificationCenter.getInstance(currentAccount).isAnimationInProgress()) {
                 nextScrollToMessageId = id;
@@ -17476,7 +18298,9 @@ public class ChatActivity extends BaseFragment implements
         if (sideControlsButtonsLayout == null) {
             return;
         }
-        boolean show = canShowPagedownButton && !hasTextSelection() && !chatActivityEnterView.isRecordingAudioVideo() && !isInsideContainer && (!searching || getMediaDataController().searchResultMessages.isEmpty());
+        boolean show = (canShowPagedownButton || isCodexHistoryView() && codexHistoryLatestAvailable)
+                && !hasTextSelection() && !chatActivityEnterView.isRecordingAudioVideo() && !isInsideContainer
+                && (!searching || getMediaDataController().searchResultMessages.isEmpty());
         if (show) {
             if (animated && (openAnimationStartTime == 0 || SystemClock.elapsedRealtime() < openAnimationStartTime + 150)) {
                 animated = false;
@@ -20958,7 +21782,28 @@ public class ChatActivity extends BaseFragment implements
         }
     }
 
-    private void didReceivedNotification_messagesDidLoad(int id, int account, final Object... args) {
+    /** 沿原通知消费流程完成分页，并在实际结束点同步 Codex 已显示的加载圈。 */
+    private void didReceivedNotification_messagesDidLoad(int id, int account, final Object... received) {
+        // 布局期通知先保留原交付，离开当前布局栈后重验页面身份，再接受段和刷新列表。
+        if (isCodexHistoryView() && received.length > 15
+                && (Integer) received[10] == classGuid && (Integer) received[14] == MODE_DEFAULT
+                && received[15] instanceof com.butang.codextop.CodexRuntime.HistoryPage
+                && chatListView != null && chatListView.isComputingLayout()) {
+            final RecyclerListView receivingList = chatListView;
+            final int receivingAccount = currentAccount;
+            final long receivingToken = codexHistoryViewToken;
+            final com.butang.codextop.CodexRuntime.HistoryPage page =
+                    (com.butang.codextop.CodexRuntime.HistoryPage) received[15];
+            AndroidUtilities.runOnUIThread(() -> {
+                if (paused || chatListView != receivingList || currentAccount != receivingAccount
+                        || codexHistoryViewToken != receivingToken || !isCodexHistoryView()
+                        || !com.butang.codextop.CodexRuntime.isHistoryPageCurrent(page)) return;
+                didReceivedNotification_messagesDidLoad(id, account, received);
+            });
+            return;
+        }
+        Object[] args = prepareCodexHistoryPage(received);
+        if (args == null) return;
         int guid = (Integer) args[10];
         if (guid != classGuid) {
             return;
@@ -21111,6 +21956,7 @@ public class ChatActivity extends BaseFragment implements
                 }
                 if (!found) {
                     startLoadFromMessageId = 0;
+                    finishCodexHistoryLoading((Integer) args[8]);
                     return;
                 }
             }
@@ -21134,7 +21980,29 @@ public class ChatActivity extends BaseFragment implements
         int fnid = (Integer) args[4];
         int last_unread_date = (Integer) args[7];
         int load_type = (Integer) args[8];
+        // 身份、等待编号和模式均已通过；失败仍结束加载，但不让收页尾/布局立即循环重发。
+        if (isCodexHistoryView() && load_type == 0 && args.length > 15
+                && args[15] instanceof com.butang.codextop.CodexRuntime.HistoryPage
+                && ((com.butang.codextop.CodexRuntime.HistoryPage) args[15]).loadFailed) {
+            codexHistoryOlderRetryRequired = true;
+        }
         boolean isEnd = (Boolean) args[9];
+        // 仅消费已验页面/等待编号的成功通知；非空latest完整时原Telegram endReached未必同步。
+        if (isCodexHistoryView() && (load_type == 0 || load_type == 2) && args.length > 15
+                && args[15] instanceof com.butang.codextop.CodexRuntime.HistoryPage
+                && !((com.butang.codextop.CodexRuntime.HistoryPage) args[15]).loadFailed) {
+            codexHistoryOlderContinueAvailable = !isEnd && (!messArr.isEmpty() || codexHistoryOlderContinueAvailable);
+        }
+        // 同一已接纳通知携带轻量本地段事实，未知/失败快照不授予或清除浏览资格。
+        if (isCodexHistoryView() && args.length > 15 && args[15] instanceof com.butang.codextop.CodexRuntime.HistoryPage) {
+            com.butang.codextop.CodexRuntime.LocalHistoryBoundary boundary = ((com.butang.codextop.CodexRuntime.HistoryPage) args[15]).localBoundary;
+            if (boundary != null) {
+                codexLocalHistoryBoundary = boundary;
+                codexLocalHistoryBoundaryEpoch = codexHistoryEpoch;
+                // 本地around不以end=false推断继续，只有快照明确还有来源旧页才给手动入口。
+                if (load_type == 3) codexHistoryOlderContinueAvailable = boundary.hasMore && !messArr.isEmpty();
+            }
+        }
         int loaded_max_id = (Integer) args[12];
         int loaded_mentions_count = chatWasReset ? 0 : (Integer) args[13];
 
@@ -21174,6 +22042,7 @@ public class ChatActivity extends BaseFragment implements
             resetProgressDialogLoading();
             showPinnedProgress(false);
             if (postponedScrollIsCanceled) {
+                finishCodexHistoryLoading(load_type);
                 return;
             }
             if (postponedScrollMessageId == 0) {
@@ -21202,6 +22071,7 @@ public class ChatActivity extends BaseFragment implements
                         } else {
                             BulletinFactory.of(this).createErrorBulletin(LocaleController.getString(R.string.MessageNotFound), themeDelegate).show();
                         }
+                        finishCodexHistoryLoading(load_type);
                         return;
                     }
                     showScrollToMessageError = false;
@@ -21425,6 +22295,9 @@ public class ChatActivity extends BaseFragment implements
         if (!chatWasReset && (load_type == 2 || load_type == 1) && messArr.isEmpty() && !isCache) {
             forwardEndReached[0] = true;
         }
+        // 原向旧追加要求尾邻居是真实历史；恢复的旧待发暂取后沿同对象归位，混合页走整刷新。
+        CodexPendingHistoryRows codexPendingHistoryRows = takeCodexPendingHistoryRows(load_type, loadIndex);
+        if (codexPendingHistoryRows != null) universalNotify = true;
         LongSparseArray<MessageObject.GroupedMessages> newGroups = null;
         LongSparseArray<MessageObject.GroupedMessages> changedGroups = null;
         MediaController mediaController = MediaController.getInstance();
@@ -21820,6 +22693,7 @@ public class ChatActivity extends BaseFragment implements
                 newRowsCount++;
             }
         }
+        restoreCodexPendingHistoryRows(codexPendingHistoryRows);
         checkGroupMessagesOrder();
         if (createUnreadLoading) {
             createUnreadMessageAfterId = 0;
@@ -21841,7 +22715,8 @@ public class ChatActivity extends BaseFragment implements
                     first_unread_id = 0;
                     last_message_id = 0;
                     createUnreadMessageAfterId = 0;
-                    if (!universalNotify && !chatAdapter.isFiltered) {
+                    // 本地段仍需保留回最新行，终态只结束加载，不能向列表虚报删除。
+                    if (!universalNotify && !chatAdapter.isFiltered && !hasCodexLocalHistoryBoundary(false)) {
                         chatAdapter.notifyItemRemoved(chatAdapter.loadingDownRow);
                     }
                 }
@@ -21875,6 +22750,7 @@ public class ChatActivity extends BaseFragment implements
                 }
             }
             loadingForward = false;
+            updateCodexHistoryLoadingCells();
         } else {
             if (messArr.size() < count && load_type != 3 && load_type != 4) {
                 if (isCache) {
@@ -21889,6 +22765,7 @@ public class ChatActivity extends BaseFragment implements
                 }
             }
             loading = false;
+            updateCodexHistoryLoadingCells();
             if (onChatMessagesLoaded != null) {
                 onChatMessagesLoaded.run();
                 onChatMessagesLoaded = null;
@@ -21909,10 +22786,20 @@ public class ChatActivity extends BaseFragment implements
                     }
                     if (scrollToMessage != null) {
                         addSponsoredMessages(!isFirstLoading);
+                        // 只消费本次本地选段锚，返回行以实时底部padding定位，不借旧引用或正文高度偏移。
+                        if (codexLocalHistoryInitialAnchorId != 0) chatAdapter.updateRowsSafe();
+                        boolean alignLocalBoundary = load_type == 3 && !postponedScroll
+                                && codexLocalHistoryInitialAnchorId != 0
+                                && scrollToMessage.getId() == codexLocalHistoryInitialAnchorId
+                                && hasCodexLocalHistoryBoundary(false) && chatAdapter.loadingDownRow >= 0;
+                        codexLocalHistoryInitialAnchorId = 0;
                         int yOffset;
                         boolean opt = false;
                         boolean bottom = true;
-                        if (startLoadFromMessageOffset != Integer.MAX_VALUE) {
+                        if (alignLocalBoundary) {
+                            yOffset = 0;
+                            startLoadFromMessageOffset = Integer.MAX_VALUE;
+                        } else if (startLoadFromMessageOffset != Integer.MAX_VALUE) {
                             yOffset = -startLoadFromMessageOffset - chatListView.getPaddingBottom();
                             startLoadFromMessageOffset = Integer.MAX_VALUE;
                         } else if (scrollToMessagePosition == -9000) {
@@ -21928,14 +22815,16 @@ public class ChatActivity extends BaseFragment implements
                         } else {
                             yOffset = scrollToMessagePosition;
                         }
-                        yOffset += AndroidUtilities.dp(50); // in case pinned message view is visible
-                        if (!opt) {
+                        if (!alignLocalBoundary) yOffset += AndroidUtilities.dp(50); // in case pinned message view is visible
+                        if (!opt && !alignLocalBoundary) {
                             yOffset -= scrollOffsetForQuote(scrollToMessage);
                         }
                         if (!postponedScroll) {
                             if (!messages.isEmpty()) {
                                 chatAdapter.updateRowsSafe();
-                                if (chatAdapter.loadingUpRow >= 0 && !messages.isEmpty() && (messages.get(messages.size() - 1) == scrollToMessage || messages.get(messages.size() - 2) == scrollToMessage)) {
+                                if (alignLocalBoundary) {
+                                    chatLayoutManager.scrollToPositionWithOffset(chatAdapter.loadingDownRow, yOffset, bottom);
+                                } else if (chatAdapter.loadingUpRow >= 0 && !messages.isEmpty() && (messages.get(messages.size() - 1) == scrollToMessage || messages.get(messages.size() - 2) == scrollToMessage)) {
                                     chatLayoutManager.scrollToPositionWithOffset(chatAdapter.loadingUpRow, yOffset, bottom);
                                 } else {
                                     chatLayoutManager.scrollToPositionWithOffset(chatAdapter.messagesStartRow + messages.indexOf(scrollToMessage), yOffset, bottom);
@@ -22007,7 +22896,10 @@ public class ChatActivity extends BaseFragment implements
                             }
                         }
                     } else if (chatAdapter.loadingUpRow >= 0 && endReached[loadIndex] && (loadIndex == 0 && mergeDialogId == 0 || loadIndex == 1)) {
-                        chatAdapter.notifyItemRemoved(chatAdapter.loadingUpRow);
+                        // 其他本地段入口仍占上行时，空终态同样不能发布一条不存在的删除。
+                        if (!hasCodexLocalHistoryBoundary(true)) {
+                            chatAdapter.notifyItemRemoved(chatAdapter.loadingUpRow);
+                        }
                         if (chatAdapter.userInfoRow >= 0 && unreadMessageObject != null && messages.indexOf(unreadMessageObject) >= messages.size() - 2) {
                             chatLayoutManager.scrollToPositionWithOffset(chatAdapter.userInfoRow, 0, false);
                         }
@@ -22117,6 +23009,17 @@ public class ChatActivity extends BaseFragment implements
         }
         addSponsoredMessages(!isFirstLoading);
         checkScrollForLoad(false);
+        if (isCodexHistoryView() && load_type == 2) {
+            cancelCodexHistoryInitialFill();
+            codexHistoryInitialFillGapEpoch = null;
+            if (!isEnd && !messArr.isEmpty()) {
+                // 等待编号和收页逻辑均已接纳后才消费快照，迟到latest不能给旧布局新增资格。
+                com.butang.codextop.CodexRuntime.HistoryPage page = (com.butang.codextop.CodexRuntime.HistoryPage) args[15];
+                codexHistoryInitialFillGapEpoch = page.unbridgedCachedHistory ? page.toEpoch : null;
+                codexHistoryInitialFillToken = codexHistoryViewToken;
+                scheduleCodexHistoryInitialFill();
+            }
+        }
 
         if (postponedScroll && !fakePostponedScroll) {
             if (!universalNotify && chatAdapter != null) {
@@ -22240,6 +23143,7 @@ public class ChatActivity extends BaseFragment implements
                 }
             }
         }
+        if (codexPendingHistoryRows != null && !postponedScroll) restoreCodexPendingHistoryAnchor(codexPendingHistoryRows);
     }
 
     private void didReceivedNotification2(int id, int account, final Object... args) {
@@ -22434,6 +23338,7 @@ public class ChatActivity extends BaseFragment implements
                 headerItem.setSubItemShown(open_direct, ChatObject.isChannel(currentChat) && !ChatObject.isMonoForum(currentChat) && currentChat.linked_monoforum_id != 0 && ChatObject.canManageMonoForum(currentAccount, -currentChat.linked_monoforum_id));
             }
         } else if (id == NotificationCenter.didReceiveNewMessages) {
+            if (!acceptsCodexHistoryIncrement(args)) return;
             FileLog.d("ChatActivity didReceiveNewMessages start");
             long did = (Long) args[0];
             ArrayList<MessageObject> arr = (ArrayList<MessageObject>) args[1];
@@ -26269,14 +27174,22 @@ public class ChatActivity extends BaseFragment implements
                 }
 
                 if (placeToPaste == -1) {
-                    if (!obj.scheduled && obj.messageOwner.id < 0 || obj.isQuickReply() || messages.isEmpty()) {
+                    // 重开恢复保留原负编号；显式恢复标记按原日期入列，不能占据今天的新尾部。
+                    final boolean codexRestoredPending = !obj.scheduled && obj.messageOwner.id < 0
+                            && com.butang.codextop.CodexRuntime.ownsConversation(dialog_id)
+                            && obj.messageOwner.params != null
+                            && "true".equals(obj.messageOwner.params.get("codexRestoredPending"));
+                    if (!obj.scheduled && obj.messageOwner.id < 0 && !codexRestoredPending || obj.isQuickReply() || messages.isEmpty()) {
                         placeToPaste = 0;
                     } else {
                         final int size = messages.size();
                         for (int b = 0; b < size; b++) {
                             final MessageObject lastMessage = messages.get(b);
                             if (lastMessage.type >= 0 && lastMessage.messageOwner.date > 0) {
-                                if (chatMode != MODE_SCHEDULED && lastMessage.messageOwner.id > 0 && obj.messageOwner.id > 0 && lastMessage.messageOwner.id < obj.messageOwner.id || lastMessage.messageOwner.date < obj.messageOwner.date || lastMessage.messageOwner.date == obj.messageOwner.date) {
+                                // 同秒的恢复负编号按更负较新保持批次和附件顺序，正编号及原版规则保持。
+                                if (chatMode != MODE_SCHEDULED && lastMessage.messageOwner.id > 0 && obj.messageOwner.id > 0 && lastMessage.messageOwner.id < obj.messageOwner.id || lastMessage.messageOwner.date < obj.messageOwner.date
+                                        || lastMessage.messageOwner.date == obj.messageOwner.date
+                                        && (!codexRestoredPending || lastMessage.messageOwner.id >= 0 || obj.messageOwner.id < lastMessage.messageOwner.id)) {
                                     MessageObject.GroupedMessages lastGroupedMessages;
                                     if (lastMessage.getGroupId() != 0) {
                                         lastGroupedMessages = groupedMessagesMap.get(lastMessage.getGroupId());
@@ -30284,6 +31197,10 @@ public class ChatActivity extends BaseFragment implements
     public void onResume() {
         codexApprovalBusy = false;
         codexQuestionBusy = false;
+        final long codexResumeToken = codexHistoryViewToken;
+        final String codexResumeEpoch = codexHistoryEpoch;
+        final long codexResumeRevision = codexHistoryViewRevision;
+        resumeCodexHistoryView();
         if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexRuntime.watchConversation(currentAccount, dialog_id);
         super.onResume();
         checkShowBlur(false);
@@ -30358,6 +31275,10 @@ public class ChatActivity extends BaseFragment implements
             getNotificationsController().setOpenedDialogId(dialog_id, getTopicId());
         }
         getMessagesController().setLastVisibleDialogId(dialog_id, chatMode == MODE_SCHEDULED, true);
+        if (!isCodexHistoryScrollCurrent(codexResumeToken, codexResumeEpoch, codexResumeRevision)) {
+            scrollToTopOnResume = scrollToTopUnReadOnResume = false;
+            scrollToMessage = null;
+        }
         if (scrollToTopOnResume) {
             if (scrollToTopUnReadOnResume && scrollToMessage != null) {
                 if (chatListView != null) {
@@ -30383,8 +31304,11 @@ public class ChatActivity extends BaseFragment implements
         }
 
         paused = false;
+        // 首次恢复前已绑定的加载行不会必然重绑，在途首载也要立即恢复真实请求指示。
+        updateCodexHistoryLoadingCells();
         pausedOnLastMessage = false;
         checkScrollForLoad(false);
+        scheduleCodexHistoryInitialFill();
         if (wasPaused) {
             wasPaused = false;
             if (chatAdapter != null) {
@@ -30504,6 +31428,8 @@ public class ChatActivity extends BaseFragment implements
     @Override
     /** 保留原页面暂停流程，撤销旧提问弹窗回调并停止离开后的电脑消息轮询。 */
     public void onPause() {
+        saveCodexHistoryBookmark();
+        pauseCodexHistoryView(false);
         codexQuestionUiGeneration++;
         if (codexQuestionDialog != null) codexQuestionDialog.dismiss();
         codexQuestionBusy = false;
@@ -30543,7 +31469,7 @@ public class ChatActivity extends BaseFragment implements
             getMessagesController().cancelTyping(0, dialog_id, threadMessageId);
         }
         if (chatMode == 0 || chatMode == MODE_SAVED) {
-            if (!pausedOnLastMessage && !firstLoading && (!isThreadChat() || isTopic)) {
+            if (!isCodexHistoryView() && !pausedOnLastMessage && !firstLoading && (!isThreadChat() || isTopic)) {
                 SharedPreferences.Editor editor = MessagesController.getNotificationsSettings(currentAccount).edit();
                 int messageId = 0;
                 int offset = 0;
@@ -37465,7 +38391,8 @@ public class ChatActivity extends BaseFragment implements
             }
 
             if (!messages.isEmpty()) {
-                if (!isFiltered && (!forwardEndReached[0] || mergeDialogId != 0 && !forwardEndReached[1]) && !hideForwardEndReached) {
+                if (!isFiltered && ((!forwardEndReached[0] || mergeDialogId != 0 && !forwardEndReached[1]) && !hideForwardEndReached
+                        || hasCodexLocalHistoryBoundary(false))) {
                     loadingDownRow = rowCount++;
                 } else {
                     loadingDownRow = -5;
@@ -37505,7 +38432,8 @@ public class ChatActivity extends BaseFragment implements
                     hintRow = rowCount++;
                 }
 
-                if (isFiltered ? !filteredEndReached : (!endReached[0] || mergeDialogId != 0 && !endReached[1]) && !(DISABLE_PROGRESS_VIEW && !AndroidUtilities.isTablet() && !isComments && currentUser == null)) {
+                if (isFiltered ? !filteredEndReached : ((!endReached[0] || mergeDialogId != 0 && !endReached[1]) && !(DISABLE_PROGRESS_VIEW && !AndroidUtilities.isTablet() && !isComments && currentUser == null)
+                        || hasCodexLocalHistoryBoundary(true))) {
                     loadingUpRow = rowCount++;
                 } else {
                     loadingUpRow = -5;
@@ -37971,6 +38899,7 @@ public class ChatActivity extends BaseFragment implements
             return new RecyclerListView.Holder(view);
         }
 
+        /** 保留原行绑定；Codex 普通历史的加载行展示该方向实际请求状态。 */
         @Override
         public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
             if (position == botInfoRow || position == botInfoEmptyRow) {
@@ -38001,7 +38930,8 @@ public class ChatActivity extends BaseFragment implements
                 infoView.set(dialogId, getMessagesController().getPeerSettings(dialogId));
             } else if (position == loadingDownRow || position == loadingUpRow) {
                 ChatLoadingCell loadingCell = (ChatLoadingCell) holder.itemView;
-                loadingCell.setProgressVisible(loadsCount > 1);
+                if (isCodexHistoryView() && !isFiltered) bindCodexHistoryLoadingCell(loadingCell, position);
+                else loadingCell.setProgressVisible(loadsCount > 1);
             } else if (position == userNameTimeRow) {
                 final TLRPC.PeerSettings settings = getMessagesController().getPeerSettings(getDialogId());
                 if (settings == null) return;

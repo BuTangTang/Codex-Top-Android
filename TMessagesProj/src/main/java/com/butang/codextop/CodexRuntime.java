@@ -43,6 +43,11 @@ public final class CodexRuntime {
     private static final Map<Long, String> remoteIds = new java.util.concurrent.ConcurrentHashMap<>();
     private static final Map<Long, String> dialogMachines = new java.util.concurrent.ConcurrentHashMap<>();
     private static final Map<Long, TranscriptWindow> histories = new HashMap<>();
+    // 仅 globalQueue 登记未完成冷空页；不缓存回包，也不创建另一份历史 owner。
+    private static final Map<Long, ColdHistoryRequest> coldHistoryRequests = new HashMap<>();
+    // 正文只存于 histories；页面仅持有其连续段引用，整数编号不会跨段解释。
+    private static final Map<Integer, HistoryView> historyViews = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicLong historyTokens = new java.util.concurrent.atomic.AtomicLong();
     private static final org.telegram.messenger.DispatchQueue sendQueue = new org.telegram.messenger.DispatchQueue("codex-send");
     // 审批读取可能等待桌面加载；独立串行执行，避免阻塞普通消息发送。
     private static final org.telegram.messenger.DispatchQueue approvalQueue = new org.telegram.messenger.DispatchQueue("codex-approval");
@@ -62,6 +67,32 @@ public final class CodexRuntime {
     private static final Map<String, String> machineNames = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile long watchGeneration;
     private static volatile long watchedDialog;
+    // 仅globalQueue持有当前因连接为空而等待的原任务，不登记健康周期或RPC失败重试。
+    private static WatchConnectionWait watchConnectionWait;
+
+    /** 一次空连接等待的归属；ready只恢复同一任务，不能切换账号、会话或电脑。 */
+    private static final class WatchConnectionWait {
+        final int account;
+        final long accountEpoch, generation, dialogId;
+        final String machine, remote;
+        final Runnable runnable;
+        DesktopConnection readyConnection;
+
+        /** 保存原任务及当次绑定，所有读写均属于globalQueue。 */
+        WatchConnectionWait(int account, long accountEpoch, long generation, long dialogId,
+                String machine, String remote, Runnable runnable) {
+            this.account = account; this.accountEpoch = accountEpoch; this.generation = generation;
+            this.dialogId = dialogId; this.machine = machine; this.remote = remote; this.runnable = runnable;
+        }
+
+        /** 消费前复核完整归属，换槽或绑定丢失不能借旧ready读取正文。 */
+        boolean isCurrent() {
+            return isAccountCurrent(accountEpoch) && account == org.telegram.messenger.UserConfig.selectedAccount
+                    && generation == watchGeneration && dialogId == watchedDialog
+                    && java.util.Objects.equals(machine, dialogMachines.get(dialogId))
+                    && java.util.Objects.equals(remote, remoteIds.get(dialogId));
+        }
+    }
     // 仅 statusQueue 访问；返回列表的短暂间隔复用一个观察租约，不缓存多份桌面历史。
     private static Runnable statusPoll;
     private static DesktopConnection observationOwner;
@@ -197,7 +228,7 @@ public final class CodexRuntime {
                             browseSnapshots.clear(); remoteIds.clear(); dialogMachines.clear();
                         }
                         dialogs.clear();
-                        histories.clear(); linkedSessions.clear(); pendingMessages.clear();
+                        histories.clear(); historyViews.clear(); coldHistoryRequests.clear(); linkedSessions.clear(); pendingMessages.clear();
                         attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear();
                         statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
@@ -249,6 +280,17 @@ public final class CodexRuntime {
     /** 新建或重连成功后唤醒原列表与同电脑的当前聊天，沿原门禁保持单次读取和单观察。 */
     static void onDesktopConnected(DesktopConnection connection) {
         final long accountEpoch = accountGeneration;
+        Utilities.globalQueue.postRunnable(() -> {
+            WatchConnectionWait waiting = watchConnectionWait;
+            if (waiting == null || waiting.accountEpoch != accountEpoch || !waiting.isCurrent()
+                    || !connection.machineId.equals(waiting.machine)
+                    || desktopConnections.get(connection.machineId) != connection || !connection.isConnected()) return;
+            // 先消费登记并取消原到期项，再恢复同一Runnable；重复ready不能建立第二条轮询链。
+            watchConnectionWait = null;
+            waiting.readyConnection = connection;
+            Utilities.globalQueue.cancelRunnable(waiting.runnable);
+            Utilities.globalQueue.postRunnable(waiting.runnable);
+        });
         AndroidUtilities.runOnUIThread(() -> {
             if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection) return;
             // 复用原列表单飞门禁，重连不为每个会话增加 STATUS 或历史请求。
@@ -1589,7 +1631,717 @@ public final class CodexRuntime {
                 + " type=" + cause.getClass().getSimpleName() + " reason=" + reason);
     }
 
-    /** 原聊天页跟随尾部游标并发布真实列表摘要；停止后的旧响应不再投递到页面。缺锚点只在本轮内存沿旧游标补页。 */
+    private static final class HistoryView {
+        final int account, classGuid;
+        final long dialogId, token, accountEpoch;
+        final String remote;
+        volatile boolean active = true;
+        volatile TranscriptWindow window, proposedWindow, bookmarkWindow;
+        // 历史队列发布的最新根引用；布局回调不跨线程读取普通histories Map。
+        volatile TranscriptWindow latestRoot;
+        volatile long bookmarkRequest;
+        volatile int count = 30;
+        volatile long intentRevision;
+        volatile ColdHistoryHandoff coldHistoryHandoff;
+        volatile Object initialLoadTicket;
+        volatile InitialLoadWaiter initialLoadWaiter;
+        HistoryView(int account, long dialogId, int classGuid, String remote, TranscriptWindow window) {
+            this.account = account; this.dialogId = dialogId; this.classGuid = classGuid; this.remote = remote;
+            this.token = historyTokens.incrementAndGet(); this.accountEpoch = accountGeneration; this.window = window;
+        }
+    }
+
+    /** 附加于原通知末尾；空页也有身份，不能从第一条气泡猜本次加载属于哪一段。 */
+    public static final class HistoryPage {
+        public final long token;
+        public final String fromEpoch, toEpoch;
+        public final boolean replaceLatest;
+        /** 历史队列交付时的本地缺末锚事实；不修改协议或声称来源连续。 */
+        public final boolean unbridgedCachedHistory;
+        /** 本次加载失败；只用于本地接收门禁，不把失败空页误认为合法游标进展。 */
+        public final boolean loadFailed;
+        /** 历史队列的本地边界快照；缺省通知不覆盖界面已经接纳的事实。 */
+        public final LocalHistoryBoundary localBoundary;
+        private final HistoryView owner;
+        private final TranscriptWindow from, to;
+        private final long intentRevision;
+        private Runnable afterAcceptance;
+        private long acceptedRevision = -1;
+        private Object initialLoadTicket;
+        /** 原成功通知沿用默认结果，所有现有调用保持原语义。 */
+        private HistoryPage(HistoryView owner, TranscriptWindow from, TranscriptWindow to, boolean replaceLatest) {
+            this(owner, from, to, replaceLatest, false);
+        }
+        /** 固定本次本地加载结果，同时保留原页面与意图身份供接收方核验。 */
+        private HistoryPage(HistoryView owner, TranscriptWindow from, TranscriptWindow to, boolean replaceLatest, boolean loadFailed) {
+            this(owner, from, to, replaceLatest, loadFailed, false);
+        }
+        /** 固定历史队列已计算的接桥资格；UI只消费事实，不遍历共享归档。 */
+        private HistoryPage(HistoryView owner, TranscriptWindow from, TranscriptWindow to, boolean replaceLatest,
+                boolean loadFailed, boolean unbridgedCachedHistory) {
+            this(owner, from, to, replaceLatest, loadFailed, unbridgedCachedHistory, null);
+        }
+        /** 一次固定正文页与轻量本地边界，UI不遍历历史根或归档。 */
+        private HistoryPage(HistoryView owner, TranscriptWindow from, TranscriptWindow to, boolean replaceLatest,
+                boolean loadFailed, boolean unbridgedCachedHistory, LocalHistoryBoundary localBoundary) {
+            this.localBoundary = localBoundary;
+            this.unbridgedCachedHistory = unbridgedCachedHistory;
+            this.loadFailed = loadFailed;
+            this.owner = owner; this.from = from; this.to = to; this.token = owner.token;
+            this.intentRevision = owner.intentRevision;
+            this.fromEpoch = from.epoch(); this.toEpoch = to.epoch(); this.replaceLatest = replaceLatest;
+        }
+    }
+
+    public static final class HistoryBookmark {
+        public final int messageId;
+        public final String epoch;
+        private HistoryBookmark(int messageId, String epoch) { this.messageId = messageId; this.epoch = epoch; }
+    }
+
+    /** 只表达本地保存和当前绑定，不把网络结束或缺锚反面解释为来源完整。 */
+    public static final class LocalHistoryBoundary {
+        public final boolean hasOtherLocalSegments, showingLatestRoot, missingCachedTailAnchor, hasMore;
+        private LocalHistoryBoundary(TranscriptWindow root, TranscriptWindow displayed) {
+            hasOtherLocalSegments = root.hasOtherLocalSegments(displayed);
+            hasMore = displayed.hasMore;
+            showingLatestRoot = root == displayed;
+            missingCachedTailAnchor = root.hasMissingCachedTailAnchor();
+        }
+    }
+
+    /** 选择器只持有当前短命目录；私有原对象身份不能由UI用整数编号伪造。 */
+    public static final class LocalHistoryCatalog {
+        public final java.util.List<LocalHistorySegment> segments;
+        public final boolean showingLatestRoot;
+        private final HistoryView view;
+        private final TranscriptWindow from, root;
+        private final PasswordLogin.Session sessionOwner;
+        private final String machine;
+        private final long revision;
+        private LocalHistoryCatalog(HistoryView view, TranscriptWindow from, TranscriptWindow root, long revision, PasswordLogin.Session owner, String machine) {
+            this.view = view; this.from = from; this.root = root; this.sessionOwner = owner; this.machine = machine;
+            this.revision = revision; showingLatestRoot = from == root;
+            ArrayList<LocalHistorySegment> result = new ArrayList<>();
+            for (TranscriptWindow.LocalSegment segment : root.localSegments())
+                if (segment.window != from && segment.window != root) result.add(new LocalHistorySegment(this, segment));
+            java.util.Collections.reverse(result);
+            segments = java.util.Collections.unmodifiableList(result);
+        }
+    }
+
+    /** 文案只需真实段内时间与数量，精确epoch/source和目标对象留在Runtime内部。 */
+    public static final class LocalHistorySegment {
+        public final int count;
+        public final long firstTime, lastTime;
+        private final LocalHistoryCatalog catalog;
+        private final TranscriptWindow.LocalSegment target;
+        private LocalHistorySegment(LocalHistoryCatalog catalog, TranscriptWindow.LocalSegment target) {
+            this.catalog = catalog; this.target = target; count = target.count;
+            firstTime = target.firstTime; lastTime = target.lastTime;
+        }
+    }
+
+    /** 选择句柄先返回供取消；只有历史队列精确定位并pin后才允许UI接受。 */
+    public static final class LocalHistorySelection {
+        private final LocalHistorySegment segment;
+        private final long revision, request;
+        private volatile boolean ready;
+        private LocalHistorySelection(LocalHistorySegment segment, long revision, long request) {
+            this.segment = segment; this.revision = revision; this.request = request;
+        }
+    }
+
+    /** 本地浏览不要求网络连接；账号对象、机器归属与页面意图必须仍是原绑定。 */
+    private static boolean localHistoryOwnerCurrent(HistoryView view, TranscriptWindow from, long revision,
+            PasswordLogin.Session owner, String machine) {
+        return owner != null && session == owner && machine != null
+                && view.account == org.telegram.messenger.UserConfig.selectedAccount
+                && machine.equals(dialogMachines.get(view.dialogId))
+                && historyViewCurrent(view, from) && view.intentRevision == revision;
+    }
+
+    /** UI只查安全发布的根引用，不跨线程遍历普通histories或archive。 */
+    public static boolean isLocalHistoryCatalogCurrent(LocalHistoryCatalog catalog) {
+        return catalog != null && localHistoryOwnerCurrent(catalog.view, catalog.from, catalog.revision,
+                catalog.sessionOwner, catalog.machine) && catalog.view.latestRoot == catalog.root;
+    }
+
+    /** 用户主动打开选择器才枚举轻量目录，不读磁盘、不发RPC、不驻留全局列表。 */
+    public static void requestLocalHistorySegments(int account, long dialogId, int classGuid, long token,
+            String epoch, java.util.function.Consumer<LocalHistoryCatalog> completed) {
+        HistoryView view = historyViews.get(classGuid);
+        if (view == null || view.token != token || view.account != account || view.dialogId != dialogId) return;
+        TranscriptWindow from = view.window;
+        final long revision = view.intentRevision;
+        final PasswordLogin.Session owner = session;
+        final String machine = dialogMachines.get(dialogId);
+        Utilities.globalQueue.postRunnable(() -> {
+            LocalHistoryCatalog catalog = null;
+            if (from != null && epoch != null && epoch.equals(from.epoch())
+                    && localHistoryOwnerCurrent(view, from, revision, owner, machine)) {
+                TranscriptWindow root = histories.get(dialogId);
+                if (root != null && root.containsSegment(from)) {
+                    synchronized (view) { view.latestRoot = root; }
+                    catalog = new LocalHistoryCatalog(view, from, root, revision, owner, machine);
+                }
+            }
+            final LocalHistoryCatalog result = catalog;
+            AndroidUtilities.runOnUIThread(() -> completed.accept(isLocalHistoryCatalogCurrent(result) ? result : null));
+        });
+    }
+
+    /** 同一请求的句柄与pin必须仍匹配；取消旧选择不得释放后来者的pin。 */
+    private static boolean localHistorySelectionCurrent(LocalHistorySelection selection) {
+        if (selection == null) return false;
+        LocalHistoryCatalog catalog = selection.segment.catalog;
+        return localHistoryOwnerCurrent(catalog.view, catalog.from, selection.revision, catalog.sessionOwner, catalog.machine)
+                && catalog.view.latestRoot == catalog.root && catalog.view.bookmarkRequest == selection.request;
+    }
+
+    /** 先撤销旧异步意图、再在原队列核精确epoch/source；此阶段绝不切换显示段。 */
+    public static LocalHistorySelection resolveLocalHistorySegment(LocalHistoryCatalog catalog, LocalHistorySegment segment,
+            java.util.function.Consumer<LocalHistorySelection> completed) {
+        if (segment == null || segment.catalog != catalog || !isLocalHistoryCatalogCurrent(catalog)) return null;
+        HistoryView view = catalog.view;
+        final LocalHistorySelection selection;
+        synchronized (view) {
+            if (!isLocalHistoryCatalogCurrent(catalog)) return null;
+            selection = new LocalHistorySelection(segment, ++view.intentRevision, ++view.bookmarkRequest);
+            view.initialLoadTicket = null; view.initialLoadWaiter = null;
+            view.proposedWindow = null; view.bookmarkWindow = null;
+        }
+        Utilities.globalQueue.postRunnable(() -> {
+            if (!localHistorySelectionCurrent(selection)) {
+                AndroidUtilities.runOnUIThread(() -> { cancelLocalHistorySelection(selection); completed.accept(null); });
+                return;
+            }
+            TranscriptWindow target = segment.target.window;
+            TranscriptWindow.Entry row = target.findSource(segment.target.sourceId, null);
+            synchronized (view) {
+                if (localHistorySelectionCurrent(selection) && histories.get(view.dialogId) == catalog.root
+                        && catalog.root.segment(segment.target.epoch) == target
+                        && row != null && row.id == segment.target.anchorId) {
+                    view.bookmarkWindow = target;
+                    selection.ready = true;
+                }
+            }
+            AndroidUtilities.runOnUIThread(() -> {
+                if (selection.ready && localHistorySelectionCurrent(selection)) completed.accept(selection);
+                else { cancelLocalHistorySelection(selection); completed.accept(null); }
+            });
+        });
+        return selection;
+    }
+
+    /** UI先通过本页搜索/选择/离页守卫后才接受；pin到当前段的转移保持原子。 */
+    public static HistoryBookmark acceptLocalHistorySelection(LocalHistorySelection selection) {
+        if (selection == null) return null;
+        LocalHistoryCatalog catalog = selection.segment.catalog;
+        HistoryView view = catalog.view;
+        synchronized (view) {
+            if (!selection.ready || !localHistorySelectionCurrent(selection)
+                    || view.bookmarkWindow != selection.segment.target.window) return null;
+            view.window = selection.segment.target.window;
+            view.bookmarkWindow = null; view.bookmarkRequest++; view.intentRevision++;
+            view.proposedWindow = null; view.initialLoadTicket = null; view.initialLoadWaiter = null;
+            selection.ready = false;
+        }
+        scheduleLocalHistoryPrune(selection);
+        return new HistoryBookmark(selection.segment.target.anchorId, selection.segment.target.epoch);
+    }
+
+    /** 取消尚未排队完成或已pin的本次选择，不改当前window与后来的选择。 */
+    public static void cancelLocalHistorySelection(LocalHistorySelection selection) {
+        if (selection == null) return;
+        HistoryView view = selection.segment.catalog.view;
+        boolean released = false;
+        synchronized (view) {
+            if (view.bookmarkRequest != selection.request) return;
+            if (view.bookmarkWindow == selection.segment.target.window) {
+                view.bookmarkWindow = null; released = true;
+            }
+            view.bookmarkRequest++;
+            selection.ready = false;
+        }
+        if (released) scheduleLocalHistoryPrune(selection);
+    }
+
+    /** 本地选择释放引用后仅收尾原账号与原根；失效选择不保存后来者的缓存。 */
+    private static void scheduleLocalHistoryPrune(LocalHistorySelection selection) {
+        LocalHistoryCatalog catalog = selection.segment.catalog;
+        HistoryView view = catalog.view;
+        Utilities.globalQueue.postRunnable(() -> {
+            if (session == catalog.sessionOwner && isAccountCurrent(view.accountEpoch)
+                    && view.account == org.telegram.messenger.UserConfig.selectedAccount
+                    && catalog.machine.equals(dialogMachines.get(view.dialogId))
+                    && view.remote.equals(remoteIds.get(view.dialogId)) && histories.get(view.dialogId) == catalog.root)
+                saveHistory(view.dialogId, view.remote, catalog.root, true);
+        });
+    }
+
+    /** 新开页默认最新缓存；暂停恢复沿用原显示段，不改变正在阅读的旧页。 */
+    public static long openHistoryView(int account, long dialogId, int classGuid) {
+        HistoryView previous = historyViews.get(classGuid);
+        if (previous != null && previous.active && previous.account == account && previous.dialogId == dialogId
+                && isAccountCurrent(previous.accountEpoch)) return previous.token;
+        TranscriptWindow retained = previous != null && previous.account == account && previous.dialogId == dialogId
+                && isAccountCurrent(previous.accountEpoch) ? previous.window : null;
+        HistoryView view = new HistoryView(account, dialogId, classGuid, remoteIds.get(dialogId), retained);
+        historyViews.put(classGuid, view);
+        return view.token;
+    }
+
+    /** 暂停使原页面及其一次冷开交接失效，历史连续段仍保留。 */
+    public static void pauseHistoryView(int classGuid, long token) {
+        HistoryView view = historyViews.get(classGuid);
+        if (view != null && view.token == token) { view.active = false; view.proposedWindow = null; view.bookmarkWindow = null; view.coldHistoryHandoff = null; view.initialLoadTicket = null; view.initialLoadWaiter = null; }
+    }
+
+    /** 销毁原页面并收尾已释放的归档引用；重用classGuid的新页面不承接旧结果。 */
+    public static void closeHistoryView(int classGuid, long token) {
+        HistoryView view = historyViews.get(classGuid);
+        if (view != null && (view.token == token || token == 0 && !view.active)) {
+            view.active = false;
+            view.coldHistoryHandoff = null;
+            view.initialLoadTicket = null; view.initialLoadWaiter = null;
+            if (historyViews.remove(classGuid, view)) scheduleHistoryArchivePrune(view);
+        }
+    }
+
+    private static boolean historyViewCurrent(HistoryView view, TranscriptWindow window) {
+        return view != null && view.active && historyViews.get(view.classGuid) == view
+                && isAccountCurrent(view.accountEpoch) && view.remote != null
+                && view.remote.equals(remoteIds.get(view.dialogId)) && view.window == window;
+    }
+
+    /** UI延后工作只验证现有绑定，不创建view；接受latest后也按当前段核对账号代次。 */
+    public static boolean isHistoryViewCurrent(int account, long dialogId, int classGuid, long token, String epoch) {
+        HistoryView view = historyViews.get(classGuid);
+        TranscriptWindow window = view == null ? null : view.window;
+        return account == org.telegram.messenger.UserConfig.selectedAccount && view != null
+                && view.account == account && view.dialogId == dialogId && view.token == token
+                && window != null && epoch != null && epoch.equals(window.epoch()) && historyViewCurrent(view, window);
+    }
+
+    /** 布局补页只读同一次捕获的view与安全发布根，拒绝旧阅读段和已替换根。 */
+    public static boolean isHistoryBridgeViewCurrent(int account, long dialogId, int classGuid, long token, String epoch) {
+        HistoryView view = historyViews.get(classGuid);
+        TranscriptWindow window = view == null ? null : view.window;
+        return account == org.telegram.messenger.UserConfig.selectedAccount && view != null
+                && view.account == account && view.dialogId == dialogId && view.token == token
+                && window != null && epoch != null && epoch.equals(window.epoch())
+                && historyViewCurrent(view, window) && window == view.latestRoot;
+    }
+
+    /** 仅历史队列发布换根；先使旧view的布局准入失效，空latest也不能漏掉这一步。 */
+    private static void publishHistoryRoot(long dialogId, TranscriptWindow root) {
+        // 与本地选段接受共用单view锁，使换根与pin转移具有明确先后；锁内不读写缓存。
+        for (HistoryView view : historyViews.values()) if (view.dialogId == dialogId) {
+            synchronized (view) { view.latestRoot = root; }
+        }
+        histories.put(dialogId, root);
+    }
+
+    /** 通知中心可延迟派发，界面接收时再次核对同段内的阅读意图代次。 */
+    public static boolean isHistoryPageCurrent(HistoryPage page) {
+        return page != null && historyViewCurrent(page.owner, page.from)
+                && page.owner.intentRevision == page.intentRevision
+                && (page.initialLoadTicket == null || page.owner.initialLoadTicket == page.initialLoadTicket)
+                && (!page.replaceLatest || page.owner.proposedWindow == page.to);
+    }
+
+    /** 接受当前候选才切换绑定，并有界收尾旧归档；上翻读者仍可拒绝而保留原段。 */
+    public static boolean acceptLatestHistory(HistoryPage page) {
+        if (page == null || !page.replaceLatest) return false;
+        synchronized (page.owner) {
+            if (!isHistoryPageCurrent(page)) return false;
+            page.owner.window = page.to;
+            page.acceptedRevision = ++page.owner.intentRevision;
+            page.owner.proposedWindow = null;
+            page.owner.bookmarkWindow = null;
+            page.owner.bookmarkRequest++;
+            page.owner.initialLoadTicket = null; page.owner.initialLoadWaiter = null;
+        }
+        scheduleHistoryArchivePrune(page.owner);
+        // NotificationCenter可能延迟原通知；必须在UI真正接受且完成清屏后恢复待发，不能提前确认。
+        if (page.afterAcceptance != null) AndroidUtilities.runOnUIThread(page.afterAcceptance, 1);
+        return true;
+    }
+
+    public static String historyBookmarkKey(int account, long dialogId) {
+        PasswordLogin.Session owner = session;
+        String machine = dialogMachines.get(dialogId), remote = remoteIds.get(dialogId);
+        if (loggingOut || owner == null || machine == null || remote == null) return null;
+        return TranscriptStore.digest(owner.server + "\n" + owner.accountId + "\n" + machine + "\n" + remote);
+    }
+
+    /** 来源书签精确找回原段；找不到就保留当前绑定，绝不拿同整数编号的另一条消息代替。 */
+    public static void resolveHistoryBookmark(int account, long dialogId, int classGuid, long token,
+            String sourceId, String localId, java.util.function.Consumer<HistoryBookmark> completed) {
+        HistoryView view = historyViews.get(classGuid);
+        if (view != null && view.token == token) { view.initialLoadTicket = null; view.initialLoadWaiter = null; }
+        final long revision = view == null ? -1 : view.intentRevision;
+        final long request = view == null ? -1 : ++view.bookmarkRequest;
+        Utilities.globalQueue.postRunnable(() -> {
+            if (view == null || view.token != token || view.account != account || view.dialogId != dialogId
+                    || !historyViewCurrent(view, view.window) || view.intentRevision != revision || view.bookmarkRequest != request) return;
+            TranscriptWindow root = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, view.remote));
+            TranscriptWindow found = root.findSegment(sourceId, localId);
+            TranscriptWindow.Entry row = found == null ? null : found.findSource(sourceId, localId);
+            final TranscriptWindow expected = view.window;
+            view.bookmarkWindow = found;
+            if (!historyViewCurrent(view, expected) || view.intentRevision != revision || view.bookmarkRequest != request) {
+                if (view.bookmarkRequest == request) view.bookmarkWindow = null;
+                return;
+            }
+            AndroidUtilities.runOnUIThread(() -> {
+                synchronized (view) {
+                    if (!historyViewCurrent(view, expected) || view.intentRevision != revision || view.bookmarkRequest != request) {
+                        if (view.bookmarkRequest == request) view.bookmarkWindow = null;
+                        return;
+                    }
+                    if (row != null) view.window = found;
+                    view.bookmarkWindow = null;
+                }
+                completed.accept(new HistoryBookmark(row == null ? 0 : row.id, row == null ? null : found.epoch()));
+            });
+        });
+    }
+
+    /** 用户明确回到最新；仅取已有最新段，没有增加一个网络轮询器。 */
+    public static void requestLatestHistory(int account, long dialogId, int classGuid, long token) {
+        HistoryView view = historyViews.get(classGuid);
+        if (view == null || view.token != token) return;
+        final long revision = ++view.intentRevision;
+        view.initialLoadTicket = null; view.initialLoadWaiter = null;
+        view.bookmarkWindow = null;
+        Utilities.globalQueue.postRunnable(() -> {
+            if (view == null || view.token != token || view.account != account || view.dialogId != dialogId
+                    || !historyViewCurrent(view, view.window) || view.intentRevision != revision) return;
+            TranscriptWindow root = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, view.remote));
+            if (view.window == null) view.window = root;
+            offerLatestHistory(view, root, true);
+        });
+    }
+
+    /** 原latest交付成功排队后返回真，供首正文转换排除同批增量通知。 */
+    private static boolean offerLatestHistory(HistoryView view, TranscriptWindow root, boolean explicit) {
+        if (!historyViewCurrent(view, view.window) || root.before(0, 1).isEmpty()
+                || !explicit && (view.window == root || view.proposedWindow == root)) return false;
+        if (view.window == null) view.window = root;
+        view.proposedWindow = root;
+        try { deliverHistoryPage(view, root, view.count, 0, 2, -1, 0, true); return true; }
+        catch (IOException error) { view.proposedWindow = null; logTranscriptFailure("latest_delivery", error, null); return false; }
+    }
+
+    private static void offerLatestHistory(long dialogId, TranscriptWindow root) {
+        for (HistoryView view : historyViews.values())
+            if (view.dialogId == dialogId) offerLatestHistory(view, root, false);
+    }
+
+    /** 仅空根首次获得正文时补一次原type2交付；已有首屏或候选不重复入队，同批watch不再插入。 */
+    private static void offerFirstVisibleHistory(long dialogId, TranscriptWindow root, java.util.Set<HistoryView> delivered) {
+        for (HistoryView view : historyViews.values()) {
+            if (view.dialogId != dialogId || view.window != root || delivered.contains(view)
+                    || !historyViewCurrent(view, root)) continue;
+            if (view.proposedWindow == root || offerLatestHistory(view, root, true)) delivered.add(view);
+        }
+    }
+
+    /** 只等待本次已加载空首屏；回调不持有正文，完成或新加载后立即释放。 */
+    private static final class InitialLoadWaiter {
+        final HistoryView view;
+        final TranscriptWindow window;
+        final DesktopConnection connection;
+        final long intentRevision;
+        final Object ticket;
+        final java.util.function.BooleanSupplier complete;
+        /** 固定原加载上下文，不能借最新回包更换阅读段或请求参数。 */
+        InitialLoadWaiter(HistoryView view, TranscriptWindow window, DesktopConnection connection,
+                long intentRevision, Object ticket, java.util.function.BooleanSupplier complete) {
+            this.view = view; this.window = window; this.connection = connection;
+            this.intentRevision = intentRevision; this.ticket = ticket; this.complete = complete;
+        }
+    }
+
+    /** 合法latest已合入后，仅让原普通冷首屏完成；返回已负责首屏的view避免watch重复插入。 */
+    private static java.util.Set<HistoryView> completeInitialLoadsFromLatest(long dialogId,
+            DesktopConnection connection, TranscriptWindow window) {
+        java.util.Set<HistoryView> completed = new java.util.HashSet<>();
+        if (histories.get(dialogId) != window || window.before(0, 1).isEmpty()
+                || connection != dialogConnection(dialogId)) return completed;
+        for (HistoryView view : historyViews.values()) {
+            InitialLoadWaiter waiter = view.initialLoadWaiter;
+            if (waiter == null || view.dialogId != dialogId || waiter.window != window
+                    || waiter.connection != connection || waiter.ticket != view.initialLoadTicket
+                    || waiter.intentRevision != view.intentRevision || !historyViewCurrent(view, window)) continue;
+            if (waiter.complete.getAsBoolean()) completed.add(view);
+        }
+        return completed;
+    }
+
+    /** 同一冷空页的消费者只保留原入口资格和续做；正文仍由 histories 唯一持有。 */
+    private static final class ColdHistorySubscriber {
+        final HistoryView view;
+        final long intentRevision;
+        final boolean foreground;
+        final java.util.function.BooleanSupplier current;
+        final java.util.function.Consumer<ColdHistoryResult> completed;
+        /** view 非空代表原 load，watch 与 prefetch 继续用各自原代次守卫。 */
+        ColdHistorySubscriber(HistoryView view, long intentRevision, boolean foreground,
+                java.util.function.BooleanSupplier current, java.util.function.Consumer<ColdHistoryResult> completed) {
+            this.view = view; this.intentRevision = intentRevision; this.foreground = foreground;
+            this.current = current; this.completed = completed;
+        }
+    }
+
+    /** 请求只跨越排队和一次回包，锁仅保护两个原网络队列之间的认领与提升。 */
+    private static final class ColdHistoryRequest {
+        final int account;
+        final long accountEpoch, dialogId;
+        final String remote, cursor, tailCursor;
+        final DesktopConnection connection;
+        final TranscriptWindow window;
+        final boolean latest, loaded;
+        final ArrayList<ColdHistorySubscriber> subscribers = new ArrayList<>();
+        int ticket;
+        boolean foreground, started, finished;
+        /** 捕获原对象和游标，回包不能以“共享”绕过期间发生的真实变化。 */
+        ColdHistoryRequest(int account, long epoch, long dialogId, String remote,
+                DesktopConnection connection, TranscriptWindow window, boolean latest) {
+            this.account = account; this.accountEpoch = epoch; this.dialogId = dialogId; this.remote = remote;
+            this.connection = connection; this.window = window; this.latest = latest;
+            this.loaded = window.loaded; this.cursor = window.cursor; this.tailCursor = window.tailCursor;
+        }
+    }
+
+    /** 只传本次合入事实和原错误，不向多个入口交付可再次合入的 JSON。 */
+    private static final class ColdHistoryResult {
+        boolean success, bootstrapAccepted, saved;
+        Exception error;
+        final java.util.Set<HistoryView> loadViews = new java.util.HashSet<>();
+    }
+
+    /** 同一页面开页结果的一次性交接，只含原对象/游标和阅读代次，不保留回包或正文。 */
+    private static final class ColdHistoryHandoff {
+        final DesktopConnection connection;
+        final TranscriptWindow window;
+        final long intentRevision;
+        final String cursor, tailCursor;
+        final boolean loaded;
+        /** 在原页面上记录刚完成的冷开，之后的外部游标变化会使交接失效。 */
+        ColdHistoryHandoff(long intentRevision, DesktopConnection connection, TranscriptWindow window) {
+            this.connection = connection; this.window = window; this.intentRevision = intentRevision;
+            this.cursor = window.cursor; this.tailCursor = window.tailCursor; this.loaded = window.loaded;
+        }
+        /** 同一令牌的原 view、阅读意图和连续段均未变化时才允许消费。 */
+        boolean matches(HistoryView view, DesktopConnection connection, TranscriptWindow window,
+                boolean loaded, String cursor, String tailCursor) {
+            return historyViewCurrent(view, window) && view.intentRevision == intentRevision
+                    && this.connection == connection && this.window == window && this.loaded == loaded
+                    && java.util.Objects.equals(this.cursor, cursor) && java.util.Objects.equals(this.tailCursor, tailCursor);
+        }
+    }
+
+    /** 只在 globalQueue 合并同一冷空 root 的同页请求；有正文和归档翻页仍走原入口。 */
+    private static boolean joinColdHistoryRequest(int account, long epoch, long dialogId, String remote,
+            DesktopConnection connection, TranscriptWindow window, boolean latest, ColdHistorySubscriber subscriber) {
+        if (histories.get(dialogId) != window || !window.before(0, 1).isEmpty()
+                || latest && (window.loaded || window.cursor != null && !window.cursor.isEmpty())
+                || !latest && (!window.loaded || window.cursor == null || window.cursor.isEmpty())) return false;
+        ColdHistoryRequest request = coldHistoryRequests.get(dialogId);
+        if (request != null) {
+            synchronized (request) {
+                if (!request.finished && request.account == account && request.accountEpoch == epoch
+                        && request.window == window && request.connection == connection && request.latest == latest
+                        && java.util.Objects.equals(request.remote, remote) && request.loaded == window.loaded
+                        && java.util.Objects.equals(request.cursor, window.cursor)
+                        && java.util.Objects.equals(request.tailCursor, window.tailCursor)) {
+                    // 资格检查与加入共用认领锁，不能加入已被另一个 executor 放弃的旧请求。
+                    request.subscribers.add(subscriber);
+                    if (subscriber.foreground && !request.foreground) {
+                        request.foreground = true;
+                        if (!request.started) dispatchColdHistoryRequest(request, ++request.ticket, true);
+                    }
+                    return true;
+                }
+            }
+        }
+        // 同号新来源/窗口登记自己的请求；旧回包只能终结自身，不能删除或合入新记录。
+        request = new ColdHistoryRequest(account, epoch, dialogId, remote, connection, window, latest);
+        request.subscribers.add(subscriber);
+        request.foreground = subscriber.foreground;
+        request.ticket = 1;
+        coldHistoryRequests.put(dialogId, request);
+        dispatchColdHistoryRequest(request, request.ticket, request.foreground);
+        return true;
+    }
+
+    /** queued 预取可提到原 historyQueue；同步认领令旧 ticket 失效，已 started 的 RPC 只共享。 */
+    private static void dispatchColdHistoryRequest(ColdHistoryRequest request, int ticket, boolean foreground) {
+        Runnable work = () -> {
+            boolean permitted = false;
+            synchronized (request) {
+                if (request.finished || request.started || request.ticket != ticket) return;
+                for (ColdHistorySubscriber subscriber : request.subscribers) {
+                    if (subscriber.current.getAsBoolean()
+                            && (subscriber.foreground || !ApplicationLoader.mainInterfacePaused)) {
+                        permitted = true;
+                        break;
+                    }
+                }
+                if (!permitted) request.finished = true;
+                else request.started = true;
+            }
+            JsonObject page = null;
+            Exception failure = null;
+            try {
+                if (permitted && isAccountCurrent(request.accountEpoch)
+                        && request.connection == dialogConnection(request.dialogId)
+                        && java.util.Objects.equals(request.remote, remoteIds.get(request.dialogId))) {
+                    page = request.latest ? request.connection.transcript(request.remote)
+                            : request.connection.transcript(request.remote, request.cursor);
+                } else failure = new IOException("历史读取来源已失效");
+            } catch (Exception error) { failure = error; }
+            final JsonObject received = page;
+            final Exception requestError = failure;
+            Utilities.globalQueue.postRunnable(() -> completeColdHistoryRequest(request, received, requestError));
+        };
+        if (foreground) historyQueue.postRunnable(work);
+        else prefetchQueue.postRunnable(work);
+    }
+
+    /** 原历史队列合入一次；合法最新正文先交付前台，原保存完成后才通知依赖落盘结果的预取。 */
+    private static void completeColdHistoryRequest(ColdHistoryRequest request, JsonObject received, Exception failure) {
+        final ArrayList<ColdHistorySubscriber> subscribers;
+        synchronized (request) {
+            request.finished = true;
+            subscribers = new ArrayList<>(request.subscribers);
+        }
+        boolean ownsRequest = coldHistoryRequests.get(request.dialogId) == request;
+        if (ownsRequest) coldHistoryRequests.remove(request.dialogId);
+        ColdHistoryResult result = new ColdHistoryResult();
+        boolean foregroundCompleted = false;
+        boolean active = false;
+        for (ColdHistorySubscriber subscriber : subscribers) {
+            if (!subscriber.current.getAsBoolean()) continue;
+            active = true;
+            if (subscriber.view != null) result.loadViews.add(subscriber.view);
+        }
+        try {
+            if (!ownsRequest || !active) { /* 已失效的请求只释放订阅，不合入或重新请求。 */ }
+            else if (failure != null) throw failure;
+            else if (!isAccountCurrent(request.accountEpoch) || request.connection != dialogConnection(request.dialogId)
+                    || !java.util.Objects.equals(request.remote, remoteIds.get(request.dialogId)))
+                throw new IOException("历史连接已更换");
+            else if (histories.get(request.dialogId) != request.window || !request.window.before(0, 1).isEmpty()
+                    || request.loaded != request.window.loaded
+                    || !java.util.Objects.equals(request.cursor, request.window.cursor)
+                    || !java.util.Objects.equals(request.tailCursor, request.window.tailCursor)) {
+                /* 其他原入口已推进缓存，消费者重读当前模型，不重复合入旧页。 */
+            }
+            else {
+                // 仅本协调器沿空页游标继续时延续一次性交接；外部变化不能刷新旧标记。
+                java.util.Set<HistoryView> carry = new java.util.HashSet<>();
+                for (HistoryView view : result.loadViews) {
+                    ColdHistoryHandoff handoff = view.coldHistoryHandoff;
+                    if (handoff != null && handoff.matches(view, request.connection, request.window,
+                            request.loaded, request.cursor, request.tailCursor)) carry.add(view);
+                }
+                com.google.gson.JsonElement tail = received == null ? null : received.get("tailCursor");
+                boolean missingTail = tail == null || tail.isJsonNull()
+                        || tail.isJsonPrimitive() && tail.getAsJsonPrimitive().isString() && tail.getAsString().isEmpty();
+                if (request.latest && (!missingTail || result.loadViews.isEmpty())) {
+                    request.window.acceptLatest(received);
+                    result.bootstrapAccepted = true;
+                } else request.window.prependWithCachedBridge(received);
+                result.success = true;
+                boolean visibleLatest = request.latest && result.bootstrapAccepted && !request.window.before(0, 1).isEmpty();
+                if (!visibleLatest) result.saved = saveHistory(request.dialogId, request.remote, request.window);
+                try {
+                    for (ColdHistorySubscriber subscriber : subscribers) {
+                        HistoryView view = subscriber.view;
+                        // 先捕获仍有效的原意图；首屏完成会关闭load资格，但同轮watch仍须接真实尾部。
+                        if (view != null && subscriber.current.getAsBoolean()
+                                && view.intentRevision == subscriber.intentRevision
+                                && (request.latest && result.bootstrapAccepted || !request.latest && carry.contains(view)))
+                            view.coldHistoryHandoff = new ColdHistoryHandoff(subscriber.intentRevision, request.connection, request.window);
+                    }
+                    if (request.latest && result.bootstrapAccepted) {
+                        result.loadViews.addAll(completeInitialLoadsFromLatest(request.dialogId, request.connection, request.window));
+                        // 协调器已验证合入前为空；恢复时没有load等待者也须交付首个可见正文。
+                        offerFirstVisibleHistory(request.dialogId, request.window, result.loadViews);
+                    }
+                    publishHistoryPreview(request.account, request.accountEpoch, request.dialogId, request.remote,
+                            request.connection.machineId, request.connection, request.window);
+                    if (!request.window.before(0, 1).isEmpty()) {
+                        for (HistoryView view : historyViews.values()) {
+                            if (view.dialogId == request.dialogId && !result.loadViews.contains(view))
+                                offerLatestHistory(view, request.window, !request.latest);
+                        }
+                    }
+                    if (visibleLatest) {
+                        // 前台只依赖已验证模型；预取消费saved，必须留到真正保存之后。
+                        foregroundCompleted = true;
+                        for (ColdHistorySubscriber subscriber : subscribers) if (subscriber.foreground) {
+                            try { subscriber.completed.accept(result); }
+                            catch (RuntimeException error) { logTranscriptFailure("cold_history_resume", error, null); }
+                        }
+                    }
+                } finally {
+                    // UI准备或回调失败也不能漏存已经合入的合法页；Outbox仍只在write成功后删除。
+                    if (visibleLatest) result.saved = saveHistory(request.dialogId, request.remote, request.window);
+                }
+            }
+        } catch (Exception error) {
+            result.success = false;
+            result.error = error;
+            logTranscriptFailure("cold_history_merge", error, received);
+        }
+        for (ColdHistorySubscriber subscriber : subscribers) {
+            if (foregroundCompleted && subscriber.foreground) continue;
+            // prefetch 即使已转前台也须释放其原门禁；各入口回调自己复核原资格。
+            try { subscriber.completed.accept(result); }
+            catch (RuntimeException error) { logTranscriptFailure("cold_history_resume", error, null); }
+        }
+    }
+
+    /** load 先完成时让同次 opening watch 直接接真实尾部；不跨暂停令牌复用。 */
+    private static boolean takeColdHistoryHandoff(int account, long dialogId, DesktopConnection connection, TranscriptWindow window) {
+        boolean accepted = false;
+        for (HistoryView view : historyViews.values()) {
+            if (view.account != account || view.dialogId != dialogId) continue;
+            ColdHistoryHandoff handoff = view.coldHistoryHandoff;
+            view.coldHistoryHandoff = null;
+            if (histories.get(dialogId) == window && handoff != null
+                    && handoff.matches(view, connection, window, window.loaded, window.cursor, window.tailCursor)
+                    && !window.needsTailBootstrap()) accepted = true;
+        }
+        return accepted;
+    }
+
+    /** 原 watch 通知保留页面和代次守卫；已有 load 负责首屏的页面不重复插入同批正文。 */
+    private static void deliverWatchedHistory(int account, long dialogId, long generation, TranscriptWindow deliveredWindow,
+            ArrayList<TranscriptWindow.Entry> delivered, java.util.Set<HistoryView> loadViews) {
+        for (HistoryView view : historyViews.values()) {
+            if (view.dialogId != dialogId || loadViews.contains(view) || !historyViewCurrent(view, deliveredWindow)) continue;
+            HistoryPage identity = new HistoryPage(view, deliveredWindow, deliveredWindow, false);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (generation != watchGeneration || !historyViewCurrent(view, deliveredWindow)
+                        || view.intentRevision != identity.intentRevision) return;
+                ArrayList<MessageObject> incoming = new ArrayList<>();
+                for (TranscriptWindow.Entry entry : delivered) {
+                    TLRPC.TL_message message = historyMessage(dialogId, entry);
+                    if (!confirmPendingEcho(account, dialogId, message)) incoming.add(historyObject(account, message));
+                }
+                if (!incoming.isEmpty()) NotificationCenter.getInstance(account).postNotificationName(
+                        NotificationCenter.didReceiveNewMessages, dialogId, incoming, false, 0, identity);
+            });
+        }
+    }
+
+    /** 每次进入先读最新；空连接等待可由ready恢复原任务，合法正文仍先交付再保存。 */
     public static void watchConversation(int account, long dialogId) {
         if (loggingOut || !loggedIn() || !ownsConversation(dialogId)) return;
         final long accountEpoch = accountGeneration;
@@ -1597,130 +2349,142 @@ public final class CodexRuntime {
         long generation = ++watchGeneration;
         watchStatus(account, dialogId, generation);
         String remote = remoteIds.get(dialogId);
+        String machine = dialogMachines.get(dialogId);
         Utilities.globalQueue.postRunnable(new Runnable() {
             private int consecutiveTailPages;
-            private TranscriptTailRecovery tailGap;
-            /** 释放本次观察的桥接页；连接、历史或代际变化后不能继续用于别的会话。 */
-            private void releaseTailGap() {
-                if (tailGap != null) {
-                    tailGap.release();
-                    tailGap = null;
-                }
-            }
-            /** 跟随增量，旧缓存缺尾游标先连续恢复；失败延后重试，不清空已有正文。 */
+            private boolean opening = true;
+            private WatchConnectionWait waiting;
+            /** 到期只清本任务登记；ready恢复后仍要复核来源和连接，不能沿旧事件发出新RPC。 */
             @Override public void run() {
-                if (generation != watchGeneration) {
-                    releaseTailGap();
-                    return;
+                WatchConnectionWait resumed = waiting;
+                waiting = null;
+                if (resumed != null && watchConnectionWait == resumed) watchConnectionWait = null;
+                if (generation != watchGeneration || !isAccountCurrent(accountEpoch)
+                        || watchedDialog != dialogId || account != org.telegram.messenger.UserConfig.selectedAccount
+                        || !java.util.Objects.equals(machine, dialogMachines.get(dialogId))
+                        || !java.util.Objects.equals(remote, remoteIds.get(dialogId))) return;
+                // 新watch只回收旧代次的空连接等待，不触碰当前页已排队或在途的请求。
+                if (watchConnectionWait != null && watchConnectionWait.generation != generation) {
+                    Utilities.globalQueue.cancelRunnable(watchConnectionWait.runnable);
+                    watchConnectionWait = null;
                 }
-                long delay = 2000;
                 try {
-                    TranscriptWindow history = histories.get(dialogId);
                     DesktopConnection connection = dialogConnection(dialogId);
+                    if (resumed != null && resumed.readyConnection != null
+                            && (resumed.readyConnection != connection || !connection.isConnected())) {
+                        Utilities.globalQueue.postRunnable(this, 5000);
+                        return;
+                    }
                     if (connection == null) {
-                        releaseTailGap();
-                        // 离线冷启没有实时连接；回到网络后自动重建，不要求退出聊天手动刷新。
                         AndroidUtilities.runOnUIThread(() -> {
                             if (generation == watchGeneration) refreshDialogs(account);
                         });
-                        delay = 5000;
-                    } else if (history != null && history.loaded) {
-                        final boolean bootstrap = history.needsTailBootstrap();
-                        if (tailGap != null && (!bootstrap || !tailGap.matches(connection, history, generation)))
-                            releaseTailGap();
-                        final String previousCursor = history.tailCursor;
-                        final String previousOlderCursor = history.cursor;
-                        final String bridgeCursor = tailGap == null ? null : tailGap.resumeCursor();
-                        final Runnable next = this;
-                        // 网络等待离开本地历史队列；同一观察轮只在请求结束后安排下一次。
-                        transcriptQueue.postRunnable(() -> {
-                            JsonObject page = null;
-                            try {
-                                if (generation == watchGeneration && connection == dialogConnection(dialogId))
-                                    page = !bootstrap ? connection.readAfter(remote, previousCursor)
-                                            : bridgeCursor == null ? connection.transcript(remote)
-                                            : connection.transcript(remote, bridgeCursor);
-                            } catch (Exception error) {
-                                logTranscriptFailure(bootstrap ? "tail_recovery_request" : "tail_request", error, null);
-                                /* 保留原记录，按失败间隔重试。 */
-                            }
-                            final JsonObject received = page;
-                            Utilities.globalQueue.postRunnable(() -> {
-                                if (generation != watchGeneration) {
-                                    releaseTailGap();
-                                    return;
-                                }
-                                long nextDelay = 5000;
-                                try {
-                                    // 返回期间可能换电脑连接或被预取推进游标，旧响应不能回写。
-                                    boolean sameWatch = received != null && connection == dialogConnection(dialogId)
-                                            && histories.get(dialogId) == history
-                                            && java.util.Objects.equals(previousCursor, history.tailCursor)
-                                            && (!bootstrap || java.util.Objects.equals(previousOlderCursor, history.cursor));
-                                    // 网络失败保留已走到的旧游标；身份变化则丢掉暂态页，不能把缺页的B、C先发给界面。
-                                    if (received != null && !sameWatch) releaseTailGap();
-                                    ArrayList<TranscriptWindow.Entry> added = null;
-                                    boolean publish = false;
-                                    if (sameWatch && bootstrap && TranscriptTailRecovery.required(history)
-                                            && (bridgeCursor != null || !TranscriptTailRecovery.containsAnchor(history, received))) {
-                                        if (tailGap == null) tailGap = TranscriptTailRecovery.start(history, connection, generation);
-                                        JsonObject ready = tailGap.accept(received, bridgeCursor);
-                                        if (ready == null) nextDelay = tailGap.continueNow() ? 0 : 2000;
-                                        else {
-                                            added = history.recoverTail(ready);
-                                            releaseTailGap();
-                                            publish = true;
-                                        }
-                                    } else if (sameWatch) {
-                                        releaseTailGap();
-                                        added = bootstrap ? history.recoverTail(received) : history.append(received);
-                                        publish = true;
-                                    }
-                                    if (publish) {
-                                        final ArrayList<TranscriptWindow.Entry> delivered = added;
-                                        if (bootstrap || !delivered.isEmpty() || !java.util.Objects.equals(previousCursor, history.tailCursor))
-                                            saveHistory(dialogId, remote, history);
-                                        publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
-                                        AndroidUtilities.runOnUIThread(() -> {
-                                            if (generation != watchGeneration) return;
-                                            ArrayList<org.telegram.messenger.MessageObject> incoming = new ArrayList<>();
-                                            for (TranscriptWindow.Entry entry : delivered) {
-                                                TLRPC.TL_message message = historyMessage(dialogId, entry);
-                                                boolean matched = confirmPendingEcho(account, dialogId, message);
-                                                if (org.telegram.messenger.BuildVars.DEBUG_VERSION && entry.message.outgoing) android.util.Log.i("CodexBridge", "echo_key=" + (entry.message.localId == null ? 0 : entry.message.localId.hashCode()) + " matched=" + matched);
-                                                if (!matched) {
-                                                    incoming.add(historyObject(account, message));
-                                                }
-                                            }
-                                            if (!incoming.isEmpty()) NotificationCenter.getInstance(account).postNotificationName(
-                                                    NotificationCenter.didReceiveNewMessages, dialogId, incoming, false, 0);
-                                        });
-                                        // 有积压才连续取页，最多四页后让出两秒；追平不增加空轮询。
-                                        if (!bootstrap && TranscriptWindow.hasPendingTail(received, previousCursor) && ++consecutiveTailPages < 4) {
-                                            nextDelay = 0;
-                                        } else {
-                                            consecutiveTailPages = 0;
-                                            nextDelay = 2000;
-                                        }
-                                        // 开发验证只记录页规模与调度，不输出对话身份或正文。
-                                        if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
-                                            android.util.Log.i("CodexBridge", "tail_page items=" + received.getAsJsonArray("items").size()
-                                                    + " bytes=" + received.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
-                                                    + " continue=" + TranscriptWindow.hasPendingTail(received, previousCursor)
-                                                    + " delay=" + nextDelay);
-                                    }
-                                } catch (Exception error) {
-                                    logTranscriptFailure(bootstrap ? "tail_recovery_merge" : "tail_merge", error, received);
-                                    consecutiveTailPages = 0; /* 无效增量不清空已有正文。 */
-                                    releaseTailGap();
-                                }
-                                if (generation == watchGeneration) Utilities.globalQueue.postRunnable(next, nextDelay);
-                            });
-                        });
+                        waiting = new WatchConnectionWait(account, accountEpoch, generation, dialogId, machine, remote, this);
+                        watchConnectionWait = waiting;
+                        Utilities.globalQueue.postRunnable(this, 5000);
                         return;
                     }
-                } catch (Exception error) { delay = 5000; }
-                if (generation == watchGeneration) Utilities.globalQueue.postRunnable(this, delay);
+                    TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
+                    if (opening && takeColdHistoryHandoff(account, dialogId, connection, history)) opening = false;
+                    final boolean latest = opening || history.needsTailBootstrap();
+                    final boolean older = !latest && history.needsVisibleHistory();
+                    final String previousCursor = history.tailCursor, previousOlderCursor = history.cursor;
+                    final boolean wasLoaded = history.loaded;
+                    final Runnable next = this;
+                    if ((latest || older) && joinColdHistoryRequest(account, accountEpoch, dialogId, remote,
+                            connection, history, latest, new ColdHistorySubscriber(null, 0, true,
+                            () -> generation == watchGeneration && isAccountCurrent(accountEpoch), result -> {
+                        if (generation != watchGeneration || !isAccountCurrent(accountEpoch)) return;
+                        long delay = 5000;
+                        if (result.success && (!latest || result.bootstrapAccepted)) {
+                            if (latest) {
+                                opening = false;
+                                takeColdHistoryHandoff(account, dialogId, connection, history);
+                            }
+                            ArrayList<TranscriptWindow.Entry> added = latest
+                                    ? history.after(0, Integer.MAX_VALUE) : new ArrayList<>();
+                            java.util.Collections.reverse(added);
+                            deliverWatchedHistory(account, dialogId, generation, history, added, result.loadViews);
+                            delay = history.needsVisibleHistory() && ++consecutiveTailPages < 4 ? 0 : 2000;
+                            if (delay != 0) consecutiveTailPages = 0;
+                        } else consecutiveTailPages = 0;
+                        Utilities.globalQueue.postRunnable(next, delay);
+                    }))) return;
+                    transcriptQueue.postRunnable(() -> {
+                        JsonObject page = null;
+                        try {
+                            if (generation == watchGeneration && isAccountCurrent(accountEpoch)
+                                    && connection == dialogConnection(dialogId))
+                                page = latest ? connection.transcript(remote) : older
+                                        ? connection.transcript(remote, previousOlderCursor) : connection.readAfter(remote, previousCursor);
+                        } catch (Exception error) { logTranscriptFailure("watch_request", error, null); }
+                        final JsonObject received = page;
+                        Utilities.globalQueue.postRunnable(() -> {
+                            if (generation != watchGeneration || !isAccountCurrent(accountEpoch)) return;
+                            long delay = 5000;
+                            try {
+                                if (received != null && connection == dialogConnection(dialogId)
+                                        && histories.get(dialogId) == history && history.loaded == wasLoaded
+                                        && java.util.Objects.equals(previousCursor, history.tailCursor)
+                                        && (!latest && !older || java.util.Objects.equals(previousOlderCursor, history.cursor))) {
+                                    com.google.gson.JsonElement reason = received.get("truncationReason");
+                                    if (!latest && !older && reason != null && reason.isJsonPrimitive()
+                                            && reason.getAsJsonPrimitive().isString() && "source_discontinuity".equals(reason.getAsString())) {
+                                        history.tailCursor = null;
+                                        saveHistory(dialogId, remote, history);
+                                        throw new IOException("消息来源出现断档");
+                                    }
+                                    ArrayList<TranscriptWindow.Entry> before = history.before(0, 1);
+                                    int lastId = before.isEmpty() ? 0 : before.get(0).id;
+                                    TranscriptWindow current = history;
+                                    ArrayList<TranscriptWindow.Entry> added;
+                                    if (latest) {
+                                        current = history.acceptLatest(received);
+                                        publishHistoryRoot(dialogId, current);
+                                        opening = false;
+                                        added = current == history ? current.after(lastId, Integer.MAX_VALUE) : new ArrayList<>();
+                                        java.util.Collections.reverse(added);
+                                    } else if (older) {
+                                        history.prependWithCachedBridge(received);
+                                        added = new ArrayList<>();
+                                    } else added = history.append(received);
+                                    boolean needsSave = latest || older || !added.isEmpty() || !java.util.Objects.equals(previousCursor, current.tailCursor);
+                                    boolean visibleLatest = latest && !current.before(0, 1).isEmpty();
+                                    if (needsSave && !visibleLatest) saveHistory(dialogId, remote, current);
+                                    try {
+                                        publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, current);
+                                        java.util.Set<HistoryView> initialLoads = latest
+                                                ? completeInitialLoadsFromLatest(dialogId, connection, current) : java.util.Collections.emptySet();
+                                        // 只处理同根空转非空；后续普通增量仍沿原通知，不反复清屏或重开额度。
+                                        if (latest && current == history && before.isEmpty() && visibleLatest)
+                                            offerFirstVisibleHistory(dialogId, current, initialLoads);
+                                        if (older && before.isEmpty() && !current.before(0, 1).isEmpty()) {
+                                            for (HistoryView view : historyViews.values())
+                                                if (view.dialogId == dialogId) offerLatestHistory(view, current, true);
+                                        } else offerLatestHistory(dialogId, current);
+                                        deliverWatchedHistory(account, dialogId, generation, current, added, initialLoads);
+                                    } finally {
+                                        // 只让合法最新正文越过保存等待；旧页顺序及异常后必需的持久化保持。
+                                        if (visibleLatest) saveHistory(dialogId, remote, current);
+                                    }
+                                    boolean backlog = current.needsVisibleHistory()
+                                            || !latest && !older && TranscriptWindow.hasPendingTail(received, previousCursor);
+                                    delay = backlog && ++consecutiveTailPages < 4 ? 0 : 2000;
+                                    if (delay != 0) consecutiveTailPages = 0;
+                                }
+                            } catch (Exception error) {
+                                logTranscriptFailure("watch_merge", error, received);
+                                consecutiveTailPages = 0;
+                            }
+                            if (generation == watchGeneration && isAccountCurrent(accountEpoch))
+                                Utilities.globalQueue.postRunnable(next, delay);
+                        });
+                    });
+                } catch (Exception error) {
+                    logTranscriptFailure("watch_prepare", error, null);
+                    if (generation == watchGeneration && isAccountCurrent(accountEpoch))
+                        Utilities.globalQueue.postRunnable(this, 5000);
+                }
             }
         });
     }
@@ -1884,7 +2648,15 @@ public final class CodexRuntime {
     public static void stopWatching(long dialogId) {
         if (watchedDialog == dialogId) {
             watchedDialog = 0;
+            final long previousGeneration = watchGeneration;
             final long stoppedGeneration = ++watchGeneration;
+            Utilities.globalQueue.postRunnable(() -> {
+                WatchConnectionWait waiting = watchConnectionWait;
+                if (waiting != null && waiting.generation == previousGeneration && waiting.dialogId == dialogId) {
+                    Utilities.globalQueue.cancelRunnable(waiting.runnable);
+                    watchConnectionWait = null;
+                }
+            });
             statusQueue.postRunnable(() -> {
                 if (watchGeneration != stoppedGeneration || watchedDialog != 0) return;
                 if (statusPoll != null) statusQueue.cancelRunnable(statusPoll);
@@ -1922,6 +2694,8 @@ public final class CodexRuntime {
         message.flags |= 256;
         message.media = new TLRPC.TL_messageMediaEmpty();
         message.params = new HashMap<>();
+        message.params.put("codexSourceId", row.message.id);
+        message.params.put("codexHistoryEpoch", row.epoch);
         if (row.message.localId != null) message.params.put("codexLocalId", row.message.localId);
         if (!row.message.attachments.isEmpty()) {
             DesktopAttachment value = row.message.attachments.get(0);
@@ -1937,56 +2711,91 @@ public final class CodexRuntime {
         return object;
     }
 
-    /** 界面线程绑定列表后恢复原历史及待发摘要；后台读取不能覆盖期间新创建的气泡。 */
+    /** 界面线程绑定列表后完整恢复本地历史及待发摘要；首次连接就绪不废弃相同归属的缓存。 */
     private static void restoreDialogPreviews(int account, long epoch, String machine, Map<String, Long> publishedIds) {
         if (!isAccountCurrent(epoch)) return;
+        final PasswordLogin.Session owner = session;
+        // 调用时固定本批绑定，逐项让出后不读取外部可变集合。
+        final Map<String, Long> bindings = new java.util.LinkedHashMap<>(publishedIds);
         final Map<Long, MessageObject> previous = new HashMap<>();
-        for (Long dialogId : publishedIds.values()) {
+        for (Long dialogId : bindings.values()) {
             ArrayList<MessageObject> preview = MessagesController.getInstance(account).dialogMessage.get(dialogId);
             previous.put(dialogId, preview == null || preview.isEmpty() ? null : preview.get(0));
         }
-        Utilities.globalQueue.postRunnable(() -> {
-            if (!isAccountCurrent(epoch)) return;
-            for (Map.Entry<String, Long> binding : publishedIds.entrySet()) {
+        Utilities.globalQueue.postRunnable(new Runnable() {
+            private long traceQueuedAt = beginHistoryTrace("preview_queue");
+            private final java.util.Iterator<Map.Entry<String, Long>> pending = bindings.entrySet().iterator();
+
+            /** 每轮完整恢复一个会话，先形成消息快照，再由同一次UI回调选择原待发或历史摘要。 */
+            @Override public void run() {
+                traceHistoryDuration("preview_queue", traceQueuedAt);
+                if (session != owner || !isAccountCurrent(epoch) || !pending.hasNext()) return;
+                Map.Entry<String, Long> binding = pending.next();
                 long dialogId = binding.getValue();
                 String remote = binding.getKey();
                 DesktopConnection connection = dialogConnection(dialogId);
-                if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) continue;
+                if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) {
+                    continueNext();
+                    return;
+                }
                 TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
+                // 完整读盘后先复核归属，再准备待发和附件；迟到恢复不能触碰下一账号目录。
+                DesktopConnection preparedConnection = connection == null ? dialogConnection(dialogId) : connection;
+                if (session != owner || histories.get(dialogId) != history
+                        || !previewCurrent(account, epoch, dialogId, remote, machine, preparedConnection)) {
+                    continueNext();
+                    return;
+                }
+                long tracePreparedAt = beginHistoryTrace("preview_prepare");
+                java.util.Set<String> echoed = history.allOutgoingLocalIds();
+                ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
+                OutboxStore.Item newest = null;
                 try {
                     ArrayList<OutboxStore.Item> queued = outboxStore(dialogId).list(remote);
-                    if (!queued.isEmpty()) {
-                        java.util.HashSet<String> echoed = new java.util.HashSet<>();
-                        for (TranscriptWindow.Entry entry : history.before(0, Integer.MAX_VALUE)) {
-                            if (entry.message.outgoing && entry.message.localId != null) echoed.add(entry.message.localId);
-                        }
-                        OutboxStore.Item newest = null;
-                        for (OutboxStore.Item item : queued) {
-                            if (!batchEchoed(item, echoed) && (newest == null || item.date > newest.date)) newest = item;
-                        }
-                        ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
-                        if (newest != null && (latest.isEmpty() || newest.date >= latest.get(0).message.createdAtMs / 1000)) {
-                            final OutboxStore.Item selected = newest;
-                            AndroidUtilities.runOnUIThread(() -> {
-                                if (!previewCurrent(account, epoch, dialogId, remote, machine, connection)) return;
-                                ArrayList<MessageObject> current = MessagesController.getInstance(account).dialogMessage.get(dialogId);
-                                MessageObject visible = current == null || current.isEmpty() ? null : current.get(0);
-                                if (visible != previous.get(dialogId)) return;
-                                if (visible != null && visible.messageOwner.params != null) {
-                                    String localId = visible.messageOwner.params.get("codexLocalId");
-                                    String batch = visible.messageOwner.params.getOrDefault("codexBatchLocalId", localId);
-                                    if (pendingMessages.get(localId) == visible && !selected.localId.equals(batch)) return;
-                                }
-                                // 原恢复器保留ACK/未知/失败、每件附件及批内顺序，不写新缓存或自动提交。
-                                ArrayList<MessageObject> pending = restoredPending(account, dialogId, selected, echoed);
-                                publishPendingPreview(account, epoch, dialogId, pending, true);
-                            });
-                        }
+                    for (OutboxStore.Item item : queued) {
+                        if (!batchEchoed(item, echoed) && (newest == null || item.date > newest.date)) newest = item;
                     }
                 } catch (java.io.IOException error) {
                     logTranscriptFailure("preview_pending_restore", error, null);
                 }
-                publishHistoryPreview(account, epoch, dialogId, remote, machine, connection, history);
+                final OutboxStore.Item selected = newest != null
+                        && (latest.isEmpty() || newest.date >= latest.get(0).message.createdAtMs / 1000) ? newest : null;
+                final TLRPC.TL_message message = latest.isEmpty() ? null : historyMessage(dialogId, latest.get(0));
+                if (selected != null || message != null) AndroidUtilities.runOnUIThread(() -> {
+                    // 只有本地恢复的空连接快照可接纳首次就绪；旧非空连接、账号或历史根更换仍拒绝。
+                    DesktopConnection currentConnection = connection == null ? dialogConnection(dialogId) : connection;
+                    if (session != owner || histories.get(dialogId) != history
+                            || !previewCurrent(account, epoch, dialogId, remote, machine, currentConnection)) return;
+                    ArrayList<MessageObject> current = MessagesController.getInstance(account).dialogMessage.get(dialogId);
+                    MessageObject visible = current == null || current.isEmpty() ? null : current.get(0);
+                    String localId = visible == null || visible.messageOwner.params == null ? null
+                            : visible.messageOwner.params.get("codexLocalId");
+                    // 新网络正文不能被旧缓存覆盖；当前仍为原待发对象且历史已回显时保留原释放语义。
+                    boolean echoedPending = localId != null && pendingMessages.get(localId) == visible && echoed.contains(localId);
+                    if (visible != previous.get(dialogId) && !echoedPending) return;
+                    boolean restoreSelected = selected != null;
+                    if (restoreSelected && visible != null && visible.messageOwner.params != null) {
+                        String batch = visible.messageOwner.params.getOrDefault("codexBatchLocalId", localId);
+                        restoreSelected = pendingMessages.get(localId) != visible || selected.localId.equals(batch);
+                    }
+                    if (restoreSelected) {
+                        // 沿原恢复器与发布器保留批内附件顺序、失败状态及未回显待发优先，不产生提交。
+                        ArrayList<MessageObject> restored = restoredPending(account, dialogId, selected, echoed);
+                        publishPendingPreview(account, epoch, dialogId, restored, true);
+                    }
+                    if (message != null) publishDialogPreview(account, epoch, dialogId, remote, machine,
+                            currentConnection, message, null, echoed);
+                });
+                traceHistoryDuration("preview_prepare", tracePreparedAt);
+                continueNext();
+            }
+
+            /** 每轮最多排一个后继，诊断从本次续排取时，不混入前一项读盘与准备时间。 */
+            private void continueNext() {
+                if (pending.hasNext()) {
+                    traceQueuedAt = beginHistoryTrace("preview_queue");
+                    Utilities.globalQueue.postRunnable(this);
+                }
             }
         });
     }
@@ -1998,10 +2807,7 @@ public final class CodexRuntime {
         ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
         if (latest.isEmpty()) return;
         TLRPC.TL_message message = historyMessage(dialogId, latest.get(0));
-        java.util.HashSet<String> echoed = new java.util.HashSet<>();
-        for (TranscriptWindow.Entry entry : history.before(0, Integer.MAX_VALUE)) {
-            if (entry.message.outgoing && entry.message.localId != null) echoed.add(entry.message.localId);
-        }
+        java.util.Set<String> echoed = history.allOutgoingLocalIds();
         AndroidUtilities.runOnUIThread(() -> publishDialogPreview(account, epoch, dialogId, remote, machine,
                 connection, message, null, echoed));
     }
@@ -2106,24 +2912,102 @@ public final class CodexRuntime {
                 session.server, session.accountId, dialogMachine(dialogId));
     }
 
-    /** 从对话所属电脑恢复正文，读取失败保留重新加载路径。 */
-    private static TranscriptWindow readHistory(long dialogId, String remote) {
-        try { return transcriptStore(dialogId).read(remote); }
-        catch (java.io.IOException error) { return new TranscriptWindow(); }
+    // 只有原globalQueue消费各阶段额度；跨线程仅只读，摘要不能耗尽首次开页的诊断机会。
+    private static volatile int historyPreviewQueueTraceEvents, historyCacheTraceEvents,
+            historyPreviewPrepareTraceEvents, historyOpenQueueTraceEvents;
+
+    /** 显式开启的独立包调试才取钟；每阶段耗尽即停，诊断故障不进入业务异常路径。 */
+    private static long beginHistoryTrace(String phase) {
+        if (!org.telegram.messenger.BuildVars.DEBUG_VERSION) return -1;
+        switch (phase) {
+            case "preview_queue": if (historyPreviewQueueTraceEvents >= 32) return -1; break;
+            case "cache_read": if (historyCacheTraceEvents >= 32) return -1; break;
+            case "preview_prepare": if (historyPreviewPrepareTraceEvents >= 32) return -1; break;
+            case "open_queue": if (historyOpenQueueTraceEvents >= 32) return -1; break;
+            default: return -1;
+        }
+        try {
+            if (!enabled() || !android.util.Log.isLoggable("CodexHistoryStartup", android.util.Log.DEBUG)) return -1;
+            return android.os.SystemClock.elapsedRealtime();
+        } catch (Throwable ignored) { return -1; }
     }
 
-    /** 同一电脑目录先保存回显，再移除待发记录；失败不把预取版本记成已落地。 */
-    private static boolean saveHistory(long dialogId, String remote, TranscriptWindow history) {
+    /** 仅原globalQueue记录四种固定阶段；各31条耗时加一次截断，总计不超过128条。 */
+    private static void traceHistoryDuration(String phase, long startedAt) {
+        if (startedAt < 0) return;
+        long finishedAt = beginHistoryTrace(phase);
+        if (finishedAt < 0) return;
         try {
+            int events;
+            switch (phase) {
+                case "preview_queue": events = ++historyPreviewQueueTraceEvents; break;
+                case "cache_read": events = ++historyCacheTraceEvents; break;
+                case "preview_prepare": events = ++historyPreviewPrepareTraceEvents; break;
+                case "open_queue": events = ++historyOpenQueueTraceEvents; break;
+                default: return;
+            }
+            if (events == 32) {
+                android.util.Log.d("CodexHistoryStartup", "history_phase=" + phase + " trace_limited=true");
+                return;
+            }
+            android.util.Log.d("CodexHistoryStartup", "history_phase=" + phase
+                    + " elapsedRealtimeMs=" + finishedAt + " durationMs=" + (finishedAt - startedAt));
+        } catch (Throwable ignored) { /* 诊断不能覆盖原读取结果或异常。 */ }
+    }
+
+    /** 从所属电脑完整恢复缓存；诊断覆盖原读取及IO回退，不改变其他异常的传播。 */
+    private static TranscriptWindow readHistory(long dialogId, String remote) {
+        long traceStartedAt = beginHistoryTrace("cache_read");
+        try { return transcriptStore(dialogId).read(remote); }
+        catch (java.io.IOException error) { return new TranscriptWindow(); }
+        finally { traceHistoryDuration("cache_read", traceStartedAt); }
+    }
+
+    /** pin释放后只在原队列清理同一账号、来源与根窗口，没有可删副本就不写磁盘。 */
+    private static void scheduleHistoryArchivePrune(HistoryView released) {
+        final PasswordLogin.Session owner = session;
+        final String machine = dialogMachines.get(released.dialogId);
+        final TranscriptWindow expected = histories.get(released.dialogId);
+        if (owner == null || machine == null || released.remote == null || expected == null) return;
+        Utilities.globalQueue.postRunnable(() -> {
+            // 清理只针对排队时的根；迟到关闭、换账号或重新绑定不能收尾后来者的缓存。
+            if (!isAccountCurrent(released.accountEpoch) || session != owner
+                    || released.account != org.telegram.messenger.UserConfig.selectedAccount
+                    || !machine.equals(dialogMachines.get(released.dialogId))
+                    || !released.remote.equals(remoteIds.get(released.dialogId))
+                    || histories.get(released.dialogId) != expected) return;
+            saveHistory(released.dialogId, released.remote, expected, true);
+        });
+    }
+
+    /** 原业务保存仍始终落盘；收尾入口另外限定为确有归档移除才写。 */
+    private static boolean saveHistory(long dialogId, String remote, TranscriptWindow history) {
+        return saveHistory(dialogId, remote, history, false);
+    }
+
+    /** 重新核对阅读引用再保存；仅清副本不接管待发，普通保存仍先落盘再确认回显。 */
+    private static boolean saveHistory(long dialogId, String remote, TranscriptWindow history, boolean pruneOnly) {
+        try {
+            java.util.HashSet<String> pinned = new java.util.HashSet<>();
+            for (HistoryView view : historyViews.values()) if (view.dialogId == dialogId && isAccountCurrent(view.accountEpoch)) {
+                // 与UI的候选→当前段转移一并取快照，不能在两次读取之间丢掉仍在阅读的段。
+                synchronized (view) {
+                    TranscriptWindow current = view.window, proposed = view.proposedWindow, bookmark = view.bookmarkWindow;
+                    if (current != null) pinned.add(current.epoch());
+                    if (proposed != null) pinned.add(proposed.epoch());
+                    if (bookmark != null) pinned.add(bookmark.epoch());
+                }
+            }
+            boolean pruned = history.pruneMergedSegments(pinned);
+            if (pruneOnly && !pruned) return true;
             transcriptStore(dialogId).write(remote, history);
+            // 这里只减少已重复保存的内容，不借关闭页面改变原待发确认时序。
+            if (pruneOnly) return true;
             // 先确认历史已落盘，之后才能删除同一发送编号的待发记录。
             OutboxStore outbox = outboxStore(dialogId);
             ArrayList<OutboxStore.Item> queued = outbox.list(remote);
             if (!queued.isEmpty()) {
-                java.util.HashSet<String> echoed = new java.util.HashSet<>();
-                for (TranscriptWindow.Entry row : history.before(0, Integer.MAX_VALUE)) {
-                    if (row.message.localId != null && row.message.outgoing) echoed.add(row.message.localId);
-                }
+                java.util.Set<String> echoed = history.allOutgoingLocalIds();
                 for (OutboxStore.Item item : queued) if (batchEchoed(item, echoed)) outbox.remove(item.localId);
             }
             return true;
@@ -2134,52 +3018,139 @@ public final class CodexRuntime {
         }
     }
 
-    /** 原聊天加载同时发布真实最新摘要；分页交付仍保持原布局、锚点和滚动逻辑。 */
+    /** 定时消息探测独立空终态；普通加载仍按绑定段解释编号，并保留原冷首屏与翻页资格。 */
     public static void loadMessages(int account, long dialogId, int count, int maxId,
                                     int classGuid, int loadType, int loadIndex, int mode) {
-        final long accountEpoch = accountGeneration;
-        if (!isAccountCurrent(accountEpoch)) return;
-        String remote = remoteIds.get(dialogId);
+        // MODE_SCHEDULED = 1：Codex没有Telegram定时消息，辅助计数不能改普通页的count/ticket/waiter。
+        if (mode == 1) {
+            final long accountEpoch = accountGeneration;
+            AndroidUtilities.runOnUIThread(() -> {
+                // 沿原通知完成对应loadIndex；旧账号排队的空结果也不能进入新账号。
+                if (!isAccountCurrent(accountEpoch)) return;
+                NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesDidLoad,
+                        dialogId, count, new ArrayList<MessageObject>(), false, 0, 0, 0, 0,
+                        loadType, true, classGuid, loadIndex, maxId, 0, mode);
+            });
+            return;
+        }
+        HistoryView candidate = historyViews.get(classGuid);
+        if (candidate == null) {
+            openHistoryView(account, dialogId, classGuid);
+            candidate = historyViews.get(classGuid);
+        }
+        final HistoryView view = candidate;
+        if (view.account != account || view.dialogId != dialogId || !historyViewCurrent(view, view.window)) return;
+        final long revision = view.intentRevision;
+        // 所有新加载只使这个提前首屏资格失效，不取消普通翻页或改原阅读意图代次。
+        final Object initialTicket = new Object();
+        view.initialLoadTicket = initialTicket;
+        view.initialLoadWaiter = null;
         Utilities.globalQueue.postRunnable(new Runnable() {
             private int pages;
             private Exception fetchError;
-            /** 本地先交付；缺页才异步取来源，回到同一队列合并并重新选择锚点。 */
+            private TranscriptWindow window;
+            private volatile boolean finished;
+            private InitialLoadWaiter initialWaiter;
+            // 只观察普通最新首屏的首次入队，不把网络等待或续页重新解释成队列等待。
+            private long traceQueuedAt = mode == 0 && loadType == 2 && maxId == 0 && count > 0 ? beginHistoryTrace("open_queue") : -1;
+
+            /** 只有已登记的冷首屏随新加载失效，普通翻页仍保留原续做资格。 */
+            private boolean initialLoadCurrent() {
+                return initialWaiter == null || view.initialLoadTicket == initialTicket;
+            }
+
+            /** 只释放自己的等待回调，不能清掉随后进入的新加载。 */
+            private void clearInitialWaiter() {
+                if (view.initialLoadWaiter == initialWaiter) view.initialLoadWaiter = null;
+            }
+
+            /** 最新正文已在同一原段中可用，按原loadIndex/mode完成一次并终止旧回包续做。 */
+            private boolean completeFromLatest() {
+                if (finished || view.initialLoadWaiter != initialWaiter || view.initialLoadTicket != initialTicket
+                        || !historyViewCurrent(view, window) || view.intentRevision != revision) return false;
+                finished = true;
+                clearInitialWaiter();
+                try { deliverHistoryPage(view, window, count, maxId, loadType, loadIndex, mode, false, initialTicket); }
+                catch (Exception error) { deliverFailure(initialTicket); }
+                return true;
+            }
+
+            /** 沿原失败通知保留请求参数；提前首屏的错误也必须在实际UI消费时重验ticket。 */
+            private void deliverFailure(Object ticket) {
+                final TranscriptWindow failedWindow = view.window;
+                if (failedWindow == null) return;
+                final HistoryPage identity = new HistoryPage(view, failedWindow, failedWindow, false, true);
+                identity.initialLoadTicket = ticket;
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (!historyViewCurrent(view, failedWindow) || view.intentRevision != revision
+                            || !isHistoryPageCurrent(identity)) return;
+                    NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesDidLoad,
+                            dialogId, 0, new ArrayList<MessageObject>(), false, 0, 0, 0, 0,
+                            loadType, false, classGuid, loadIndex, maxId, 0, mode, identity);
+                });
+            }
+
+            /** 首次进入原队列时记录等待；原过期、补页和交付判断按原顺序继续。 */
             @Override public void run() {
-                if (!isAccountCurrent(accountEpoch)) return;
+                traceHistoryDuration("open_queue", traceQueuedAt);
+                traceQueuedAt = -1;
+                if (finished || !initialLoadCurrent() || !historyViewCurrent(view, view.window) || view.intentRevision != revision) return;
                 try {
                     if (fetchError != null) throw fetchError;
-                    TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
-                    DesktopConnection previewConnection = dialogConnection(dialogId);
-                    publishHistoryPreview(account, accountEpoch, dialogId, remote, dialogMachines.get(dialogId), previewConnection, history);
-                    boolean newer = loadType == 1;
-                    ArrayList<TranscriptWindow.Entry> selected = newer ? history.after(maxId, count + 1) : history.before(maxId, count + 1);
-                    boolean cachedPage = !selected.isEmpty();
+                    TranscriptWindow root = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, view.remote));
+                    if (view.window == null) view.window = root;
+                    if (window == null) window = view.window;
+                    if (!historyViewCurrent(view, window) || !root.containsSegment(window)) return;
+                    view.count = count;
+                    TranscriptWindow history = window;
+                    publishHistoryPreview(account, view.accountEpoch, dialogId, view.remote, dialogMachines.get(dialogId), dialogConnection(dialogId), root);
+                    boolean newer = loadType == 1, around = loadType == 3;
+                    ArrayList<TranscriptWindow.Entry> selected = around ? history.around(maxId, count)
+                            : newer ? history.after(maxId, count + 1) : history.before(maxId, count + 1);
+                    boolean anchorFound = around && history.findNumber(maxId) != null;
+                    boolean missingOlderAnchor = around && count > 0 && maxId > 0 && !anchorFound
+                            && history.before(maxId, 1).isEmpty();
                     DesktopConnection connection = dialogConnection(dialogId);
-                    // 工具密集历史仍最多取四页；已有本地页无需等待网络补满。
-                    if (!newer && connection != null && (!cachedPage || pages > 0)
-                            && pages < 4 && selected.size() < count && history.hasMore) {
+                    // 普通首屏已有可见正文即交付，空投影仍沿原预算找正文；主动翻旧和定位保持补页。
+                    boolean visibleLatest = mode == 0 && loadType == 2 && maxId == 0 && count > 0 && !selected.isEmpty();
+                    if (!visibleLatest && !newer && connection != null && (selected.isEmpty() || pages > 0 || missingOlderAnchor)
+                            && pages < 4 && (selected.size() < count || missingOlderAnchor) && history.hasMore) {
                         final String cursor = history.cursor;
                         final boolean loaded = history.loaded;
                         final Runnable resume = this;
+                        // 未加载与已加载空投影都登记首屏ticket，让同一合法latest在保存前直接完成且可被新load取消。
+                        if (initialWaiter == null && pages == 0 && mode == 0 && loadType == 2 && maxId == 0 && count > 0
+                                && root == history && selected.isEmpty() && view.initialLoadTicket == initialTicket) {
+                            initialWaiter = new InitialLoadWaiter(view, history, connection, revision, initialTicket, this::completeFromLatest);
+                            view.initialLoadWaiter = initialWaiter;
+                        }
                         pages++;
+                        // 同轮普通 load 与 watch/prefetch 仅共享冷空页，各自保留原页预算与交付模式。
+                        if (joinColdHistoryRequest(account, view.accountEpoch, dialogId, view.remote, connection, history,
+                                cursor == null || cursor.isEmpty(), new ColdHistorySubscriber(view, revision, true,
+                                () -> !finished && initialLoadCurrent() && historyViewCurrent(view, history) && view.intentRevision == revision, result -> {
+                            if (finished || !initialLoadCurrent() || !historyViewCurrent(view, history) || view.intentRevision != revision) return;
+                            if (result.error != null) fetchError = result.error;
+                            Utilities.globalQueue.postRunnable(resume);
+                        }))) return;
                         historyQueue.postRunnable(() -> {
-                            if (!isAccountCurrent(accountEpoch)) return;
+                            if (finished || !initialLoadCurrent() || !historyViewCurrent(view, history) || view.intentRevision != revision) return;
                             JsonObject page = null;
                             Exception failure = null;
-                            try { page = connection.transcript(remote, cursor); }
+                            try { page = connection.transcript(view.remote, cursor); }
                             catch (Exception error) { failure = error; }
                             final JsonObject received = page;
                             final Exception requestError = failure;
                             Utilities.globalQueue.postRunnable(() -> {
-                                if (!isAccountCurrent(accountEpoch)) return;
+                                if (finished || !initialLoadCurrent() || !historyViewCurrent(view, history) || view.intentRevision != revision) return;
                                 try {
                                     if (requestError != null) throw requestError;
-                                    // 其他分页或预取可能先推进旧页游标；不重复合并迟到页。
-                                    if (connection != dialogConnection(dialogId) || histories.get(dialogId) != history)
-                                        throw new java.io.IOException("历史连接已更换");
+                                    TranscriptWindow currentRoot = histories.get(dialogId);
+                                    if (connection != dialogConnection(dialogId) || currentRoot == null || !currentRoot.containsSegment(history))
+                                        throw new IOException("历史连接已更换");
                                     if (loaded == history.loaded && java.util.Objects.equals(cursor, history.cursor)) {
-                                        history.prepend(received);
-                                        saveHistory(dialogId, remote, history);
+                                        history.prependWithCachedBridge(received);
+                                        saveHistory(dialogId, view.remote, currentRoot);
                                     }
                                 } catch (Exception error) { fetchError = error; }
                                 Utilities.globalQueue.postRunnable(resume);
@@ -2187,52 +3158,140 @@ public final class CodexRuntime {
                         });
                         return;
                     }
-                    boolean end = (newer ? history.loaded && history.tailCursor != null : history.complete) && selected.size() <= count;
-                    // 向新翻页先交付紧邻锚点的一批；不能跳过最近的一项或拿旧页冒充新页。
-                    if (newer && selected.size() > count) selected.remove(0);
-                    ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
-                    int loadedAnchor = maxId == 0 && loadType == 2 && !latest.isEmpty() ? latest.get(0).id : maxId;
-                    ArrayList<TranscriptWindow.Entry> rows = selected;
-                    ArrayList<OutboxStore.Item> restored = maxId == 0 && loadType == 2
-                            ? outboxStore(dialogId).list(remote) : new ArrayList<>();
-                    java.util.HashSet<String> echoed = new java.util.HashSet<>();
-                    for (TranscriptWindow.Entry row : history.before(0, Integer.MAX_VALUE)) {
-                        if (row.message.localId != null && row.message.outgoing) echoed.add(row.message.localId);
-                    }
-                    restored.removeIf(item -> batchEchoed(item, echoed));
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (!isAccountCurrent(accountEpoch) || !remote.equals(remoteIds.get(dialogId))) return;
-                        ArrayList<org.telegram.messenger.MessageObject> objects = new ArrayList<>();
-                        for (int i = 0; i < Math.min(count, rows.size()); i++) {
-                            TranscriptWindow.Entry row = rows.get(i);
-                            TLRPC.TL_message message = historyMessage(dialogId, row);
-                            confirmPendingEcho(account, dialogId, message);
-                            objects.add(historyObject(account, message));
-                        }
-                        if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge", "history type=" + loadType + " max=" + maxId + " count=" + objects.size());
-                        // 原页以数量不足判断结束；只有来源明确完整时才允许进入结束分支。
-                        int reportedCount = end ? Math.max(count, objects.size() + 1) : objects.size();
-                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesDidLoad,
-                                dialogId, reportedCount, objects, false, 0, 0, 0, 0,
-                                loadType, end, classGuid, loadIndex, loadedAnchor, 0, mode);
-                        if (!restored.isEmpty()) {
-                            ArrayList<org.telegram.messenger.MessageObject> pending = new ArrayList<>();
-                            for (OutboxStore.Item item : restored) pending.addAll(restoredPending(account, dialogId, item, echoed));
-                            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.didReceiveNewMessages,
-                                    dialogId, pending, false, 0);
-                        }
-                    });
+                    finished = true;
+                    clearInitialWaiter();
+                    deliverHistoryPage(view, history, count, maxId, loadType, loadIndex, mode, false,
+                            initialWaiter == null ? null : initialTicket);
                 } catch (Exception error) {
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (!isAccountCurrent(accountEpoch)) return;
-                        android.widget.Toast.makeText(ApplicationLoader.applicationContext,
-                                "暂时无法读取聊天记录，请稍后重新打开", android.widget.Toast.LENGTH_SHORT).show();
-                        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.messagesDidLoad,
-                                dialogId, 0, new ArrayList<org.telegram.messenger.MessageObject>(), false,
-                                0, 0, 0, 0, loadType, false, classGuid, loadIndex, maxId, 0, mode);
-                    });
+                    finished = true;
+                    clearInitialWaiter();
+                    deliverFailure(initialWaiter == null ? null : initialTicket);
                 }
             }
+        });
+    }
+
+    /** 缓存首屏、按需历史和最新替换沿同一交付/待发恢复逻辑，禁止旧代通知改动新列表。 */
+    private static void deliverHistoryPage(HistoryView view, TranscriptWindow history, int count, int maxId,
+            int loadType, int loadIndex, int mode, boolean replace) throws IOException {
+        deliverHistoryPage(view, history, count, maxId, loadType, loadIndex, mode, replace, null);
+    }
+
+    /** 提前首屏保留ticket；旧页耗尽本段可读内容即通知UI结束，不改来源完整性及锚点证明。 */
+    private static void deliverHistoryPage(HistoryView view, TranscriptWindow history, int count, int maxId,
+            int loadType, int loadIndex, int mode, boolean replace, Object initialTicket) throws IOException {
+        boolean newer = loadType == 1, around = loadType == 3;
+        ArrayList<TranscriptWindow.Entry> selected = around ? history.around(maxId, count)
+                : newer ? history.after(maxId, count + 1) : history.before(maxId, count + 1);
+        boolean anchorFound = around && history.findNumber(maxId) != null;
+        // 无后续游标只代表当前可读边界；本地仍有下一页时继续，不能把不完整来源标成complete。
+        boolean end = around ? anchorFound && history.complete && !selected.isEmpty()
+                && history.before(selected.get(selected.size() - 1).id, 1).isEmpty()
+                : (newer ? history.loaded && history.tailCursor != null : history.complete || !history.hasMore) && selected.size() <= count;
+        if (newer && selected.size() > count) selected.remove(0);
+        ArrayList<TranscriptWindow.Entry> latest = history.before(0, 1);
+        int loadedAnchor = maxId == 0 && loadType == 2 && !latest.isEmpty() ? latest.get(0).id : maxId;
+        TranscriptWindow root = histories.get(view.dialogId);
+        java.util.Set<String> echoed = (root == null ? history : root).allOutgoingLocalIds();
+        ArrayList<OutboxStore.Item> restored = maxId == 0 && loadType == 2
+                ? outboxStore(view.dialogId).list(view.remote) : new ArrayList<>();
+        restored.removeIf(item -> batchEchoed(item, echoed));
+        // 初次缓存交付也发布根引用；UI不需要遍历归档或查询普通Map。
+        synchronized (view) { view.latestRoot = root; }
+        // 仅普通非空最新交付在历史队列读取末锚快照；旧页、待发和失败通知不新增资格。
+        boolean bridgeCandidate = mode == 0 && loadType == 2 && maxId == 0 && root == history
+                && !selected.isEmpty() && history.hasUnbridgedCachedHistory();
+        LocalHistoryBoundary localBoundary = root != null && root.containsSegment(history)
+                ? new LocalHistoryBoundary(root, history) : null;
+        HistoryPage identity = new HistoryPage(view, view.window, history, replace, false, bridgeCandidate, localBoundary);
+        identity.initialLoadTicket = initialTicket;
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!historyViewCurrent(view, identity.from) || view.intentRevision != identity.intentRevision
+                    || !isHistoryPageCurrent(identity) || replace && view.proposedWindow != history) return;
+            ArrayList<MessageObject> objects = new ArrayList<>();
+            for (int i = 0; i < Math.min(count, selected.size()); i++) {
+                TLRPC.TL_message message = historyMessage(view.dialogId, selected.get(i));
+                // 替换候选还未被UI接受，不能先把旧段内的待发对象改成新段正编号。
+                if (!replace) confirmPendingEcho(view.account, view.dialogId, message);
+                objects.add(historyObject(view.account, message));
+            }
+            Runnable restorePending = () -> {
+                if (!historyViewCurrent(view, history) || initialTicket != null && view.initialLoadTicket != initialTicket
+                        || view.intentRevision != (replace ? identity.acceptedRevision : identity.intentRevision)) return;
+                if (replace) for (MessageObject object : objects)
+                    confirmPendingEcho(view.account, view.dialogId, (TLRPC.TL_message) object.messageOwner);
+                if (!restored.isEmpty()) {
+                    ArrayList<MessageObject> pending = new ArrayList<>();
+                    for (OutboxStore.Item item : restored) pending.addAll(restoredPending(view.account, view.dialogId, item, echoed));
+                    for (MessageObject object : pending) {
+                        object.messageOwner.params.put("codexRestoredPending", "true");
+                        object.wasJustSent = false;
+                    }
+                    HistoryPage pendingIdentity = new HistoryPage(view, history, history, false);
+                    pendingIdentity.initialLoadTicket = initialTicket;
+                    NotificationCenter.getInstance(view.account).postNotificationName(NotificationCenter.didReceiveNewMessages,
+                            view.dialogId, pending, false, 0, pendingIdentity);
+                }
+            };
+            if (replace) {
+                ArrayList<MessageObject> confirmed = new ArrayList<>(objects);
+                identity.afterAcceptance = () -> finishAcceptedHistory(identity, confirmed, loadedAnchor);
+            }
+            int reportedCount = end ? Math.max(count, objects.size() + 1) : objects.size();
+            NotificationCenter.getInstance(view.account).postNotificationName(NotificationCenter.messagesDidLoad,
+                    view.dialogId, reportedCount, objects, false, 0, 0, 0, 0,
+                    loadType, end, view.classGuid, loadIndex, loadedAnchor, 0, mode, identity);
+            if (!replace) restorePending.run();
+        });
+    }
+
+    /** 替换通知等待动画期间仍可能收发；接收后只补本地新尾和原待发，不重新请求网络。 */
+    private static void finishAcceptedHistory(HistoryPage page, ArrayList<MessageObject> confirmed, int deliveredLastId) {
+        HistoryView view = page.owner;
+        Utilities.globalQueue.postRunnable(() -> {
+            if (!historyViewCurrent(view, page.to) || view.intentRevision != page.acceptedRevision) return;
+            TranscriptWindow root = histories.get(view.dialogId);
+            if (root == null || !root.containsSegment(page.to)) return;
+            ArrayList<TranscriptWindow.Entry> extra = page.to.after(deliveredLastId, Integer.MAX_VALUE);
+            java.util.Collections.reverse(extra);
+            java.util.Set<String> echoed = root.allOutgoingLocalIds();
+            ArrayList<OutboxStore.Item> queued;
+            try { queued = outboxStore(view.dialogId).list(view.remote); }
+            catch (IOException error) {
+                logTranscriptFailure("accepted_outbox", error, null);
+                queued = new ArrayList<>();
+            }
+            final ArrayList<OutboxStore.Item> restored = queued;
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!historyViewCurrent(view, page.to) || view.intentRevision != page.acceptedRevision) return;
+                ArrayList<MessageObject> incoming = new ArrayList<>();
+                for (MessageObject object : confirmed) confirmPendingEcho(view.account, view.dialogId, (TLRPC.TL_message) object.messageOwner);
+                for (TranscriptWindow.Entry row : extra) {
+                    TLRPC.TL_message message = historyMessage(view.dialogId, row);
+                    confirmPendingEcho(view.account, view.dialogId, message);
+                    incoming.add(historyObject(view.account, message));
+                }
+                java.util.HashSet<Integer> pendingIds = new java.util.HashSet<>();
+                for (OutboxStore.Item item : restored) {
+                    if (batchEchoed(item, echoed)) continue;
+                    for (MessageObject object : restoredPending(view.account, view.dialogId, item, echoed)) {
+                        if (pendingIds.add(object.getId())) incoming.add(object);
+                    }
+                }
+                // 原UI队列中新建立的待发可能晚于上面的落盘快照；复用原对象，不重投也不改送达事实。
+                for (Map.Entry<String, MessageObject> item : pendingMessages.entrySet()) {
+                    MessageObject object = item.getValue();
+                    if (object.getDialogId() == view.dialogId && !echoed.contains(item.getKey())
+                            && pendingIds.add(object.getId())) incoming.add(object);
+                }
+                for (MessageObject object : incoming) if (object.getId() < 0) {
+                    object.messageOwner.params.put("codexRestoredPending", "true");
+                    object.wasJustSent = false;
+                }
+                if (!incoming.isEmpty()) NotificationCenter.getInstance(view.account).postNotificationName(
+                        NotificationCenter.didReceiveNewMessages, view.dialogId, incoming, false, 0,
+                        new HistoryPage(view, page.to, page.to, false));
+            });
         });
     }
 
@@ -2241,19 +3300,26 @@ public final class CodexRuntime {
         prefetchDialogs(candidates, connection, 1);
     }
 
-    /** 预取保留原账号快照并发布真实最新摘要；未变版本的缓存也进入原消息映射。 */
+    /** 预取保留账号快照；已有尾游标沿同一段增量推进，首次或明确断档才恢复最新页。 */
     private static void prefetchDialogs(com.google.gson.JsonArray candidates, DesktopConnection connection, int catchupPages) {
         final long accountEpoch = accountGeneration;
         final PasswordLogin.Session owner = session;
         final int account = org.telegram.messenger.UserConfig.selectedAccount;
         if (!isAccountCurrent(accountEpoch) || connection == null || !connection.isConnected()
                 || desktopConnections.get(connection.machineId) != connection) return;
-        Utilities.globalQueue.postRunnable(() -> {
-            if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection
-                    || !connection.isConnected()) return;
-            int remaining = recentDialogLimit();
-            for (com.google.gson.JsonElement value : candidates) {
-                if (remaining <= 0) break;
+        // 包括行内字段一起固定，后续继续时仍使用本次候选事实。
+        final com.google.gson.JsonArray snapshot = candidates.deepCopy();
+        Utilities.globalQueue.postRunnable(new Runnable() {
+            private final java.util.Iterator<com.google.gson.JsonElement> pending = snapshot.iterator();
+            private int remaining = -1;
+
+            /** 本地准备逐项让出；原网络队列、单飞门禁和迟回包校验保持。 */
+            @Override public void run() {
+                if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection
+                        || !connection.isConnected()) return;
+                if (remaining < 0) remaining = recentDialogLimit();
+                if (remaining <= 0 || !pending.hasNext()) return;
+                com.google.gson.JsonElement value = pending.next();
                 final JsonObject candidate;
                 final String remote;
                 final long revision;
@@ -2264,29 +3330,59 @@ public final class CodexRuntime {
                 } catch (RuntimeException error) {
                     // 坏行只记录类型并跳过，不中断队列或占用后续合法候选的预取额度。
                     logTranscriptFailure("prefetch_candidate", error, null);
-                    continue;
+                    continueNext();
+                    return;
                 }
                 remaining--;
                 long dialogId = bindDialog(connection.machineId, remote, owner, accountEpoch);
                 if (dialogId == 0 || dialogConnection(dialogId) != connection
-                        || dialogId == watchedDialog || prefetching.contains(dialogId)) continue;
+                        || dialogId == watchedDialog || prefetching.contains(dialogId)) {
+                    continueNext();
+                    return;
+                }
                 TranscriptWindow history = histories.computeIfAbsent(dialogId, ignored -> readHistory(dialogId, remote));
                 publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
                 final boolean bootstrap = history.needsTailBootstrap();
                 final boolean older = !bootstrap && history.needsVisibleHistory();
-                if (!bootstrap && !older && java.util.Objects.equals(prefetchedRevisions.get(dialogId), revision)) continue;
+                final boolean latestPage = bootstrap;
+                if (!bootstrap && !older && java.util.Objects.equals(prefetchedRevisions.get(dialogId), revision)) {
+                    continueNext();
+                    return;
+                }
                 final String tailCursor = history.tailCursor;
                 final String olderCursor = history.cursor;
                 final boolean wasLoaded = history.loaded;
                 final String cursor = older ? olderCursor : tailCursor;
                 prefetching.add(dialogId);
+                if ((latestPage || older) && joinColdHistoryRequest(account, accountEpoch, dialogId, remote,
+                        connection, history, latestPage, new ColdHistorySubscriber(null, 0, false,
+                        () -> isAccountCurrent(accountEpoch) && connection == dialogConnection(dialogId)
+                                && dialogId != watchedDialog, result -> {
+                    if (!isAccountCurrent(accountEpoch)) return;
+                    prefetching.remove(dialogId);
+                    if (!result.success || latestPage && !result.bootstrapAccepted
+                            || connection != dialogConnection(dialogId) || dialogId == watchedDialog) return;
+                    boolean missingBody = history.needsVisibleHistory();
+                    if (result.saved && !older && !history.needsTailBootstrap() && !missingBody)
+                        prefetchedRevisions.put(dialogId, revision);
+                    else prefetchedRevisions.remove(dialogId);
+                    // 空页共享仍只推进本入口原四页预算；向旧找到正文后再沿原尾部核对。
+                    if (catchupPages < 4 && (missingBody && !history.needsTailBootstrap() || older && !missingBody)) {
+                        com.google.gson.JsonArray nextCandidates = new com.google.gson.JsonArray();
+                        nextCandidates.add(candidate);
+                        prefetchDialogs(nextCandidates, connection, catchupPages + 1);
+                    }
+                }))) {
+                    continueNext();
+                    return;
+                }
                 prefetchQueue.postRunnable(() -> {
                     if (!isAccountCurrent(accountEpoch)) return;
                     JsonObject page = null;
                     try {
                         if (dialogConnection(dialogId) == connection && connection.isConnected()
                                 && !ApplicationLoader.mainInterfacePaused)
-                            page = bootstrap ? connection.transcript(remote)
+                            page = latestPage ? connection.transcript(remote)
                                     : older ? connection.transcript(remote, cursor) : connection.readAfter(remote, cursor);
                     } catch (Exception error) {
                         logTranscriptFailure(bootstrap ? "prefetch_initial_request" : older ? "prefetch_older_request" : "prefetch_tail_request", error, null);
@@ -2301,18 +3397,38 @@ public final class CodexRuntime {
                                 || !java.util.Objects.equals(tailCursor, history.tailCursor)
                                 || (bootstrap || older) && !java.util.Objects.equals(olderCursor, history.cursor)) return;
                         try {
-                            if (bootstrap) history.recoverTail(received);
-                            else if (older) history.prepend(received);
+                            com.google.gson.JsonElement reason = received.get("truncationReason");
+                            if (!latestPage && !older && reason != null && reason.isJsonPrimitive()
+                                    && reason.getAsJsonPrimitive().isString() && "source_discontinuity".equals(reason.getAsString())) {
+                                // 只有明确断档才失效尾游标；保留正文，让下一列表周期走原bootstrap恢复。
+                                history.tailCursor = null;
+                                saveHistory(dialogId, remote, history);
+                                throw new IOException("消息来源出现断档");
+                            }
+                            TranscriptWindow current = history;
+                            if (latestPage) {
+                                current = history.acceptLatest(received);
+                                publishHistoryRoot(dialogId, current);
+                            } else if (older) history.prependWithCachedBridge(received);
                             else history.append(received);
-                            boolean saved = saveHistory(dialogId, remote, history);
-                            publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, history);
+                            boolean visibleLatest = latestPage && !current.before(0, 1).isEmpty();
+                            boolean saved = false;
+                            if (!visibleLatest) saved = saveHistory(dialogId, remote, current);
+                            try {
+                                publishHistoryPreview(account, accountEpoch, dialogId, remote, connection.machineId, connection, current);
+                                if (latestPage) completeInitialLoadsFromLatest(dialogId, connection, current);
+                                offerLatestHistory(dialogId, current);
+                            } finally {
+                                // 预取可交接正在打开的首屏，但追平版本与Outbox仍只服从真实保存结果。
+                                if (visibleLatest) saved = saveHistory(dialogId, remote, current);
+                            }
                             // 服务端仍有后续增量时，下次继续同一游标，不能提前记为追平。
                             boolean more = received.has("hasMore") && received.get("hasMore").getAsBoolean();
                             boolean truncated = received.has("truncated") && received.get("truncated").getAsBoolean();
-                            boolean missingBody = history.needsVisibleHistory();
+                            boolean missingBody = current.needsVisibleHistory();
                             // 向旧找到正文只补首屏，不能代表新尾部已追平；沿同一预算再核对原尾游标。
-                            boolean pendingTail = older ? !missingBody : !bootstrap && TranscriptWindow.hasPendingTail(received, cursor);
-                            if (saved && !older && !history.needsTailBootstrap() && !missingBody && (bootstrap || (!more && !truncated)))
+                            boolean pendingTail = older ? !missingBody : !latestPage && TranscriptWindow.hasPendingTail(received, cursor);
+                            if (saved && !older && !current.needsTailBootstrap() && !missingBody && (latestPage || (!more && !truncated)))
                                 prefetchedRevisions.put(dialogId, revision);
                             else prefetchedRevisions.remove(dialogId);
                             if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
@@ -2320,7 +3436,7 @@ public final class CodexRuntime {
                                         + " initial=" + bootstrap + " older=" + older + " items=" + received.getAsJsonArray("items").size()
                                         + " pending=" + (missingBody || pendingTail));
                             // 首屏空投影也沿真实旧页游标找正文；每轮总共最多四页，剩余仍交原列表周期继续。
-                            if (catchupPages < 4 && ((missingBody && !history.needsTailBootstrap()) || pendingTail)) {
+                            if (catchupPages < 4 && ((missingBody && !current.needsTailBootstrap()) || pendingTail)) {
                                 com.google.gson.JsonArray pending = new com.google.gson.JsonArray();
                                 pending.add(candidate);
                                 prefetchDialogs(pending, connection, catchupPages + 1);
@@ -2331,6 +3447,12 @@ public final class CodexRuntime {
                         }
                     });
                 });
+                continueNext();
+            }
+
+            /** 合法候选沿原规则消耗预算，坏行不消耗；每次仅安排一个同队列续做。 */
+            private void continueNext() {
+                if (remaining > 0 && pending.hasNext()) Utilities.globalQueue.postRunnable(this);
             }
         });
     }
