@@ -36,12 +36,18 @@ public final class TranscriptStore {
         this.maxBytes = maxBytes;
         directory = new File(root, digest(server + "\n" + account + "\n" + machine));
     }
+    /** 保持原UTF-8与SHA-256缓存键，以固定字符表生成64位小写十六进制，避免逐字节格式化分配。 */
     static String digest(String value) {
         try {
             byte[] bytes = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder result = new StringBuilder();
-            for (byte b : bytes) result.append(String.format(java.util.Locale.ROOT, "%02x", b & 255));
-            return result.toString();
+            char[] result = new char[bytes.length * 2];
+            String hex = "0123456789abcdef";
+            for (int i = 0; i < bytes.length; i++) {
+                int valueByte = bytes[i] & 255;
+                result[i * 2] = hex.charAt(valueByte >>> 4);
+                result[i * 2 + 1] = hex.charAt(valueByte & 15);
+            }
+            return new String(result);
         } catch (java.security.NoSuchAlgorithmException error) { throw new IllegalStateException(error); }
     }
     /** 规范缓存逐行恢复；只有整份值及文件尾均通过才交付，兼容布局最多重开一次沿旧读法。 */
@@ -129,6 +135,8 @@ public final class TranscriptStore {
                 files.add(file);
             }
         }
+        // 先完成全部目录检查和容量统计；未超预算时不读取mtime或排序，也不掩盖枚举失败。
+        if (total <= maxBytes) return;
         files.sort(java.util.Comparator.comparingLong(File::lastModified).thenComparing(File::getPath));
         for (File file : files) {
             if (total <= maxBytes) break;
