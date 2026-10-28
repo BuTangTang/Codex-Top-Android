@@ -2746,6 +2746,7 @@ public final class CodexRuntime {
         message.date = (int) (row.message.createdAtMs / 1000);
         message.message = row.message.text;
         message.out = row.message.outgoing;
+        CodexMessageText.apply(message);
         message.peer_id = new TLRPC.TL_peerUser();
         message.peer_id.user_id = dialogId;
         message.from_id = new TLRPC.TL_peerUser();

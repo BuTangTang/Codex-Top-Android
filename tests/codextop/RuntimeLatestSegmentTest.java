@@ -190,6 +190,8 @@ public final class RuntimeLatestSegmentTest {
                 public static final class TL_peerUser {public long user_id;}
                 public static final class TL_messageMediaEmpty {}
             }
+            /** 显示实体由 CodexMessageTextTest 覆盖；不改变本夹具的段握手、原文或事件计数。 */
+            static final class CodexMessageText {static void apply(TLRPC.TL_message message){}}
             static final class Event {final int type;final Object[] args;Event(int t,Object[] a){type=t;args=a;}}
             static final class NotificationCenter {
                 static final int messagesDidLoad=1,didReceiveNewMessages=2,messageReceivedByServer=3;static final NotificationCenter value=new NotificationCenter();
