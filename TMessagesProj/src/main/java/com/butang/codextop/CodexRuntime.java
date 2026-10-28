@@ -2759,7 +2759,13 @@ public final class CodexRuntime {
         if (row.message.localId != null) message.params.put("codexLocalId", row.message.localId);
         if (!row.message.attachments.isEmpty()) {
             DesktopAttachment value = row.message.attachments.get(0);
-            AttachmentMessages.apply(message, value, cachedAttachment(attachmentDirectory(dialogId), row.message.localId, value));
+            File cached = cachedAttachment(attachmentDirectory(dialogId), row.message.localId, value);
+            // 旧缓存把源码定位链接推断成文件；只修正显示，不改历史、身份或已经就绪的真实附件。
+            boolean sourceReference = !message.out && "file".equals(value.kind)
+                    && value.sizeBytes == null && value.sha256 == null && value.path != null
+                    && value.name.equals(new File(value.path).getName()) && cached == null
+                    && CodexMessageText.isSourceReference(row.message.text, value.path);
+            if (!sourceReference) AttachmentMessages.apply(message, value, cached);
         }
         return message;
     }

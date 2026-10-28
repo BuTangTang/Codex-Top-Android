@@ -76,7 +76,7 @@ public final class RuntimeSendFailureTest {
         import com.google.gson.*;import java.io.*;import java.nio.file.*;import java.util.*;
         public final class RuntimeSendFailureProbe {
             /** 显示转换由 CodexMessageTextTest 独立覆盖；本夹具只保留原发送、落盘与身份断言。 */
-            static final class CodexMessageText {static void apply(TLRPC.TL_message message){}}
+            static final class CodexMessageText {static void apply(TLRPC.TL_message message){} static boolean isSourceReference(String text,String path){return false;}}
             static final class Queue {
                 final ArrayDeque<Runnable> tasks=new ArrayDeque<>();
                 /** 保留异步顺序以插入晚回执与账号切换。 */

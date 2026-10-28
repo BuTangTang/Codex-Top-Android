@@ -2,9 +2,32 @@ package com.butang.codextop;
 
 import org.telegram.tgnet.TLRPC;
 
-/** Actual display projection with synthetic messages, no account, network or Android rendering. */
+/** 使用合成消息执行真实显示转换，不访问账号、网络或 Android 界面。 */
 public final class CodexMessageTextTest {
     public static void main(String[] args) {
+        check(CodexMessageText.isSourceReference("[源码](/tmp/a.swift:50)", "/tmp/a.swift:50"), "普通源码行定位");
+        check(CodexMessageText.isSourceReference("[源码](/tmp/a.swift:50:2)", "/tmp/a.swift:50:2"), "源码列定位");
+        check(CodexMessageText.isSourceReference("[源码](/tmp/a.swift#L50-L60)", "/tmp/a.swift#L50-L60"), "普通路径片段原样");
+        check(CodexMessageText.isSourceReference("[源码](file:///tmp/a%20b.swift#L50)", "/tmp/a b.swift"), "fileURL解码片段");
+        check(CodexMessageText.isSourceReference("[源码](file://localhost/tmp/a%20b.swift:50)", "/tmp/a b.swift:50"), "本地file主机");
+        check(CodexMessageText.isSourceReference("[源码](/tmp/a%20b.swift:50)", "/tmp/a%20b.swift:50"), "普通绝对路径不解码");
+        check(!CodexMessageText.isSourceReference("[源码](/tmp/a%20b.swift:50)", "/tmp/a b.swift:50"), "百分号真实字符不得混同空格");
+        check(!CodexMessageText.isSourceReference("![源码](/tmp/a.swift:50)", "/tmp/a.swift:50"), "图片保留");
+        check(!CodexMessageText.isSourceReference("`[源码](/tmp/a.swift:50)`", "/tmp/a.swift:50"), "行内代码保留");
+        check(!CodexMessageText.isSourceReference("```\n[源码](/tmp/a.swift:50)\n```", "/tmp/a.swift:50"), "代码块保留");
+        check(!CodexMessageText.isSourceReference("[文件](/tmp/a.swift)", "/tmp/a.swift"), "无行号的真实文件保留");
+        check(!CodexMessageText.isSourceReference("[网页](https://example.com/a.swift:50)", "/a.swift:50"), "网页不冒充本地");
+        check(!CodexMessageText.isSourceReference("[源码](file://remote/tmp/a.swift:50)", "/tmp/a.swift:50"), "远端file主机不冒充本地");
+        check(!CodexMessageText.isSourceReference("[源码](file:///tmp/a%2Fb.swift:50)", "/tmp/a/b.swift:50"), "编码路径分隔符无效");
+        TLRPC.Message mixed = render("**本轮结果**\n\n> 已核对\n\n[页面源码](/Users/example/PrivacyAndSecurityController.swift:50)\n\n"
+                + "| 项目 | 结果 |\n| --- | --- |\n| 字体 | **完整内容** |\n| 路径 | `a_b` |", false);
+        equal("本轮结果\n\n已核对\n\n页面源码（/Users/example/PrivacyAndSecurityController.swift:50）\n\n"
+                + "项目：字体\n结果：完整内容\n\n项目：路径\n结果：a_b", mixed.message);
+        entity(mixed, TLRPC.TL_messageEntityBold.class, "本轮结果");
+        entity(mixed, TLRPC.TL_messageEntityBlockquote.class, "已核对");
+        entity(mixed, TLRPC.TL_messageEntityBold.class, "完整内容");
+        entity(mixed, TLRPC.TL_messageEntityCode.class, "a_b");
+        check(mixed.entities.stream().noneMatch(e -> e instanceof TLRPC.TL_messageEntityTextUrl), "本地路径不可作为URL执行");
         TLRPC.Message bold = render("合计 **6.36%**，😀 **中文**", false);
         equal("合计 6.36%，😀 中文", bold.message);
         entity(bold, TLRPC.TL_messageEntityBold.class, "6.36%");
@@ -25,8 +48,42 @@ public final class CodexMessageTextTest {
         unchanged("普通引号“文本”和 2 * 3，路径 a_b_c  \n");
         unchanged("**未结束和 [链接](broken");
         unchanged("\\*literal\\*");
-        unchanged("![image](https://example.com/x.png) **bold**");
-        unchanged("[unsafe](javascript:alert) **bold**");
+        TLRPC.Message image = render("![image](https://example.com/x.png) **bold**", false);
+        equal("图片：image（https://example.com/x.png） bold", image.message);
+        entity(image, TLRPC.TL_messageEntityBold.class, "bold");
+        TLRPC.Message unknownLink = render("[unsafe](javascript:alert) **bold**", false);
+        equal("unsafe（javascript:alert） bold", unknownLink.message);
+        entity(unknownLink, TLRPC.TL_messageEntityBold.class, "bold");
+        check(unknownLink.entities.stream().noneMatch(e -> e instanceof TLRPC.TL_messageEntityTextUrl), "未知协议不可点");
+        equal("列名：值", render("| 列名 |\n| --- |\n| 值 |", false).message);
+        equal("甲：a|b\n乙：末尾", render("|甲|乙|\n|-|-|\n|a\\|b|末尾|", false).message);
+        equal("甲\n乙", render("|甲|乙|\n|-|-|", false).message);
+        TLRPC.Message extraCells = render("**保留**\n\n|甲|乙|\n|-|-|\n|一|二|额外完整内容|", false);
+        equal("保留\n\n|甲|乙|\n|-|-|\n|一|二|额外完整内容|", extraCells.message);
+        entity(extraCells, TLRPC.TL_messageEntityBold.class, "保留");
+        for (String irregular : new String[]{"|甲|乙|\n|-|-|\n|-|-|-|\n|一|二|",
+                "|甲|乙|\n|-|-|\n单格\n|一|二|额外完整内容|"}) {
+            TLRPC.Message preserved = render("**保留**\n\n" + irregular, false);
+            equal("保留\n\n" + irregular, preserved.message);
+            entity(preserved, TLRPC.TL_messageEntityBold.class, "保留");
+        }
+        TLRPC.Message quotedTable = render("> |甲|乙|\n> |-|-|\n> |一|二|额外完整内容|", false);
+        check(quotedTable.message.contains("额外完整内容"), "引用内异常表格不能丢格");
+        entity(quotedTable, TLRPC.TL_messageEntityBlockquote.class, "|甲|乙|\n|-|-|\n|一|二|额外完整内容|");
+        TLRPC.Message listedTable = render("- |甲|乙|\n  |-|-|\n  |一|二|额外完整内容|", false);
+        check(listedTable.message.contains("额外完整内容"), "列表内异常表格不能丢格");
+        for (String prefix : new String[]{"> ", ">> ", "- ", "* ", "+ ", "1. ", "2) ", "  ", "\t"}) {
+            String indent = prefix.startsWith(">") ? prefix : "   ";
+            TLRPC.Message container = render("**保留粗体**\n\n" + prefix + "|甲|乙|\n" + indent
+                    + "|-|-|\n" + indent + "|一|二|额外完整内容|", false);
+            check(container.message.contains("额外完整内容"), "容器内容完整：" + prefix);
+            entity(container, TLRPC.TL_messageEntityBold.class, "保留粗体");
+        }
+        equal("甲：\n乙：", render("|甲|乙|\n|-|-|\n|||", false).message);
+        equal("列 1：一\n乙：二", render("||乙|\n|-|-|\n|一|二|", false).message);
+        String completeCell = "完整长内容".repeat(200);
+        equal("列名：" + completeCell, render("|列名|\n|-|\n|" + completeCell + "|", false).message);
+        unchanged("|" + "列名".repeat(2000) + "|\n|-|\n" + "|值|\n".repeat(100));
         unchanged("x".repeat(65537) + " **tail**");
         unchanged("**x** ".repeat(1025));
         TLRPC.Message html = render("**粗体** <script>alert(1)</script>", false);
