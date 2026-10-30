@@ -90,6 +90,7 @@ public final class DialogArrangementTest {
                 entry(2, "/w/done", Category.FINISHED, 90));
         List<Row> rows = DialogArrangement.arrange(entries, PROJECT, null);
         check(types(rows).equals("PROJECT_HEADER") && !rows.get(0).expanded, "全结束整组折叠");
+        check("已结束 2".equals(rows.get(0).summary), "全结束摘要 " + rows.get(0).summary);
         Map<String, Boolean> open = new HashMap<>();
         open.put(rows.get(0).key, true);
         rows = DialogArrangement.arrange(entries, PROJECT, open);

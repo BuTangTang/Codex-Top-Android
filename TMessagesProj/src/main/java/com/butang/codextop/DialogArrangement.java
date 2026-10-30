@@ -216,7 +216,7 @@ public final class DialogArrangement {
         if (foldExpanded) for (Entry entry : finished) rows.add(dialog(entry, null));
     }
 
-    /** 摘要统计整个项目（含已置顶），只列非零项，最后总是会话数。 */
+    /** 摘要统计整个项目（含已置顶），只列非零项，最后是会话数；全部结束时写“已结束 N”。 */
     static String summary(List<Entry> all) {
         int pending = 0, error = 0, running = 0, unknown = 0;
         for (Entry entry : all) {
@@ -228,6 +228,8 @@ public final class DialogArrangement {
                 default: break;
             }
         }
+        // 全部结束的项目只写“已结束 N”，与设计图一致。
+        if (pending + error + running + unknown == 0) return "已结束 " + all.size();
         StringBuilder text = new StringBuilder();
         if (pending > 0) text.append(pending).append(" 待处理 · ");
         if (error > 0) text.append(error).append(" 出错 · ");

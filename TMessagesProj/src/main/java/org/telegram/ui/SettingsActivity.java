@@ -416,10 +416,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     /** 额度优先使用原文字行；窗口与重置紧邻，原采集来源、预计及过期含义完整保留。 */
     private void fillCodexUsageItems(ArrayList<UItem> items) {
         if (codexMyRoot()) {
-            items.add(UItem.asHeader("Codex 额度"));
-            items.add(SettingCell.Factory.ofCodex(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
-                    ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel(),
-                    SettingCell.Factory.CODEX_SUBTITLE_TWO)
+            // 设计图：“额度”标题右侧是来源电脑的小按钮，点整行切换。
+            items.add(org.telegram.ui.Cells.CodexMineCells.QuotaHeader.Factory.of(25, codexUsageMachine != null
+                    ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel())
                     .setEnabled(!codexBrowseLoading || !codexBrowseRows.isEmpty()));
         } else {
             items.add(SettingCell.Factory.ofCodex(30, 0, 0, 0, "来源电脑",
@@ -1091,26 +1090,24 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 items.add(UItem.asShadow(null));
                 items.add(UItem.asHeader("通用"));
                 items.add(UItem.asCheck(54, "需要你处理置顶").setChecked(arrangement.pinPending));
-                items.add(SettingCell.Factory.ofCodex(6, 0, 0, 0, "最近会话条数",
-                        com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+                items.add(UItem.asButton(6, "最近会话条数", com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
                 items.add(UItem.asShadow("待审批、待回答和出错的会话固定在最上面。"));
                 return;
             }
             // D-83 根页：账号行、额度、设置分组、退出登录置底。
-            // 已连接绿点，其余灰点；文字沿用原连接状态。
-            android.text.SpannableString connection = new android.text.SpannableString("● " + account.connectionLabel);
-            connection.setSpan(new android.text.style.ForegroundColorSpan("服务器已连接".equals(account.connectionLabel) ? 0xFF2EAD5B
-                    : Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourceProvider)), 0, 1, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            items.add(SettingCell.Factory.ofCodex(40, 0, 0, 0, loginName, connection));
+            // 设计图：账号卡、额度卡、单行设置、退出登录置底。
+            items.add(org.telegram.ui.Cells.CodexMineCells.AccountRow.Factory.of(40, loginName, account.connectionLabel,
+                    "服务器已连接".equals(account.connectionLabel)));
+            items.add(UItem.asShadow(null));
             fillCodexUsageItems(items);
             items.add(UItem.asShadow(null));
             items.add(UItem.asHeader("设置"));
             com.butang.codextop.DialogArrangement.Settings arrangement = com.butang.codextop.CodexRuntime.arrangementSettings();
-            items.add(SettingCell.Factory.ofCodex(41, 0, 0, 0, "会话排列", arrangement.byTime ? "按时间" : "按项目"));
-            items.add(SettingCell.Factory.ofCodex(34, 0, 0, 0, "外观", Theme.getCodexPixelAppearanceLabel()));
+            items.add(UItem.asButton(41, "会话排列", arrangement.byTime ? "按时间" : "按项目"));
+            items.add(UItem.asButton(34, "外观", Theme.getCodexPixelAppearanceLabel()));
             com.butang.codextop.CodexAppUpdater.Snapshot update = com.butang.codextop.CodexAppUpdater.getInstance().getSnapshot();
-            items.add(SettingCell.Factory.ofCodex(35, 0, 0, 0, update.title, update.detail));
-            items.add(SettingCell.Factory.ofCodex(42, 0, 0, 0, "连接与诊断", "服务地址、版本"));
+            items.add(UItem.asButton(35, "应用更新", update.detail));
+            items.add(UItem.asButton(42, "连接与诊断", getVersionName()));
             items.add(UItem.asShadow(null));
             items.add(UItem.asButton(43, "退出登录").red());
             items.add(UItem.asShadow(null));
@@ -2171,21 +2168,18 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
             @Override
             protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-                setMeasuredDimension(View.MeasureSpec.getSize(widthMeasureSpec), dp(4));
+                setMeasuredDimension(View.MeasureSpec.getSize(widthMeasureSpec), dp(6));
             }
             @Override
             protected void onDraw(Canvas canvas) {
-                int gap = dp(3);
-                int cell = Math.max(1, (getWidth() - gap * 9) / 10);
-                for (int i = 0; i < 10; i++) {
-                    int left = i * (cell + gap);
-                    paint.setColor(trackColor);
-                    canvas.drawRect(left, 0, left + cell, getHeight(), paint);
-                    float fraction = hideFill ? 0f : segmentFill(i, percent);
-                    if (fraction > 0f) {
-                        paint.setColor(fillColor);
-                        canvas.drawRect(left, 0, left + cell * fraction, getHeight(), paint);
-                    }
+                // D-83：平滑圆角进度条，缺失比例只画底轨，不画成 0 以外的值。
+                float radius = getHeight() / 2f;
+                paint.setColor(trackColor);
+                canvas.drawRoundRect(0, 0, getWidth(), getHeight(), radius, radius, paint);
+                if (!hideFill && percent > 0) {
+                    paint.setColor(fillColor);
+                    float width = (float) (getWidth() * Math.min(100.0, percent) / 100.0);
+                    canvas.drawRoundRect(0, 0, Math.max(width, getHeight()), getHeight(), radius, radius, paint);
                 }
             }
         }
@@ -2223,30 +2217,45 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 warning.setBackground(Theme.createRoundRectDrawable(dp(6), 0xFFFFF1C2));
                 addView(warning, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
             }
+            // 卡头：工具名在左，采集时间在右（过期时已在上方提示条里写明）。
+            pair("Codex", state.stale ? null : state.fetched + " 采集", 15, true);
             for (int i = 0; i < state.meters.size(); i++) {
                 MeterLine line = state.meters.get(i);
-                addText(line.label + " · " + line.window, 13, false, false);
-                TextView percent = addText(line.percent == null ? "剩余比例未返回" : line.percent, line.percent == null ? 16 : 32, true, false);
+                TextView percent = pair(line.window, line.percent == null ? "剩余比例未返回" : "剩 " + line.percent, 14, false);
                 percentViews.add(percent);
                 liveNumbers.add(line.percent != null);
-                if (line.suffix != null) addText(line.suffix, 14, false, false);
                 ScaleView scale = new ScaleView(getContext());
                 scale.percent = line.percentValue;
                 scale.hideFill = line.hideFill;
                 scales.add(scale);
-                addView(scale, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 4, 0, 6, 0, 6));
+                addView(scale, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 6, 0, 6, 0, 6));
                 addText(line.reset == null ? "重置时间未返回" : line.reset + " 重置", 13, false, false);
-                if (i < state.meters.size() - 1) {
-                    View gap = new View(getContext());
-                    addView(gap, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 8));
-                }
             }
-            if (!state.stale) addText("采集于 " + state.fetched, 13, false, false);
             if (state.account != null) {
                 addText("采集账号", 13, false, false);
                 addText(state.account, 15, false, true);
             }
             updateColors();
+        }
+
+        /** 一行左右两端文字；返回右侧文字，供剩余比例着色。 */
+        private TextView pair(String left, String right, int sizeSp, boolean header) {
+            LinearLayout row = new LinearLayout(getContext());
+            row.setOrientation(HORIZONTAL);
+            TextView start = new TextView(getContext());
+            start.setText(left);
+            start.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
+            if (header) start.setTypeface(AndroidUtilities.bold());
+            (header ? inkViews : secondaryViews).add(start);
+            TextView end = new TextView(getContext());
+            end.setText(right);
+            end.setTextSize(TypedValue.COMPLEX_UNIT_SP, header ? 13 : sizeSp);
+            end.setGravity(Gravity.END);
+            if (header) secondaryViews.add(end);
+            row.addView(start, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f));
+            row.addView(end, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT));
+            addView(row, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, header ? 0 : 8, 0, 0));
+            return end;
         }
 
         private TextView addText(String text, int sizeSp, boolean percent, boolean ink) {
@@ -2390,7 +2399,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
         public void bind(String name, String status, String tools, String projects, boolean offline) {
             nameView.setText(name);
-            statusView.setText(status);
+            // 在线前的圆点用绿色，其余状态保持次要文字色。
+            if (status != null && status.startsWith("●")) {
+                android.text.SpannableString text = new android.text.SpannableString(status);
+                text.setSpan(new android.text.style.ForegroundColorSpan(0xFF2EAD5B), 0, 1, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                statusView.setText(text);
+            } else {
+                statusView.setText(status);
+            }
             toolView.setText(tools);
             toolView.setVisibility(TextUtils.isEmpty(tools) ? GONE : VISIBLE);
             projectView.setText(projects);
@@ -2471,9 +2487,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             com.butang.codextop.CodexRuntime.ComputerSummary summary = row.has("id")
                     ? com.butang.codextop.CodexRuntime.computerSummary(row.get("id").getAsString()) : null;
             if (summary == null) return "Codex  —";
-            String counts = "待处理 " + summary.pending + " · 运行 " + summary.running + " · 出错 " + summary.error + " · 已结束 " + summary.finished;
-            if (summary.unknown > 0) counts += " · 未知 " + summary.unknown;
-            return "Codex  " + (offline(row) ? "上次 " : "") + counts;
+            // 设计图：只列非零项，如“1 待办 · 1 运行 · 6 结束”。
+            ArrayList<String> parts = new ArrayList<>();
+            if (summary.pending > 0) parts.add(summary.pending + " 待办");
+            if (summary.running > 0) parts.add(summary.running + " 运行");
+            if (summary.error > 0) parts.add(summary.error + " 出错");
+            if (summary.unknown > 0) parts.add(summary.unknown + " 未知");
+            if (summary.finished > 0) parts.add(summary.finished + " 结束");
+            return "Codex  " + (offline(row) ? "上次 " : "") + TextUtils.join(" · ", parts);
         }
 
         static String projectsOf(com.google.gson.JsonObject row) {
@@ -2482,7 +2503,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             if (summary == null || summary.projects.isEmpty()) return null;
             int shown = Math.min(3, summary.projects.size());
             String text = TextUtils.join("、", summary.projects.subList(0, shown));
-            return summary.projects.size() > shown ? text + " 等 " + summary.projects.size() + " 个" : text;
+            return "项目：" + (summary.projects.size() > shown ? text + " 等 " + summary.projects.size() + " 个" : text);
         }
 
         public static class Factory extends UItem.UItemFactory<ComputerCell> {

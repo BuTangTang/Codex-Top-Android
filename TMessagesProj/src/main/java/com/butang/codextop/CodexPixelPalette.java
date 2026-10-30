@@ -228,13 +228,14 @@ public final class CodexPixelPalette {
                 Theme.key_dialogSearchHint,
                 Theme.key_dialogSearchIcon,
                 Theme.key_emptyListPlaceholder,
-                Theme.key_actionBarDefaultArchivedSearchPlaceholder);
+                Theme.key_actionBarDefaultArchivedSearchPlaceholder,
+                // D-83：设置值与分组标题用次要色，每页只在一处用强调色。
+                Theme.key_windowBackgroundWhiteValueText,
+                Theme.key_windowBackgroundWhiteBlueHeader);
         paint(colors, accentText,
                 Theme.key_windowBackgroundWhiteBlueText,
                 Theme.key_windowBackgroundWhiteBlueText4,
-                Theme.key_windowBackgroundWhiteValueText,
                 Theme.key_windowBackgroundWhiteLinkText,
-                Theme.key_windowBackgroundWhiteBlueHeader,
                 Theme.key_dialogTextBlue,
                 Theme.key_dialogTextLink,
                 Theme.key_dialogButton,
