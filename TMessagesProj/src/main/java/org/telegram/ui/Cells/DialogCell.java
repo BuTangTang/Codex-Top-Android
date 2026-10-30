@@ -4015,8 +4015,13 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         String pending = com.butang.codextop.CodexRuntime.pinnedPendingText(currentDialogId);
         CharSequence body = pending != null ? pending : preview;
         String context = com.butang.codextop.CodexRuntime.arrangedContext(currentDialogId);
+        // D-83 三期 A：两种来源并存时最前写 CX／CC。
+        String mark = com.butang.codextop.CodexRuntime.sourceMark(currentDialogId);
+        if (!TextUtils.isEmpty(mark)) context = TextUtils.isEmpty(context) ? mark : mark + " · " + context;
         if (TextUtils.isEmpty(context)) return body;
-        return TextUtils.concat(context, " · ", body == null ? "" : body);
+        // 没有预览时只写标记或项目，不留结尾的分隔点。
+        if (TextUtils.isEmpty(body)) return context;
+        return TextUtils.concat(context, " · ", body);
     }
 
     /** 待处理、待审批用橙色，出错用红色。 */
@@ -6611,7 +6616,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
                 codexStatus = status.validity + ":" + status.state + ":" + status.pendingKind + ":" + status.label
                         + ":" + com.butang.codextop.CodexRuntime.pinnedPendingText(currentDialogId)
-                        + ":" + com.butang.codextop.CodexRuntime.arrangedContext(currentDialogId);
+                        + ":" + com.butang.codextop.CodexRuntime.arrangedContext(currentDialogId)
+                        + ":" + com.butang.codextop.CodexRuntime.sourceMark(currentDialogId);
             }
             int messageHash = message == null ? 0 : message.getId() + message.hashCode();
             Integer printingType = null;

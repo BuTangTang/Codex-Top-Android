@@ -41,37 +41,39 @@ public final class SessionStatus {
     public static final class Snapshot {
         public final String state, pendingKind, validity, source, turnId, label;
         public final long eventAtMs, checkedAtMs, observedAtElapsedMs;
-        public final java.util.Set<String> questionIds;
+        public final java.util.Set<String> questionIds, approvalIds;
         public final Goal goal;
 
         /** 保留来源事实与本机接收时刻，来源时钟不与手机墙钟比较。 */
         private Snapshot(String state, String pendingKind, String validity, String source, String turnId,
-                long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label, java.util.Set<String> questionIds) {
-            this(state,pendingKind,validity,source,turnId,eventAtMs,checkedAtMs,observedAtElapsedMs,label,questionIds,
+                long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label, java.util.Set<String> questionIds,
+                java.util.Set<String> approvalIds) {
+            this(state,pendingKind,validity,source,turnId,eventAtMs,checkedAtMs,observedAtElapsedMs,label,questionIds,approvalIds,
                     emptyGoal("unsupported","unsupported","目标信息暂不可用"));
         }
 
         /** 生命周期和目标分别失效，LIST不会借自己的请求起点延长目标。 */
         private Snapshot(String state, String pendingKind, String validity, String source, String turnId,
                 long eventAtMs, long checkedAtMs, long observedAtElapsedMs, String label,
-                java.util.Set<String> questionIds, Goal goal) {
+                java.util.Set<String> questionIds, java.util.Set<String> approvalIds, Goal goal) {
             this.goal=goal;
             this.state = state; this.pendingKind = pendingKind; this.validity = validity;
             this.source = source; this.turnId = turnId; this.label = label;
             this.eventAtMs = eventAtMs; this.checkedAtMs = checkedAtMs;
             this.observedAtElapsedMs = observedAtElapsedMs;
             this.questionIds = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(questionIds));
+            this.approvalIds = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(approvalIds));
         }
 
         /** 失效时明确标注已验证的上次事实和本次原因，不续有效期或重复叠加前缀。 */
         private Snapshot invalid(String validity, String label) {
             String previous = knownLabel(state, pendingKind);
             String display = previous == null ? label : "上次：" + previous + " · " + label;
-            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, display, questionIds, goal);
+            return new Snapshot(state, pendingKind, validity, source, turnId, eventAtMs, checkedAtMs, observedAtElapsedMs, display, questionIds, approvalIds, goal);
         }
         /** 合并同一owner的目标投影，不改变原生命周期、来源和待办身份。 */
         private Snapshot withGoal(Goal goal) {
-            return new Snapshot(state,pendingKind,validity,source,turnId,eventAtMs,checkedAtMs,observedAtElapsedMs,label,questionIds,goal);
+            return new Snapshot(state,pendingKind,validity,source,turnId,eventAtMs,checkedAtMs,observedAtElapsedMs,label,questionIds,approvalIds,goal);
         }
     }
 
@@ -352,7 +354,8 @@ public final class SessionStatus {
 
     /** 创建无可用事实的明确状态，不从活动时间、未读或连接成功猜测生命周期。 */
     private static Snapshot unknown(String validity, String label, long observedAt) {
-        return new Snapshot("unknown", "unknown", validity, "", "", -1, -1, observedAt, label, java.util.Collections.emptySet());
+        return new Snapshot("unknown", "unknown", validity, "", "", -1, -1, observedAt, label, java.util.Collections.emptySet(),
+                java.util.Collections.emptySet());
     }
 
     /** 安全收窄可选 JSON 对象，格式错误由对应事实入口降级。 */
@@ -385,7 +388,7 @@ public final class SessionStatus {
         if ((!"desktop".equals(source) && !"rollout".equals(source)) || turnId.trim().isEmpty())
             return unknown("unknown", "状态未知", receivedAt);
         String pending = "none";
-        java.util.Set<String> questionIds = new java.util.HashSet<>();
+        java.util.Set<String> questionIds = new java.util.HashSet<>(), approvalIds = new java.util.HashSet<>();
         if ("needs_input".equals(state)) {
             JsonElement requests = observation.get("requests");
             if (requests == null || !requests.isJsonArray() || requests.getAsJsonArray().size() == 0)
@@ -396,7 +399,11 @@ public final class SessionStatus {
                 JsonObject request = value.getAsJsonObject();
                 if (text(request, "requestId").trim().isEmpty()) return unknown("unknown", "状态未知", receivedAt);
                 String kind = text(request, "kind");
-                if ("permission_request".equals(kind)) approval = true;
+                if ("permission_request".equals(kind)) {
+                    approval = true;
+                    // 只用于判断置顶摘要是否仍属于同一审批，不授予作答能力。
+                    approvalIds.add(text(request, "requestId"));
+                }
                 else if ("user_action_request".equals(kind)) {
                     question = true;
                     // 原STATUS已有未答题身份；只供打开的表单判断变化，不授予提交能力。
@@ -406,7 +413,7 @@ public final class SessionStatus {
             }
             pending = question && approval ? "mixed" : question ? "question" : "approval";
         }
-        return known(state, pending, source, turnId, -1, -1, receivedAt, questionIds);
+        return known(state, pending, source, turnId, -1, -1, receivedAt, questionIds, approvalIds);
     }
 
     /** STATUS 的在线和错误信息优先；runnerActive/activity 都不进入生命周期判断。 */
@@ -420,6 +427,9 @@ public final class SessionStatus {
 
     /** 批量候选只接受正式生命周期字段；新待办投影缺失时保留旧协议的笼统待处理。 */
     private static Snapshot candidateSnapshot(JsonObject candidate, long receivedAt) {
+        // 三期 A：Claude Code 状态接通前只给明确的未知并写明原因，不按修改时间猜运行或完成。
+        if (SessionSources.CLAUDE.equals(text(candidate, "providerId")))
+            return unknown("unsupported", SessionSources.CLAUDE_STATUS_UNSUPPORTED, receivedAt);
         JsonObject details = object(candidate, "details"), fact = object(details, "codexLifecycle");
         long checkedAt = time(fact, "checkedAtMs"), eventAt = time(fact, "eventAtMs");
         if (time(fact, "v") != 1 || checkedAt < 0) return unknown("unknown", "状态未知", receivedAt);
@@ -427,22 +437,22 @@ public final class SessionStatus {
         if ("unknown".equals(state) || eventAt < 0 || eventAt > checkedAt) return unknown("unknown", "状态未知", receivedAt);
         String pending = "needs_input".equals(state) ? "unknown" : "none";
         String source = "rollout", turnId = "";
-        java.util.Set<String> questionIds = java.util.Collections.emptySet();
+        java.util.Set<String> questionIds = java.util.Collections.emptySet(), approvalIds = java.util.Collections.emptySet();
         if (details.has("codexObservation")) {
             Snapshot observation = observationSnapshot(object(details, "codexObservation"), receivedAt);
             if (!"current".equals(observation.validity) || !state.equals(observation.state)) return unknown("unknown", "状态未知", receivedAt);
             pending = observation.pendingKind; source = observation.source; turnId = observation.turnId;
-            questionIds = observation.questionIds;
+            questionIds = observation.questionIds; approvalIds = observation.approvalIds;
         }
-        return known(state, pending, source, turnId, eventAt, checkedAt, receivedAt, questionIds);
+        return known(state, pending, source, turnId, eventAt, checkedAt, receivedAt, questionIds, approvalIds);
     }
 
     /** 两种来源只在此处创建当前事实；历史说明复用文字映射，不授予当前有效性。 */
     private static Snapshot known(String state, String pending, String source, String turnId,
-            long eventAt, long checkedAt, long receivedAt, java.util.Set<String> questionIds) {
+            long eventAt, long checkedAt, long receivedAt, java.util.Set<String> questionIds, java.util.Set<String> approvalIds) {
         String label = knownLabel(state, pending);
         if (label == null) return unknown("unknown", "状态未知", receivedAt);
-        return new Snapshot(state, pending, "current", source, turnId, eventAt, checkedAt, receivedAt, label, questionIds);
+        return new Snapshot(state, pending, "current", source, turnId, eventAt, checkedAt, receivedAt, label, questionIds, approvalIds);
     }
 
     /** 仅映射既有明确状态；当前和上次文案共用，不从显示文字恢复事实。 */

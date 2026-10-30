@@ -112,7 +112,8 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             VIEW_TYPE_FORWARD_TO_STORIES_CELL = 21,
             VIEW_TYPE_HEADER_3 = 22,
             VIEW_TYPE_DIALOG_COMMUNITY = 23,
-            VIEW_TYPE_CODEX_GROUP = 24;
+            VIEW_TYPE_CODEX_GROUP = 24,
+            VIEW_TYPE_CODEX_FOOTER = 25;
 
     private Context mContext;
     private ArchiveHintCell archiveHintCell;
@@ -472,6 +473,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             if (viewType == VIEW_TYPE_LAST_EMPTY) {
                 return false;
             }
+            if (viewType == VIEW_TYPE_CODEX_FOOTER) {
+                return Objects.equals(title, itemInternal.title);
+            }
             if (viewType == VIEW_TYPE_CODEX_GROUP) {
                 return codexRow != null && itemInternal.codexRow != null && codexRow.key.equals(itemInternal.codexRow.key);
             }
@@ -685,6 +689,7 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 viewType != VIEW_TYPE_SHADOW && viewType != VIEW_TYPE_HEADER &&
                 viewType != VIEW_TYPE_LAST_EMPTY && viewType != VIEW_TYPE_NEW_CHAT_HINT && viewType != VIEW_TYPE_CONTACTS_FLICKER &&
                 viewType != VIEW_TYPE_REQUIREMENTS && viewType != VIEW_TYPE_REQUIRED_EMPTY && viewType != VIEW_TYPE_STORIES && viewType != VIEW_TYPE_ARCHIVE_FULLSCREEN && viewType != VIEW_TYPE_GRAY_SECTION
+                && viewType != VIEW_TYPE_CODEX_FOOTER
                 && (viewType != VIEW_TYPE_CODEX_GROUP || holder.itemView instanceof CodexGroupCell && ((CodexGroupCell) holder.itemView).isToggle());
     }
 
@@ -815,6 +820,13 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             case VIEW_TYPE_CODEX_GROUP:
                 view = new CodexGroupCell(mContext);
                 break;
+            case VIEW_TYPE_CODEX_FOOTER: {
+                TextInfoPrivacyCell footer = new TextInfoPrivacyCell(mContext);
+                footer.setTextGravity(Gravity.CENTER_HORIZONTAL);
+                view = footer;
+                view.setClickable(false);
+                break;
+            }
             case VIEW_TYPE_SHADOW: {
                 view = new ShadowSectionCell(mContext);
                 Drawable drawable = Theme.getThemedDrawableByKey(mContext, R.drawable.greydivider, Theme.key_windowBackgroundGrayShadow);
@@ -1163,6 +1175,10 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             }
             case VIEW_TYPE_CODEX_GROUP: {
                 ((CodexGroupCell) holder.itemView).setRow(itemInternals.get(i).codexRow);
+                break;
+            }
+            case VIEW_TYPE_CODEX_FOOTER: {
+                ((TextInfoPrivacyCell) holder.itemView).setText(itemInternals.get(i).title);
                 break;
             }
             case VIEW_TYPE_GRAY_SECTION: {
@@ -1838,6 +1854,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 isEmpty = true;
                 itemInternals.add(new ItemInternal(VIEW_TYPE_EMPTY, dialogsEmptyType()));
             } else {
+                // D-83i：说明列表只含每台电脑最近 N 条；空列表只留原空态。
+                itemInternals.add(new ItemInternal(VIEW_TYPE_CODEX_FOOTER,
+                        "显示每台电脑最近 " + com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条会话"));
                 itemInternals.add(new ItemInternal(VIEW_TYPE_LAST_EMPTY));
             }
         } else if (!stopUpdate) {

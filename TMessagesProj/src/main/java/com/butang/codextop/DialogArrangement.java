@@ -95,6 +95,11 @@ public final class DialogArrangement {
         return null;
     }
 
+    /** 置顶摘要的有效期标识：同一轮内提问或审批任一编号变化，旧摘要都不能沿用。 */
+    public static String pendingIdentity(String turnId, java.util.Set<String> questionIds, java.util.Set<String> approvalIds) {
+        return text(turnId) + "\n" + new java.util.TreeSet<>(questionIds) + "\n" + new java.util.TreeSet<>(approvalIds);
+    }
+
     /** 分组键：电脑加规范化目录；没有可用目录的会话归入该电脑的“未关联项目”。 */
     public static String projectKey(String machineId, String directory) {
         String path = ProjectPaths.key(directory);

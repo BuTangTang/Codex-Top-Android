@@ -449,20 +449,58 @@ public final class DesktopConnection implements AutoCloseable {
         return source;
     }
 
-    /** 构造已支持的用户 Codex 来源，不新增源路径猜测。 */
+    /** Claude Code 来源只写类型，配置目录由电脑端按自身配置决定，手机不指定路径。 */
+    static JsonObject claudeConfigSource() {
+        JsonObject source = new JsonObject();
+        source.addProperty("kind", "claudeConfig");
+        return source;
+    }
+
+    /** 按会话来源填 providerId 与来源；Codex 会话保持原请求不变。 */
     private JsonObject base(String remoteSessionId) {
+        return base(SessionSources.provider(remoteSessionId), remoteSessionId);
+    }
+
+    private JsonObject base(String provider, String remoteSessionId) {
         JsonObject params = new JsonObject();
         params.addProperty("machineId", machineId);
-        params.addProperty("providerId", "codex");
-        params.add("source", userCodexSource());
-        if (remoteSessionId != null) params.addProperty("remoteSessionId", remoteSessionId);
+        params.addProperty("providerId", provider);
+        params.add("source", SessionSources.CLAUDE.equals(provider) ? claudeConfigSource() : userCodexSource());
+        if (remoteSessionId != null) params.addProperty("remoteSessionId", SessionSources.nativeRemote(remoteSessionId));
         return params;
+    }
+
+    /**
+     * 三期 A：Claude Code 最近会话。远端编号改成手机内部的来源前缀形式并标明来源，
+     * 之后的正文请求按前缀路由；失败由调用方吞掉，不影响 Codex 列表。
+     */
+    public JsonArray claudeCandidates(int limit) throws Exception {
+        JsonObject params = base(SessionSources.CLAUDE, null);
+        params.addProperty("limit", Math.max(1, Math.min(500, limit)));
+        JsonObject response = rpc("daemon.directSessions.candidates.list", params);
+        if (!response.has("candidates") || !response.get("candidates").isJsonArray())
+            throw new IOException("Claude Code 会话列表格式无效");
+        JsonArray result = new JsonArray();
+        for (JsonElement entry : response.getAsJsonArray("candidates")) {
+            JsonObject candidate = entry.getAsJsonObject().deepCopy();
+            String remote = candidate.get("remoteSessionId").getAsString();
+            candidate.addProperty("remoteSessionId", SessionSources.localRemote(SessionSources.CLAUDE, remote));
+            candidate.addProperty("providerId", SessionSources.CLAUDE);
+            result.add(candidate);
+        }
+        return result;
     }
 
     /** 仅表示本机传输门禁明确阻止了emit；已发出后的断线和超时仍属于未知结果。 */
     static final class RpcNotDispatchedException extends IOException {
         /** 未发送可由调用方保留草稿，等待用户手动重试。 */
         private RpcNotDispatchedException() { super("电脑连接正在恢复，请稍后重试"); }
+    }
+
+    /** 电脑明确拒绝；只保留协议错误码供诊断，不带服务器错误正文。 */
+    static final class RpcFailedException extends IOException {
+        final String errorCode;
+        private RpcFailedException(String errorCode) { super("电脑未能完成此请求"); this.errorCode = errorCode; }
     }
 
     /** 原发送handler明确返回未接受，保留原因供原待发状态决定是否允许手动重试。 */
@@ -705,7 +743,8 @@ public final class DesktopConnection implements AutoCloseable {
                         if (!reason.isEmpty() && !"delivery_outcome_unknown".equals(reason))
                             throw new SendRejectedException(reason);
                     }
-                    throw new IOException("电脑未能完成此请求");
+                    throw new RpcFailedException(validSuccess && response.has("errorCode") && response.get("errorCode").isJsonPrimitive()
+                            ? response.get("errorCode").getAsString() : "");
                 }
                 if (sendAckTrace != null) sendAckTrace.mark(2);
                 result.complete(response);

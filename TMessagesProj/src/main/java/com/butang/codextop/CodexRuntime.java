@@ -75,6 +75,8 @@ public final class CodexRuntime {
     private static final SessionStatus.Store statuses = new SessionStatus.Store();
     private static final Map<Long, String> dialogTitles = new HashMap<>();
     private static final Map<Long, String> dialogDirectories = new HashMap<>();
+    // 候选原始毫秒时间，供分组模型排序；last_message_date 只到秒。
+    private static final Map<Long, Long> dialogUpdatedAtMs = new HashMap<>();
     private static final Map<String, String> machineNames = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile long watchGeneration;
     private static volatile long watchedDialog;
@@ -247,7 +249,7 @@ public final class CodexRuntime {
                         dialogs.clear();
                         histories.clear(); historyViews.clear(); coldHistoryRequests.clear(); linkedSessions.clear(); pendingMessages.clear();
                         attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear(); sendJobs.clear();
-                        statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
+                        statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); dialogUpdatedAtMs.clear(); machineNames.clear();
                         arrangementOverrides.clear(); arrangedSignature = ""; arrangedContexts.clear(); pendingSummaries.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
                         connectedComputersPrefetching = false;
@@ -910,7 +912,7 @@ public final class CodexRuntime {
     /** 原输入框清空后立刻产生本地气泡；同组图片或文件收齐后只提交一个桌面输入。 */
     public static void sendMessage(int account, SendMessageParams params) {
         final long epoch = accountGeneration;
-        if (!isAccountCurrent(epoch) || !ownsConversation(params.peer)) return;
+        if (!isAccountCurrent(epoch) || !ownsConversation(params.peer) || readOnlyConversation(params.peer)) return;
         ArrayList<SendMessageParams> selected = new ArrayList<>();
         String groupId = params.params == null ? null : params.params.get("groupId");
         if (params.retryMessageObject == null && (params.photo != null || params.document != null)
@@ -1452,6 +1454,7 @@ public final class CodexRuntime {
     public static void readApprovals(long dialogId, java.util.function.BiConsumer<ApprovalReview, String> callback) {
         final long epoch = accountGeneration, generation = watchGeneration;
         if (!isAccountCurrent(epoch) || watchedDialog != dialogId) return;
+        if (readOnlyConversation(dialogId)) { callback.accept(null, SessionSources.CLAUDE_READ_ONLY); return; }
         final String remote = remoteIds.get(dialogId);
         final android.content.SharedPreferences decisions = ApplicationLoader.applicationContext.getSharedPreferences(
                 "codex-approval-" + TranscriptStore.digest(session.server + "\n" + session.accountId), 0);
@@ -1671,6 +1674,7 @@ public final class CodexRuntime {
         if (!isAccountCurrent(epoch) || watchedDialog != dialogId) {
             callback.accept(null, "当前会话已变化，请重新打开问题。"); return;
         }
+        if (readOnlyConversation(dialogId)) { callback.accept(null, SessionSources.CLAUDE_READ_ONLY); return; }
         final String machine = dialogMachines.get(dialogId);
         final String remote = remoteIds.get(dialogId);
         final DesktopConnection connection = dialogConnection(dialogId);
@@ -2806,7 +2810,8 @@ public final class CodexRuntime {
         final long accountEpoch = accountGeneration;
         watchedDialog = dialogId;
         long generation = ++watchGeneration;
-        watchStatus(account, dialogId, generation);
+        // Claude Code 会话只读：不关联、不订阅状态、不登记通知，正文仍按同一历史路径读取。
+        if (!SessionSources.isClaude(remoteIds.get(dialogId))) watchStatus(account, dialogId, generation);
         String remote = remoteIds.get(dialogId);
         String machine = dialogMachines.get(dialogId);
         Utilities.globalQueue.postRunnable(new Runnable() {
@@ -4057,6 +4062,7 @@ public final class CodexRuntime {
                                     || connection == desktop || !connection.isConnected()) continue;
                             if (!page.has("candidates") || !page.get("candidates").isJsonArray())
                                 throw new IOException("电脑会话列表格式无效");
+                            appendClaudeCandidates(connection, page.getAsJsonArray("candidates"));
                             prefetchDialogs(page.getAsJsonArray("candidates"), connection);
                         } catch (Exception error) {
                             logTranscriptFailure("connected_candidates", error, null);
@@ -4210,18 +4216,83 @@ public final class CodexRuntime {
     /** 按时间或置顶区的行在预览前写所属项目（多台电脑时再写电脑）；按项目分组的行不加。 */
     public static String arrangedContext(long dialogId) { return arrangedContexts.get(dialogId); }
 
+    /** Claude Code 会话在三期 B 接通前只读：不能发送、作答或审批。 */
+    public static boolean readOnlyConversation(long dialogId) {
+        return SessionSources.isClaude(remoteIds.get(dialogId));
+    }
+
+    /** 两种来源同时出现在列表里时，第二行最前写 CX／CC；只有一种来源（含关掉一种）时不写。 */
+    public static String sourceMark(long dialogId) {
+        String remote = remoteIds.get(dialogId);
+        if (remote == null || !bothSourcesListed() || !sourceShown(SessionSources.CODEX)
+                || !sourceShown(SessionSources.CLAUDE)) return null;
+        return SessionSources.mark(remote);
+    }
+
+    /** 当前列表里是否有 Claude Code 会话。 */
+    public static boolean claudeListed() {
+        for (TLRPC.Dialog dialog : dialogs) if (SessionSources.isClaude(remoteIds.get(dialog.id))) return true;
+        return false;
+    }
+
+    /** 当前列表是否同时有 Codex 与 Claude Code 会话（不看“显示来源”过滤）。 */
+    public static boolean bothSourcesListed() {
+        boolean codex = false, claude = false;
+        for (TLRPC.Dialog dialog : dialogs) {
+            String remote = remoteIds.get(dialog.id);
+            if (remote == null) continue;
+            if (SessionSources.isClaude(remote)) claude = true; else codex = true;
+            if (codex && claude) return true;
+        }
+        return false;
+    }
+
+    /** “显示来源”：关掉的来源只从列表隐藏，身份、历史与草稿都保留。 */
+    public static boolean sourceShown(String source) {
+        return ApplicationLoader.applicationContext.getSharedPreferences("codex-preferences", 0)
+                .getBoolean(SessionSources.CLAUDE.equals(source) ? "showClaude" : "showCodex", true);
+    }
+
+    /** 至少保留一种来源；想关掉最后一种时不改并返回 false。 */
+    public static boolean setSourceShown(int account, String source, boolean shown) {
+        boolean claude = SessionSources.CLAUDE.equals(source);
+        if (!shown && !sourceShown(claude ? SessionSources.CODEX : SessionSources.CLAUDE)) return false;
+        ApplicationLoader.applicationContext.getSharedPreferences("codex-preferences", 0).edit()
+                .putBoolean(claude ? "showClaude" : "showCodex", shown).apply();
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
+        return true;
+    }
+
+    /** 三期 A：同一台电脑的 Claude Code 会话并入同一列表；读不到时只保留 Codex，不算列表失败。 */
+    private static void appendClaudeCandidates(DesktopConnection connection, com.google.gson.JsonArray candidates) {
+        try { candidates.addAll(connection.claudeCandidates(recentDialogLimit())); }
+        catch (Exception error) {
+            logTranscriptFailure("claude_candidates", error, null);
+            // 只记协议错误码，便于区分电脑端不支持、来源无效与读取失败；不记错误正文。
+            Throwable cause = error;
+            for (int i = 0; i < 3 && cause != null && !(cause instanceof DesktopConnection.RpcFailedException); i++)
+                cause = cause.getCause();
+            if (org.telegram.messenger.BuildVars.DEBUG_VERSION && cause instanceof DesktopConnection.RpcFailedException)
+                android.util.Log.w("CodexBridge", "claude_candidates_error=" + ((DesktopConnection.RpcFailedException) cause).errorCode);
+        }
+    }
+
     /** 置顶区待处理行的第二行：本次已读过的题目或命令摘要，没读过就提示点开查看；不为列表去电脑读题。 */
     public static String pinnedPendingText(long dialogId) {
         SessionStatus.Snapshot value = status(dialogId);
-        if (DialogArrangement.category(value.validity, value.state) != DialogArrangement.Category.PENDING
-                || !arrangementSettings().pinPending) return null;
+        if (DialogArrangement.category(value.validity, value.state) != DialogArrangement.Category.PENDING) {
+            // 离开待处理后旧摘要作废，再次进入待处理时不会沿用上一次的题目或命令。
+            pendingSummaries.remove(dialogId);
+            return null;
+        }
+        if (!arrangementSettings().pinPending) return null;
         String[] cached = pendingSummaries.get(dialogId);
         if (cached != null && cached[0].equals(pendingIdentity(value))) return cached[1];
         return "question".equals(value.pendingKind) ? "待你回复，点开查看"
                 : "approval".equals(value.pendingKind) ? "待批准，点开查看" : "待处理，点开查看";
     }
 
-    /** 摘要只在同一轮、同一组题目下有效，换题后退回“点开查看”。 */
+    /** 摘要只在同一轮、同一组题目和审批下有效，换题或换审批后退回“点开查看”。 */
     private static void rememberPending(long dialogId, String text) {
         if (text == null || text.trim().isEmpty()) return;
         String line = text.trim().split("\n", 2)[0];
@@ -4231,7 +4302,7 @@ public final class CodexRuntime {
     }
 
     private static String pendingIdentity(SessionStatus.Snapshot value) {
-        return value.turnId + "\n" + new java.util.TreeSet<>(value.questionIds);
+        return DialogArrangement.pendingIdentity(value.turnId, value.questionIds, value.approvalIds);
     }
 
     /** 审批摘要取第一条命令或第一行说明。 */
@@ -4253,10 +4324,15 @@ public final class CodexRuntime {
     }
 
     public static ComputerSummary computerSummary(String machineId) {
+        return computerSummary(machineId, null);
+    }
+
+    /** 按来源分别统计；source 为 null 时合计两种来源。 */
+    public static ComputerSummary computerSummary(String machineId, String source) {
         int pending = 0, running = 0, error = 0, finished = 0, unknown = 0;
         ArrayList<String> directories = new ArrayList<>();
-        for (DialogArrangement.Entry entry : arrangementEntries()) {
-            if (!entry.machineId.equals(machineId)) continue;
+        for (DialogArrangement.Entry entry : allArrangementEntries()) {
+            if (!entry.machineId.equals(machineId) || source != null && !source.equals(entry.source)) continue;
             switch (entry.category) {
                 case PENDING: pending++; break;
                 case RUNNING: running++; break;
@@ -4282,8 +4358,16 @@ public final class CodexRuntime {
         return DialogArrangement.tag(DialogArrangement.category(value.validity, value.state), value.pendingKind);
     }
 
-    /** 当前列表的展示事实；只取已有字段，电脑在线与否在二期多电脑汇总时接入。 */
+    /** 列表展示的会话：按“显示来源”过滤；电脑卡计数不受过滤影响。 */
     private static ArrayList<DialogArrangement.Entry> arrangementEntries() {
+        ArrayList<DialogArrangement.Entry> shown = new ArrayList<>();
+        for (DialogArrangement.Entry entry : allArrangementEntries())
+            if (sourceShown(entry.source)) shown.add(entry);
+        return shown;
+    }
+
+    /** 当前列表的展示事实；只取已有字段，电脑在线与否在二期多电脑汇总时接入。 */
+    private static ArrayList<DialogArrangement.Entry> allArrangementEntries() {
         ArrayList<DialogArrangement.Entry> entries = new ArrayList<>();
         for (TLRPC.Dialog dialog : dialogs) {
             String remote = remoteIds.get(dialog.id);
@@ -4291,8 +4375,9 @@ public final class CodexRuntime {
             String machine = dialogMachines.getOrDefault(dialog.id, "");
             SessionStatus.Snapshot value = status(dialog.id);
             entries.add(new DialogArrangement.Entry(dialog.id, machine, machineNames.getOrDefault(machine, ""), true, -1,
-                    dialogDirectories.getOrDefault(dialog.id, ""), "codex",
-                    DialogArrangement.category(value.validity, value.state), dialog.last_message_date * 1000L, remote));
+                    dialogDirectories.getOrDefault(dialog.id, ""), SessionSources.provider(remote),
+                    DialogArrangement.category(value.validity, value.state),
+                    dialogUpdatedAtMs.getOrDefault(dialog.id, dialog.last_message_date * 1000L), remote));
         }
         return entries;
     }
@@ -4357,6 +4442,7 @@ public final class CodexRuntime {
                 }
                 long timestamp = candidate.get("updatedAtMs").getAsLong();
                 updatedAt.put(local, timestamp);
+                dialogUpdatedAtMs.put(local, timestamp);
                 int date = (int) (timestamp / 1000);
                 presentationChanged |= dialog.last_message_date != date;
                 dialog.last_message_date = date;
@@ -4436,6 +4522,9 @@ public final class CodexRuntime {
                 if (!response.has("candidates") || !response.get("candidates").isJsonArray())
                     throw new java.io.IOException("电脑会话列表格式无效");
                 com.google.gson.JsonArray candidates = response.getAsJsonArray("candidates");
+                stage = "claude";
+                appendClaudeCandidates(desktop, candidates);
+                stage = "decode";
                 // 在后台验证必需字段，异常由同一失败分支收口，不让坏数据进入界面线程。
                 for (com.google.gson.JsonElement entry : candidates) {
                     JsonObject candidate = entry.getAsJsonObject();

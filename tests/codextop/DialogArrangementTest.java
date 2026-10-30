@@ -25,9 +25,11 @@ public final class DialogArrangementTest {
         finishedFold();
         pinning();
         byTime();
+        sameSecond();
+        pendingIdentity();
         machines();
         windowsCase();
-        System.out.println("DialogArrangement: 状态映射、项目命名、未关联、折叠、置顶、按时间、多电脑及离线、Windows 路径通过");
+        System.out.println("DialogArrangement: 状态映射、项目命名、未关联、折叠、置顶、按时间、同秒毫秒、摘要标识、多电脑及离线、Windows 路径通过");
     }
 
     private static void categories() {
@@ -141,6 +143,32 @@ public final class DialogArrangementTest {
         check("b".equals(rows.get(2).context), "按时间第二行带项目名");
         rows = DialogArrangement.arrange(entries, new Settings(true, true, true, false), null);
         check(types(rows).equals("DIALOG DIALOG DIALOG") && rows.get(1).dialogId == 3, "按时间不置顶");
+    }
+
+    /** R4：同一秒内按毫秒先后，远端编号只在毫秒也相同时决定顺序。 */
+    private static void sameSecond() {
+        List<Entry> entries = Arrays.asList(entry(1, "/w/a", Category.RUNNING, 1_000_100, "a"),
+                entry(2, "/w/b", Category.RUNNING, 1_000_900, "z"));
+        List<Row> rows = DialogArrangement.arrange(entries, new Settings(true, true, true, true), null);
+        check(rows.get(0).dialogId == 2 && rows.get(1).dialogId == 1, "同秒较新的在前");
+        entries = Arrays.asList(entry(1, "/w/a", Category.RUNNING, 1_000_500, "z"),
+                entry(2, "/w/b", Category.RUNNING, 1_000_500, "a"));
+        rows = DialogArrangement.arrange(entries, new Settings(true, true, true, true), null);
+        check(rows.get(0).dialogId == 2, "毫秒相同按远端编号");
+    }
+
+    /** B1：同一轮换了审批或题目，摘要标识都要变；同一请求不变。 */
+    private static void pendingIdentity() {
+        java.util.Set<String> none = java.util.Collections.emptySet();
+        String first = DialogArrangement.pendingIdentity("t", none, java.util.Set.of("a1"));
+        check(!first.equals(DialogArrangement.pendingIdentity("t", none, java.util.Set.of("a2"))), "同轮换审批失效");
+        check(first.equals(DialogArrangement.pendingIdentity("t", none, new java.util.HashSet<>(java.util.Set.of("a1")))), "同一审批不失效");
+        check(!DialogArrangement.pendingIdentity("t", java.util.Set.of("q1"), none)
+                .equals(DialogArrangement.pendingIdentity("t", java.util.Set.of("q2"), none)), "换题失效");
+        check(!DialogArrangement.pendingIdentity("t", java.util.Set.of("x"), none)
+                .equals(DialogArrangement.pendingIdentity("t", none, java.util.Set.of("x"))), "提问与审批同编号不混淆");
+        check(DialogArrangement.pendingIdentity("t", java.util.Set.of("q2", "q1"), java.util.Set.of("b", "a"))
+                .equals(DialogArrangement.pendingIdentity("t", java.util.Set.of("q1", "q2"), java.util.Set.of("a", "b"))), "顺序无关");
     }
 
     private static void machines() {

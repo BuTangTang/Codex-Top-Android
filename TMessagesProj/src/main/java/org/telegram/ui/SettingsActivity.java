@@ -436,6 +436,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
         if (codexUsage == null || !codexUsage.available) items.add(UItem.asShadow(status));
         if (!codexMyRoot()) items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
+        // D-83 三期 A：Claude Code 额度暂无可靠来源，只写明读不到，不画进度条。
+        if (com.butang.codextop.CodexRuntime.claudeListed())
+            items.add(UItem.asButton(26, "Claude Code 额度", "暂无法读取").setEnabled(false));
     }
 
 
@@ -443,6 +446,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     private boolean codexBrowser() {
         return com.butang.codextop.CodexRuntime.enabled() && getArguments() != null
                 && getArguments().getBoolean("codexComputerBrowser", false);
+    }
+
+    /** 电脑列表页：卡片计数随会话列表刷新。 */
+    private boolean codexComputerList() {
+        return codexBrowser() && getArguments().getString("codexMachine") == null && !codexConversations();
     }
 
     /** 当前是否为独立的电脑或项目对话页。 */
@@ -525,6 +533,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     @Override
     public boolean onFragmentCreate() {
         getNotificationCenter().addObserver(this, NotificationCenter.updateInterfaces);
+        getNotificationCenter().addObserver(this, NotificationCenter.dialogsNeedReload);
         getNotificationCenter().addObserver(this, NotificationCenter.starBalanceUpdated);
         getNotificationCenter().addObserver(this, NotificationCenter.newSuggestionsAvailable);
 
@@ -887,6 +896,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         super.onFragmentDestroy();
 
         getNotificationCenter().removeObserver(this, NotificationCenter.updateInterfaces);
+        getNotificationCenter().removeObserver(this, NotificationCenter.dialogsNeedReload);
         getNotificationCenter().removeObserver(this, NotificationCenter.starBalanceUpdated);
         getNotificationCenter().removeObserver(this, NotificationCenter.newSuggestionsAvailable);
     }
@@ -901,9 +911,12 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         } else if (id == NotificationCenter.updateInterfaces) {
             setInfo();
-            if (com.butang.codextop.CodexRuntime.enabled() && !codexBrowser() && listView != null) {
+            if (com.butang.codextop.CodexRuntime.enabled() && (!codexBrowser() || codexComputerList()) && listView != null) {
                 listView.adapter.update(false);
             }
+        } else if (id == NotificationCenter.dialogsNeedReload) {
+            // 电脑卡的计数取自会话列表；列表增删或改条数后跟着重算，不必重开页面。
+            if (codexComputerList() && listView != null) listView.adapter.update(false);
         } else if (id == NotificationCenter.newSuggestionsAvailable) {
             if (listView != null) {
                 listView.adapter.update(true);
@@ -1084,8 +1097,17 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 if (!arrangement.byTime) {
                     items.add(UItem.asShadow(null));
                     items.add(UItem.asHeader("按项目"));
-                    items.add(UItem.asCheck(52, "多台电脑先分电脑").setChecked(arrangement.byMachine));
+                    // D-83k：一期手机只连一台电脑，“多台电脑先分电脑”到二期再显示；已存偏好照常保留。
                     items.add(UItem.asCheck(53, "已结束折叠").setChecked(arrangement.collapseFinished));
+                }
+                // D-83 三期 A：两种来源并存（或已关掉一种）时才出现“显示来源”，至少保留一种。
+                boolean showCodex = com.butang.codextop.CodexRuntime.sourceShown(com.butang.codextop.SessionSources.CODEX);
+                boolean showClaude = com.butang.codextop.CodexRuntime.sourceShown(com.butang.codextop.SessionSources.CLAUDE);
+                if (com.butang.codextop.CodexRuntime.bothSourcesListed() || !showCodex || !showClaude) {
+                    items.add(UItem.asShadow(null));
+                    items.add(UItem.asHeader("显示来源"));
+                    items.add(UItem.asCheck(55, "Codex").setChecked(showCodex));
+                    items.add(UItem.asCheck(56, "Claude Code").setChecked(showClaude));
                 }
                 items.add(UItem.asShadow(null));
                 items.add(UItem.asHeader("通用"));
@@ -1324,6 +1346,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                         presentFragment(new SettingsActivity(child));
                     }
                 }
+                return;
+            }
+            if (codexSubpage("codexArrangement") && (item.id == 55 || item.id == 56)) {
+                String source = item.id == 55 ? com.butang.codextop.SessionSources.CODEX : com.butang.codextop.SessionSources.CLAUDE;
+                if (!com.butang.codextop.CodexRuntime.setSourceShown(currentAccount, source,
+                        !com.butang.codextop.CodexRuntime.sourceShown(source)))
+                    BulletinFactory.of(this).createSimpleBulletin(R.raw.error, "至少保留一种来源").show();
+                listView.adapter.update(true);
                 return;
             }
             if (codexSubpage("codexArrangement") && item.id >= 50 && item.id <= 54) {
@@ -2482,11 +2512,20 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                     && !(row.has("cached") && row.get("cached").isJsonPrimitive() && row.get("cached").getAsBoolean());
         }
 
-        /** 每种工具一行数量；手机没有该电脑会话时写“—”，不显示 0。离线时数字前加“上次”。 */
+        /** 每种工具一行数量，只统计最近 N 条；手机没有该电脑会话时写“—”，不显示 0。离线时前加“上次”。 */
         static String toolsOf(com.google.gson.JsonObject row) {
+            String codex = toolOf(row, com.butang.codextop.SessionSources.CODEX, "Codex");
+            if (!row.has("id")) return codex;
+            // Claude Code 只在该电脑确有会话时加一行。
+            if (com.butang.codextop.CodexRuntime.computerSummary(row.get("id").getAsString(),
+                    com.butang.codextop.SessionSources.CLAUDE) == null) return codex;
+            return codex + "\n" + toolOf(row, com.butang.codextop.SessionSources.CLAUDE, "Claude Code");
+        }
+
+        private static String toolOf(com.google.gson.JsonObject row, String source, String name) {
             com.butang.codextop.CodexRuntime.ComputerSummary summary = row.has("id")
-                    ? com.butang.codextop.CodexRuntime.computerSummary(row.get("id").getAsString()) : null;
-            if (summary == null) return "Codex  —";
+                    ? com.butang.codextop.CodexRuntime.computerSummary(row.get("id").getAsString(), source) : null;
+            if (summary == null) return name + "  —";
             // 设计图：只列非零项，如“1 待办 · 1 运行 · 6 结束”。
             ArrayList<String> parts = new ArrayList<>();
             if (summary.pending > 0) parts.add(summary.pending + " 待办");
@@ -2494,7 +2533,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             if (summary.error > 0) parts.add(summary.error + " 出错");
             if (summary.unknown > 0) parts.add(summary.unknown + " 未知");
             if (summary.finished > 0) parts.add(summary.finished + " 结束");
-            return "Codex  " + (offline(row) ? "上次 " : "") + TextUtils.join(" · ", parts);
+            return name + "  " + (offline(row) ? "上次 · 最近 " : "最近 ") + TextUtils.join(" · ", parts);
         }
 
         static String projectsOf(com.google.gson.JsonObject row) {
@@ -2516,7 +2555,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             public void bindView(View view, UItem item, boolean divider, UniversalAdapter adapter, UniversalRecyclerView listView) {
                 com.google.gson.JsonObject row = item.object instanceof com.google.gson.JsonObject ? (com.google.gson.JsonObject) item.object : new com.google.gson.JsonObject();
                 ((ComputerCell) view).bind(item.text == null ? "" : item.text.toString(), item.subtext == null ? "" : item.subtext.toString(),
-                        toolsOf(row), projectsOf(row), offline(row));
+                        item.texts == null ? toolsOf(row) : item.texts[0], item.texts == null ? projectsOf(row) : item.texts[1], offline(row));
             }
             public static UItem of(com.google.gson.JsonObject row) {
                 UItem item = UItem.ofFactory(Factory.class);
@@ -2525,6 +2564,8 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 item.object2 = "computers:" + com.butang.codextop.BrowseStore.identity("computers", row);
                 item.text = row.has("name") && !row.get("name").isJsonNull() ? row.get("name").getAsString() : "";
                 item.subtext = statusOf(row);
+                // 建项时记下计数与项目，差异比较才能发现列表变化后的新数字。
+                item.texts = new String[]{toolsOf(row), projectsOf(row)};
                 return item;
             }
             @Override
@@ -2535,8 +2576,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             public boolean contentsEquals(UItem a, UItem b) {
                 return equals(a, b) && TextUtils.equals(a.text, b.text) && TextUtils.equals(a.subtext, b.subtext)
                         && a.object instanceof com.google.gson.JsonObject && b.object instanceof com.google.gson.JsonObject
-                        && TextUtils.equals(toolsOf((com.google.gson.JsonObject) a.object), toolsOf((com.google.gson.JsonObject) b.object))
-                        && TextUtils.equals(projectsOf((com.google.gson.JsonObject) a.object), projectsOf((com.google.gson.JsonObject) b.object))
+                        && java.util.Arrays.equals(a.texts, b.texts)
                         && TextUtils.equals(text(a, "name"), text(b, "name"))
                         && java.util.Objects.equals(flag(a, "active"), flag(b, "active"))
                         && java.util.Objects.equals(flag(a, "cached"), flag(b, "cached"));

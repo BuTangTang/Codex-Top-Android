@@ -29170,7 +29170,19 @@ public class ChatActivity extends BaseFragment implements
         boolean showSuggestButton = false;
         boolean showSearchButton = chatMode == MODE_DEFAULT && ChatObject.isChannelOrGiga(currentChat);
         boolean showGigaGroupButton = false;
-        if (chatMode == MODE_DEFAULT && getMessagesController().isFrozen() && !AccountFrozenAlert.isSpamBot(currentAccount, currentUser)) {
+        if (chatMode == MODE_DEFAULT && com.butang.codextop.CodexRuntime.readOnlyConversation(dialog_id)) {
+            // D-83 三期 A：Claude Code 会话只读，输入框换成说明；不显示提问与审批入口。
+            if (bottomOverlayStartButton != null) bottomOverlayStartButton.setVisibility(View.INVISIBLE);
+            bottomOverlayLinks = true;
+            bottomOverlayChatText.setVisibility(View.GONE);
+            bottomOverlayLinksText.setVisibility(View.VISIBLE);
+            bottomOverlayLinksText.setTextColor(getThemedColor(Theme.key_graySectionText));
+            bottomOverlayLinksText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+            bottomOverlayLinksText.setText(com.butang.codextop.SessionSources.CLAUDE_READ_ONLY);
+            bottomOverlayLinksText.setClickable(false);
+            showBottomOverlayProgress(false, false);
+            if (chatActivityEnterView != null) chatActivityEnterView.hidePopup(false);
+        } else if (chatMode == MODE_DEFAULT && getMessagesController().isFrozen() && !AccountFrozenAlert.isSpamBot(currentAccount, currentUser)) {
             if (bottomOverlayStartButton != null) {
                 bottomOverlayStartButton.setVisibility(View.INVISIBLE);
             }

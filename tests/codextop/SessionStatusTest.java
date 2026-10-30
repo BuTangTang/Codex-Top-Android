@@ -52,6 +52,7 @@ public final class SessionStatusTest {
         store.observation(1, "machine", response, 100, 110);
         var first = store.get(1, 111);
         if (!first.questionIds.equals(java.util.Set.of("a", "b"))) throw new AssertionError("待答身份丢失或混入审批");
+        if (!first.approvalIds.equals(java.util.Set.of("approval"))) throw new AssertionError("审批身份丢失或混入提问");
         try { first.questionIds.add("bad"); throw new AssertionError("外部可改写状态身份"); }
         catch (UnsupportedOperationException expected) { }
         response.getAsJsonObject("observation").getAsJsonArray("requests").remove(0);
