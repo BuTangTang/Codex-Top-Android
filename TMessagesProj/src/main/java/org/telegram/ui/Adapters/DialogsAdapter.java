@@ -53,6 +53,7 @@ import org.telegram.tgnet.tl.TL_chatlists;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.Theme;
 import org.telegram.ui.Cells.ArchiveHintCell;
+import org.telegram.ui.Cells.CodexGroupCell;
 import org.telegram.ui.Cells.DialogCell;
 import org.telegram.ui.Cells.DialogMeUrlCell;
 import org.telegram.ui.Cells.DialogsEmptyCell;
@@ -110,7 +111,8 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             VIEW_TYPE_GRAY_SECTION = 20,
             VIEW_TYPE_FORWARD_TO_STORIES_CELL = 21,
             VIEW_TYPE_HEADER_3 = 22,
-            VIEW_TYPE_DIALOG_COMMUNITY = 23;
+            VIEW_TYPE_DIALOG_COMMUNITY = 23,
+            VIEW_TYPE_CODEX_GROUP = 24;
 
     private Context mContext;
     private ArchiveHintCell archiveHintCell;
@@ -287,6 +289,7 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
     private class ItemInternal extends AdapterWithDiffUtils.Item {
 
         TLRPC.Dialog dialog;
+        com.butang.codextop.DialogArrangement.Row codexRow;
         private int codexDate;
         private String codexTitle;
         private String codexMachineName;
@@ -309,6 +312,19 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
         private TLRPC.Chat chat;
         private TLRPC.User user;
         private long dialogId;
+
+        /** D-83 分组行；稳定编号按分组键保存，与会话编号互不影响。 */
+        public ItemInternal(com.butang.codextop.DialogArrangement.Row row) {
+            super(VIEW_TYPE_CODEX_GROUP, true);
+            codexRow = row;
+            Integer currentId = dialogsHeaderStableIds.get("codex:" + row.key);
+            if (currentId != null) {
+                stableId = currentId;
+            } else {
+                stableId = stableIdPointer++;
+                dialogsHeaderStableIds.put("codex:" + row.key, stableId);
+            }
+        }
 
         public ItemInternal(int viewType, String string) {
             super(viewType, false);
@@ -456,6 +472,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             if (viewType == VIEW_TYPE_LAST_EMPTY) {
                 return false;
             }
+            if (viewType == VIEW_TYPE_CODEX_GROUP) {
+                return codexRow != null && itemInternal.codexRow != null && codexRow.key.equals(itemInternal.codexRow.key);
+            }
             return true;
         }
 
@@ -472,6 +491,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
 
         final ItemInternal item = itemInternals.get(i);
 
+        if (item.codexRow != null) {
+            return item.codexRow;
+        }
         if (item.title != null) {
             return item.title;
         } else if (item.chat != null) {
@@ -599,6 +621,8 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 if (com.butang.codextop.CodexRuntime.enabled() && oldItem.dialog != null && newItem.dialog != null
                         && (oldItem.codexDate != newItem.codexDate || !java.util.Objects.equals(oldItem.codexTitle, newItem.codexTitle)
                         || !java.util.Objects.equals(oldItem.codexMachineName, newItem.codexMachineName))) return false;
+                if (oldItem.codexRow != null && newItem.codexRow != null)
+                    return oldItem.codexRow.presentation().equals(newItem.codexRow.presentation());
                 return oldItem.viewType == newItem.viewType;
             }
         };
@@ -660,7 +684,8 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
         return viewType != VIEW_TYPE_FLICKER && viewType != VIEW_TYPE_EMPTY && viewType != VIEW_TYPE_DIVIDER &&
                 viewType != VIEW_TYPE_SHADOW && viewType != VIEW_TYPE_HEADER &&
                 viewType != VIEW_TYPE_LAST_EMPTY && viewType != VIEW_TYPE_NEW_CHAT_HINT && viewType != VIEW_TYPE_CONTACTS_FLICKER &&
-                viewType != VIEW_TYPE_REQUIREMENTS && viewType != VIEW_TYPE_REQUIRED_EMPTY && viewType != VIEW_TYPE_STORIES && viewType != VIEW_TYPE_ARCHIVE_FULLSCREEN && viewType != VIEW_TYPE_GRAY_SECTION;
+                viewType != VIEW_TYPE_REQUIREMENTS && viewType != VIEW_TYPE_REQUIRED_EMPTY && viewType != VIEW_TYPE_STORIES && viewType != VIEW_TYPE_ARCHIVE_FULLSCREEN && viewType != VIEW_TYPE_GRAY_SECTION
+                && (viewType != VIEW_TYPE_CODEX_GROUP || holder.itemView instanceof CodexGroupCell && ((CodexGroupCell) holder.itemView).isToggle());
     }
 
     @Override
@@ -786,6 +811,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 break;
             case VIEW_TYPE_GRAY_SECTION:
                 view = new GraySectionCell(mContext);
+                break;
+            case VIEW_TYPE_CODEX_GROUP:
+                view = new CodexGroupCell(mContext);
                 break;
             case VIEW_TYPE_SHADOW: {
                 view = new ShadowSectionCell(mContext);
@@ -1131,6 +1159,10 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                         cell.setText(getString(R.string.FilterGroups));
                         break;
                 }
+                break;
+            }
+            case VIEW_TYPE_CODEX_GROUP: {
+                ((CodexGroupCell) holder.itemView).setRow(itemInternals.get(i).codexRow);
                 break;
             }
             case VIEW_TYPE_GRAY_SECTION: {
@@ -1791,7 +1823,24 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             itemInternals.add(new ItemInternal(VIEW_TYPE_FORWARD_TO_STORIES_CELL));
         }
 
-        if (!stopUpdate) {
+        if (!stopUpdate && codexArranged()) {
+            // D-83：按分组模型输出标题行与会话行；会话对象仍取原列表，不另造 Dialog。
+            android.util.LongSparseArray<TLRPC.Dialog> byId = new android.util.LongSparseArray<>();
+            for (TLRPC.Dialog dialog : array) byId.put(dialog.id, dialog);
+            for (com.butang.codextop.DialogArrangement.Row row : com.butang.codextop.CodexRuntime.arrangedRows()) {
+                if (row.type != com.butang.codextop.DialogArrangement.RowType.DIALOG) {
+                    itemInternals.add(new ItemInternal(row));
+                } else if (byId.get(row.dialogId) != null) {
+                    itemInternals.add(new ItemInternal(VIEW_TYPE_DIALOG, byId.get(row.dialogId)));
+                }
+            }
+            if (dialogsCount == 0) {
+                isEmpty = true;
+                itemInternals.add(new ItemInternal(VIEW_TYPE_EMPTY, dialogsEmptyType()));
+            } else {
+                itemInternals.add(new ItemInternal(VIEW_TYPE_LAST_EMPTY));
+            }
+        } else if (!stopUpdate) {
             for (int k = 0; k < array.size(); k++) {
                 if (dialogsType == DialogsActivity.DIALOGS_TYPE_ADD_USERS_TO && array.get(k) instanceof DialogsActivity.DialogsHeader) {
                     itemInternals.add(new ItemInternal(VIEW_TYPE_HEADER_2, array.get(k)));
@@ -1829,6 +1878,12 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 }
             }
         }
+    }
+
+    /** 只在 Codex 会话根页分组；选择转发、文件夹等原入口保持原平铺列表。 */
+    private boolean codexArranged() {
+        return com.butang.codextop.CodexRuntime.enabled() && communityId == 0 && folderId == 0
+                && dialogsType == DialogsActivity.DIALOGS_TYPE_DEFAULT && !isOnlySelect && requestPeerType == null;
     }
 
     /** 与真实普通行共用03/06来源门；保留原固定70/76高度及论坛特殊高度。 */

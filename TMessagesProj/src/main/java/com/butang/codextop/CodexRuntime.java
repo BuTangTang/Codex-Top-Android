@@ -248,6 +248,7 @@ public final class CodexRuntime {
                         histories.clear(); historyViews.clear(); coldHistoryRequests.clear(); linkedSessions.clear(); pendingMessages.clear();
                         attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear(); sendJobs.clear();
                         statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
+                        arrangementOverrides.clear(); arrangedSignature = ""; arrangedContexts.clear(); pendingSummaries.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
                         connectedComputersPrefetching = false;
                         loading = false; listRefreshScheduled = false; loadError = null;
@@ -1471,8 +1472,10 @@ public final class CodexRuntime {
             } catch (Exception error) { failure = "暂时无法读取待处理操作，请稍后重试或在电脑查看。"; }
             final ApprovalReview loaded = review; final String message = failure;
             AndroidUtilities.runOnUIThread(() -> {
-                if (isAccountCurrent(epoch) && generation == watchGeneration && watchedDialog == dialogId)
+                if (isAccountCurrent(epoch) && generation == watchGeneration && watchedDialog == dialogId) {
+                    if (loaded != null && !loaded.requests.isEmpty()) rememberPending(dialogId, approvalSummary(loaded.requests.get(0)));
                     callback.accept(loaded, message);
+                }
             });
         });
     }
@@ -1720,6 +1723,8 @@ public final class CodexRuntime {
                 else {
                     long expiry = statuses.currentExpiry(dialogId, loaded.machine, android.os.SystemClock.elapsedRealtime());
                     loaded.adoptExpiry(expiry);
+                    if (!loaded.requests.isEmpty() && !loaded.requests.get(0).questions.isEmpty())
+                        rememberPending(dialogId, loaded.requests.get(0).questions.get(0).question);
                     callback.accept(loaded, message);
                 }
             });
@@ -4153,6 +4158,149 @@ public final class CodexRuntime {
         user.id = id; user.first_name = title; user.last_name = ""; user.contact = true;
         controller.putUser(user, false);
         return true;
+    }
+
+    /** D-83 手动展开／折叠，只存内存，避免把目录写进本机存储；界面线程读写。 */
+    private static final Map<String, Boolean> arrangementOverrides = new HashMap<>();
+    private static String arrangedSignature = "";
+    private static final Map<Long, String> arrangedContexts = new HashMap<>();
+    private static final Map<Long, String[]> pendingSummaries = new HashMap<>();
+
+    /** “我的 → 会话排列”的当前选项；默认按项目、先分电脑、已结束折叠、待处理置顶。 */
+    public static DialogArrangement.Settings arrangementSettings() {
+        android.content.SharedPreferences preferences = ApplicationLoader.applicationContext.getSharedPreferences("codex-preferences", 0);
+        return new DialogArrangement.Settings("time".equals(preferences.getString("dialogArrangement", "project")),
+                preferences.getBoolean("arrangeByMachine", true), preferences.getBoolean("collapseFinished", true),
+                preferences.getBoolean("pinPending", true));
+    }
+
+    /** 保存排列选项并立即按新方式重排，不重新联网。 */
+    public static void setArrangementSettings(int account, DialogArrangement.Settings settings) {
+        ApplicationLoader.applicationContext.getSharedPreferences("codex-preferences", 0).edit()
+                .putString("dialogArrangement", settings.byTime ? "time" : "project")
+                .putBoolean("arrangeByMachine", settings.byMachine)
+                .putBoolean("collapseFinished", settings.collapseFinished)
+                .putBoolean("pinPending", settings.pinPending).apply();
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
+    }
+
+    /** 由当前列表和状态生成分组行，并记下已交给界面的结果。 */
+    public static ArrayList<DialogArrangement.Row> arrangedRows() {
+        ArrayList<DialogArrangement.Row> rows = new ArrayList<>(DialogArrangement.arrange(arrangementEntries(),
+                arrangementSettings(), arrangementOverrides));
+        arrangedSignature = arrangementSignature(rows);
+        arrangedContexts.clear();
+        for (DialogArrangement.Row row : rows)
+            if (row.type == DialogArrangement.RowType.DIALOG && row.context != null) arrangedContexts.put(row.dialogId, row.context);
+        return rows;
+    }
+
+    /** 状态更新后判断分组是否需要重排，例如运行结束移入“已结束”或新待办置顶。 */
+    public static boolean arrangementChanged() {
+        return !arrangedSignature.equals(arrangementSignature(DialogArrangement.arrange(arrangementEntries(),
+                arrangementSettings(), arrangementOverrides)));
+    }
+
+    /** 点按项目组或“已结束 N”后切换展开状态。 */
+    public static void toggleArrangement(int account, DialogArrangement.Row row) {
+        arrangementOverrides.put(row.key, !row.expanded);
+        NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);
+    }
+
+    /** 按时间或置顶区的行在预览前写所属项目（多台电脑时再写电脑）；按项目分组的行不加。 */
+    public static String arrangedContext(long dialogId) { return arrangedContexts.get(dialogId); }
+
+    /** 置顶区待处理行的第二行：本次已读过的题目或命令摘要，没读过就提示点开查看；不为列表去电脑读题。 */
+    public static String pinnedPendingText(long dialogId) {
+        SessionStatus.Snapshot value = status(dialogId);
+        if (DialogArrangement.category(value.validity, value.state) != DialogArrangement.Category.PENDING
+                || !arrangementSettings().pinPending) return null;
+        String[] cached = pendingSummaries.get(dialogId);
+        if (cached != null && cached[0].equals(pendingIdentity(value))) return cached[1];
+        return "question".equals(value.pendingKind) ? "待你回复，点开查看"
+                : "approval".equals(value.pendingKind) ? "待批准，点开查看" : "待处理，点开查看";
+    }
+
+    /** 摘要只在同一轮、同一组题目下有效，换题后退回“点开查看”。 */
+    private static void rememberPending(long dialogId, String text) {
+        if (text == null || text.trim().isEmpty()) return;
+        String line = text.trim().split("\n", 2)[0];
+        pendingSummaries.put(dialogId, new String[]{pendingIdentity(status(dialogId)), line});
+        NotificationCenter.getInstance(org.telegram.messenger.UserConfig.selectedAccount).postNotificationName(NotificationCenter.updateInterfaces,
+                MessagesController.UPDATE_MASK_STATUS);
+    }
+
+    private static String pendingIdentity(SessionStatus.Snapshot value) {
+        return value.turnId + "\n" + new java.util.TreeSet<>(value.questionIds);
+    }
+
+    /** 审批摘要取第一条命令或第一行说明。 */
+    private static String approvalSummary(DesktopApproval request) {
+        String details = request.details == null ? "" : request.details.trim();
+        if (details.startsWith("执行命令\n")) details = details.substring("执行命令\n".length());
+        String first = details.split("\n", 2)[0].trim();
+        return first.isEmpty() ? null : "批准：" + first;
+    }
+
+    /** 电脑页卡片的概况：只统计手机已拿到的该电脑会话；一条都没有时返回 null，界面显示“—”。 */
+    public static final class ComputerSummary {
+        public final int pending, running, error, finished, unknown;
+        public final ArrayList<String> projects;
+        ComputerSummary(int pending, int running, int error, int finished, int unknown, ArrayList<String> projects) {
+            this.pending = pending; this.running = running; this.error = error; this.finished = finished;
+            this.unknown = unknown; this.projects = projects;
+        }
+    }
+
+    public static ComputerSummary computerSummary(String machineId) {
+        int pending = 0, running = 0, error = 0, finished = 0, unknown = 0;
+        ArrayList<String> directories = new ArrayList<>();
+        for (DialogArrangement.Entry entry : arrangementEntries()) {
+            if (!entry.machineId.equals(machineId)) continue;
+            switch (entry.category) {
+                case PENDING: pending++; break;
+                case RUNNING: running++; break;
+                case ERROR: error++; break;
+                case FINISHED: finished++; break;
+                default: unknown++; break;
+            }
+            directories.add(entry.directory);
+        }
+        if (directories.isEmpty()) return null;
+        Map<String, String> names = DialogArrangement.projectNames(directories);
+        ArrayList<String> projects = new ArrayList<>();
+        for (String directory : directories) {
+            String name = names.get(directory);
+            if (name != null && !projects.contains(name)) projects.add(name);
+        }
+        return new ComputerSummary(pending, running, error, finished, unknown, projects);
+    }
+
+    /** 时间上方的小标签，供会话行绘制。 */
+    public static String statusTag(long dialogId) {
+        SessionStatus.Snapshot value = status(dialogId);
+        return DialogArrangement.tag(DialogArrangement.category(value.validity, value.state), value.pendingKind);
+    }
+
+    /** 当前列表的展示事实；只取已有字段，电脑在线与否在二期多电脑汇总时接入。 */
+    private static ArrayList<DialogArrangement.Entry> arrangementEntries() {
+        ArrayList<DialogArrangement.Entry> entries = new ArrayList<>();
+        for (TLRPC.Dialog dialog : dialogs) {
+            String remote = remoteIds.get(dialog.id);
+            if (remote == null) continue;
+            String machine = dialogMachines.getOrDefault(dialog.id, "");
+            SessionStatus.Snapshot value = status(dialog.id);
+            entries.add(new DialogArrangement.Entry(dialog.id, machine, machineNames.getOrDefault(machine, ""), true, -1,
+                    dialogDirectories.getOrDefault(dialog.id, ""), "codex",
+                    DialogArrangement.category(value.validity, value.state), dialog.last_message_date * 1000L, remote));
+        }
+        return entries;
+    }
+
+    private static String arrangementSignature(java.util.List<DialogArrangement.Row> rows) {
+        StringBuilder text = new StringBuilder();
+        for (DialogArrangement.Row row : rows) text.append(row.presentation()).append('\n');
+        return text.toString();
     }
 
     /** 最近列表上限只影响列表与预取，不删除历史和待发记录。 */

@@ -16,13 +16,19 @@ public final class ProjectPaths {
         return path.equals(root) || path.startsWith(root.endsWith("/") ? root : root + "/");
     }
 
+    /** 同一目录的比较键；Windows 路径忽略大小写，无效路径返回 null。 */
+    public static String key(String value) {
+        String path = normalize(value);
+        return path != null && windows(path) ? path.toLowerCase(Locale.ROOT) : path;
+    }
+
     /** 识别盘符和网络共享路径，不把普通 POSIX 路径改成大小写不敏感。 */
     private static boolean windows(String path) {
         return path.startsWith("//") || path.matches("^[A-Za-z]:/.*");
     }
 
-    /** 仅接受绝对路径，折叠重复分隔符和点段，保留盘符及共享前缀。 */
-    private static String normalize(String value) {
+    /** 仅接受绝对路径，折叠重复分隔符和点段，保留盘符及共享前缀与原大小写。 */
+    public static String normalize(String value) {
         if (value == null || value.trim().isEmpty()) return null;
         String path = value.trim().replace('\\', '/').replaceFirst("^/+([A-Za-z]:/)", "$1");
         String prefix;

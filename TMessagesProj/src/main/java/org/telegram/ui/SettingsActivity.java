@@ -226,7 +226,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     /** 仅“我的”根页承载直接额度展示，不改变电脑浏览和普通 Telegram 设置。 */
     private boolean codexMyRoot() {
-        return com.butang.codextop.CodexRuntime.enabled() && !codexBrowser() && !codexQuota() && !codexAppearance();
+        return com.butang.codextop.CodexRuntime.enabled() && !codexBrowser() && !codexQuota() && !codexAppearance()
+                && !codexSubpage("codexAccount") && !codexSubpage("codexDiagnostics") && !codexSubpage("codexArrangement");
+    }
+
+    /** D-83 “我的”的二级页：账号详情、连接与诊断、会话排列。 */
+    private boolean codexSubpage(String key) {
+        return com.butang.codextop.CodexRuntime.enabled() && getArguments() != null && getArguments().getBoolean(key, false);
     }
 
     /** 三栏宿主中的电脑和我的才使用大页头，项目、会话、额度及外观子页保持原导航。 */
@@ -370,10 +376,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         updateCodexBrowserItems();
     }
 
-    /** 日期使用手机本地格式；不存在的时间不推算。 */
+    /** D-83 中文日期；不存在的时间不推算。 */
     private String codexQuotaTime(long time) {
-        return java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
-                .format(new java.util.Date(time));
+        return com.butang.codextop.CodexDates.formatWithTime(time);
     }
 
     /** 周期按来源实际毫秒值显示，不预设必须有小时和周两个窗口。 */
@@ -399,11 +404,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 suffix = meter.estimated ? "采集时预计剩余" : "采集时剩余";
             }
             lines.add(new UsageCell.MeterLine(meter.label, codexQuotaWindow(meter.windowDurationMs), shown, suffix,
-                    meter.resetsAtMs == null ? "来源未返回" : codexQuotaTime(meter.resetsAtMs), missing,
+                    meter.resetsAtMs == null ? null : codexQuotaTime(meter.resetsAtMs), missing,
                     missing ? 0 : meter.remainingPercent));
         }
         return UsageCell.Factory.of(new UsageCell.State(lines,
-                TextUtils.isEmpty(codexUsage.accountLabel) ? "来源未返回" : codexUsage.accountLabel,
+                codexMyRoot() ? null : TextUtils.isEmpty(codexUsage.accountLabel) ? "来源未返回" : codexUsage.accountLabel,
                 codexQuotaTime(codexUsage.fetchedAtMs), codexUsage.isStale(System.currentTimeMillis()),
                 codexUsageLoading, codexUsageError));
     }
@@ -411,6 +416,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     /** 额度优先使用原文字行；窗口与重置紧邻，原采集来源、预计及过期含义完整保留。 */
     private void fillCodexUsageItems(ArrayList<UItem> items) {
         if (codexMyRoot()) {
+            items.add(UItem.asHeader("Codex 额度"));
             items.add(SettingCell.Factory.ofCodex(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
                     ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel(),
                     SettingCell.Factory.CODEX_SUBTITLE_TWO)
@@ -419,7 +425,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             items.add(SettingCell.Factory.ofCodex(30, 0, 0, 0, "来源电脑",
                     getArguments().getString("codexMachineName", "电脑"), SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(false));
         }
-        items.add(UItem.asHeader("Codex 额度"));
+        if (!codexMyRoot()) items.add(UItem.asHeader("Codex 额度"));
         if (codexUsageMachineId() != null && codexUsage != null && codexUsage.available) {
             items.add(codexUsageItem());
         }
@@ -430,7 +436,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         String status = codexUsageLoading && (codexUsage == null || !codexUsage.available) ? "正在读取" : codexUsageError != null ? codexUsageError
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
         if (codexUsage == null || !codexUsage.available) items.add(UItem.asShadow(status));
-        items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
+        if (!codexMyRoot()) items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
     }
 
 
@@ -677,11 +683,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         };
         if (com.butang.codextop.CodexRuntime.enabled()) {
-            actionBar.setTitle(codexAppearance() ? "外观" : codexQuota() ? "Codex 额度" : codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "我的");
+            actionBar.setTitle(codexAppearance() ? "外观" : codexQuota() ? "Codex 额度" : codexBrowser() ? getArguments().getString("codexTitle", "电脑")
+                    : codexSubpage("codexAccount") ? "账号" : codexSubpage("codexDiagnostics") ? "连接与诊断"
+                    : codexSubpage("codexArrangement") ? "会话排列" : "我的");
             // 子栈会移除 hasMainTabs；仅电脑列表与我的根页 opt-in，不看标题字符串。
             actionBar.setCodexRootHeader(codexRootHeaderPage());
             searchItem.setVisibility(View.GONE);
-            otherItem.setVisibility(codexBrowser() || codexQuota() || codexAppearance() ? View.GONE : View.VISIBLE);
+            otherItem.setVisibility(codexMyRoot() ? View.VISIBLE : View.GONE);
         } else {
             search.loadFaqWebPage();
         }
@@ -1054,17 +1062,57 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 items.add(UItem.asShadow(null));
                 return;
             }
-            fillCodexUsageItems(items);
-            items.add(UItem.asHeader("账号与外观"));
             com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
-            items.add(AccountMetaCell.Factory.of(
-                    TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName,
-                    account.connectionLabel, null, null, getVersionName()));
+            String loginName = TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName;
+            if (codexSubpage("codexAccount")) {
+                items.add(AccountMetaCell.Factory.of(loginName, account.connectionLabel, account.server, null, getVersionName()));
+                items.add(UItem.asShadow(null));
+                return;
+            }
+            if (codexSubpage("codexDiagnostics")) {
+                items.add(SettingCell.Factory.ofCodex(60, 0, 0, 0, "服务地址",
+                        TextUtils.isEmpty(account.server) ? "未登录" : account.server, SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(false));
+                items.add(SettingCell.Factory.ofCodex(61, 0, 0, 0, "连接状态", account.connectionLabel).setEnabled(false));
+                items.add(SettingCell.Factory.ofCodex(62, 0, 0, 0, "版本", getVersionName()).setEnabled(false));
+                items.add(UItem.asShadow("本地缓存只保存会话列表、额度与已读正文，退出登录时清除。"));
+                return;
+            }
+            if (codexSubpage("codexArrangement")) {
+                com.butang.codextop.DialogArrangement.Settings arrangement = com.butang.codextop.CodexRuntime.arrangementSettings();
+                items.add(UItem.asHeader("排列方式"));
+                items.add(UItem.asRadio(50, "按项目").setChecked(!arrangement.byTime));
+                items.add(UItem.asRadio(51, "按时间").setChecked(arrangement.byTime));
+                if (!arrangement.byTime) {
+                    items.add(UItem.asShadow(null));
+                    items.add(UItem.asHeader("按项目"));
+                    items.add(UItem.asCheck(52, "多台电脑先分电脑").setChecked(arrangement.byMachine));
+                    items.add(UItem.asCheck(53, "已结束折叠").setChecked(arrangement.collapseFinished));
+                }
+                items.add(UItem.asShadow(null));
+                items.add(UItem.asHeader("通用"));
+                items.add(UItem.asCheck(54, "需要你处理置顶").setChecked(arrangement.pinPending));
+                items.add(SettingCell.Factory.ofCodex(6, 0, 0, 0, "最近会话条数",
+                        com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+                items.add(UItem.asShadow("待审批、待回答和出错的会话固定在最上面。"));
+                return;
+            }
+            // D-83 根页：账号行、额度、设置分组、退出登录置底。
+            // 已连接绿点，其余灰点；文字沿用原连接状态。
+            android.text.SpannableString connection = new android.text.SpannableString("● " + account.connectionLabel);
+            connection.setSpan(new android.text.style.ForegroundColorSpan("服务器已连接".equals(account.connectionLabel) ? 0xFF2EAD5B
+                    : Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourceProvider)), 0, 1, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            items.add(SettingCell.Factory.ofCodex(40, 0, 0, 0, loginName, connection));
+            fillCodexUsageItems(items);
+            items.add(UItem.asShadow(null));
+            items.add(UItem.asHeader("设置"));
+            com.butang.codextop.DialogArrangement.Settings arrangement = com.butang.codextop.CodexRuntime.arrangementSettings();
+            items.add(SettingCell.Factory.ofCodex(41, 0, 0, 0, "会话排列", arrangement.byTime ? "按时间" : "按项目"));
             items.add(SettingCell.Factory.ofCodex(34, 0, 0, 0, "外观", Theme.getCodexPixelAppearanceLabel()));
             com.butang.codextop.CodexAppUpdater.Snapshot update = com.butang.codextop.CodexAppUpdater.getInstance().getSnapshot();
             items.add(SettingCell.Factory.ofCodex(35, 0, 0, 0, update.title, update.detail));
-            items.add(SettingCell.Factory.ofCodex(6, 0, 0, 0, "最近会话条数",
-                    com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
+            items.add(SettingCell.Factory.ofCodex(42, 0, 0, 0, "连接与诊断", "服务地址、版本"));
+            items.add(UItem.asShadow(null));
+            items.add(UItem.asButton(43, "退出登录").red());
             items.add(UItem.asShadow(null));
             return;
         }
@@ -1279,6 +1327,25 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                         presentFragment(new SettingsActivity(child));
                     }
                 }
+                return;
+            }
+            if (codexSubpage("codexArrangement") && item.id >= 50 && item.id <= 54) {
+                com.butang.codextop.DialogArrangement.Settings a = com.butang.codextop.CodexRuntime.arrangementSettings();
+                boolean byTime = item.id == 50 ? false : item.id == 51 ? true : a.byTime;
+                com.butang.codextop.CodexRuntime.setArrangementSettings(currentAccount, new com.butang.codextop.DialogArrangement.Settings(
+                        byTime, item.id == 52 ? !a.byMachine : a.byMachine, item.id == 53 ? !a.collapseFinished : a.collapseFinished,
+                        item.id == 54 ? !a.pinPending : a.pinPending));
+                listView.adapter.update(true);
+                return;
+            }
+            if (item.id == 40 || item.id == 41 || item.id == 42) {
+                Bundle child = new Bundle();
+                child.putBoolean(item.id == 40 ? "codexAccount" : item.id == 41 ? "codexArrangement" : "codexDiagnostics", true);
+                presentFragment(new SettingsActivity(child));
+                return;
+            }
+            if (item.id == 43) {
+                showDialog(LogoutActivity.makeLogOutDialog(getParentActivity(), currentAccount));
                 return;
             }
             if (item.id == 25) {
@@ -2146,6 +2213,16 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             secondaryViews.clear();
             inkViews.clear();
             stale = state.stale;
+            // D-83：过期用单独黄色提示条，采集时间写在卡片底部一次；采集账号只在额度详情页显示。
+            if (state.stale) {
+                TextView warning = new TextView(getContext());
+                warning.setText("数据已过期 · 采集于 " + state.fetched);
+                warning.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                warning.setTextColor(0xFF8A5A00);
+                warning.setPadding(dp(10), dp(6), dp(10), dp(6));
+                warning.setBackground(Theme.createRoundRectDrawable(dp(6), 0xFFFFF1C2));
+                addView(warning, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 0, 0, 8));
+            }
             for (int i = 0; i < state.meters.size(); i++) {
                 MeterLine line = state.meters.get(i);
                 addText(line.label + " · " + line.window, 13, false, false);
@@ -2158,18 +2235,17 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 scale.hideFill = line.hideFill;
                 scales.add(scale);
                 addView(scale, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 4, 0, 6, 0, 6));
-                addText("重置时间：" + line.reset, 13, false, false);
-                addText((state.stale ? "采集时间（已过期）：" : "采集时间：") + state.fetched, 15, false, true);
+                addText(line.reset == null ? "重置时间未返回" : line.reset + " 重置", 13, false, false);
                 if (i < state.meters.size() - 1) {
                     View gap = new View(getContext());
                     addView(gap, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 8));
                 }
             }
-            if (state.meters.isEmpty()) {
-                addText((state.stale ? "采集时间（已过期）：" : "采集时间：") + state.fetched, 15, false, true);
+            if (!state.stale) addText("采集于 " + state.fetched, 13, false, false);
+            if (state.account != null) {
+                addText("采集账号", 13, false, false);
+                addText(state.account, 15, false, true);
             }
-            addText("采集账号", 13, false, false);
-            addText(state.account, 15, false, true);
             updateColors();
         }
 
@@ -2249,7 +2325,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         private final Theme.ResourcesProvider resourcesProvider;
         private final View edge;
         final MonitorView monitor;
-        private final TextView nameView, statusView, openView;
+        private final TextView nameView, statusView, openView, toolView, projectView;
         private final Paint cardFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint cardStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final android.graphics.Path cardPath = new android.graphics.Path();
@@ -2277,23 +2353,26 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             this.resourcesProvider = resourcesProvider;
             setOrientation(HORIZONTAL);
             // 外16/6与内16/16合并，整行仍只有原列表点击目标。
-            setPadding(dp(32), dp(22), dp(32), dp(22));
+            setPadding(dp(32), dp(18), dp(32), dp(18));
             setWillNotDraw(false);
             cardStrokePaint.setStyle(Paint.Style.STROKE);
             edge = new View(context);
             monitor = new MonitorView(context);
             LinearLayout text = new LinearLayout(context);
             text.setOrientation(VERTICAL);
-            nameView = line(context, 18);
+            nameView = line(context, 17);
             statusView = line(context, 13);
+            toolView = line(context, 14);
+            projectView = line(context, 13);
             openView = line(context, 13);
-            openView.setText("查看项目 →");
-            openView.setGravity(Gravity.END);
+            openView.setVisibility(GONE);
+            // D-83：电脑名、在线状态；每种工具一行数量；下附项目名。整卡可点，不再单独写“查看项目”。
             text.addView(nameView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-            text.addView(statusView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 4, 0, 0));
-            text.addView(openView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
+            text.addView(statusView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+            text.addView(toolView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 10, 0, 0));
+            text.addView(projectView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 4, 0, 0));
             addView(edge, LayoutHelper.createLinear(2, 28, Gravity.CENTER_VERTICAL, 0, 0, 10, 0));
-            addView(monitor, LayoutHelper.createLinear(48, 48, Gravity.CENTER_VERTICAL, 0, 0, 16, 0));
+            addView(monitor, LayoutHelper.createLinear(32, 32, Gravity.TOP, 0, 2, 14, 0));
             addView(text, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, Gravity.CENTER_VERTICAL, 0, 0, 0, 0));
             updateColors();
         }
@@ -2306,8 +2385,18 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         }
 
         public void bind(String name, String status) {
+            bind(name, status, null, null, false);
+        }
+
+        public void bind(String name, String status, String tools, String projects, boolean offline) {
             nameView.setText(name);
             statusView.setText(status);
+            toolView.setText(tools);
+            toolView.setVisibility(TextUtils.isEmpty(tools) ? GONE : VISIBLE);
+            projectView.setText(projects);
+            projectView.setVisibility(TextUtils.isEmpty(projects) ? GONE : VISIBLE);
+            // 离线整卡灰显。
+            setAlpha(offline ? 0.55f : 1f);
         }
 
         @Override
@@ -2317,15 +2406,16 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             cardStyleId = Theme.getCodexPixelStyle().id;
             setBackgroundColor(0);
             cardFillPaint.setColor(Theme.getColor(Theme.key_dialogBackground, resourcesProvider));
-            cardStrokePaint.setColor(cardStyleId == 6 ? accent : cardStyleId == 4 ? ink
-                    : Theme.getColor(Theme.key_divider, resourcesProvider));
+            cardStrokePaint.setColor(Theme.getColor(Theme.key_divider, resourcesProvider));
             cardStrokePaint.setStrokeWidth(dp(1));
             edge.setBackgroundColor(accent);
-            edge.setVisibility(cardStyleId == 3 ? VISIBLE : GONE);
+            edge.setVisibility(GONE);
             monitor.color = accent;
             monitor.invalidate();
             nameView.setTextColor(ink);
             statusView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourcesProvider));
+            toolView.setTextColor(ink);
+            projectView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourcesProvider));
             openView.setTextColor(accent);
             rebuildCardPath(getWidth(), getHeight());
             invalidate();
@@ -2344,27 +2434,8 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             float left = dp(16) + inset, top = dp(6) + inset;
             float right = width - dp(16) - inset, bottom = height - dp(6) - inset;
             if (right <= left || bottom <= top) return;
-            if (cardStyleId == 2 || cardStyleId == 4) {
-                float cut = Math.min(dp(8), Math.min(right - left, bottom - top) / 2f);
-                cardPath.moveTo(left, top);
-                if (cardStyleId == 4) {
-                    cardPath.lineTo(right - cut, top);
-                    cardPath.lineTo(right, top + cut);
-                } else {
-                    cardPath.lineTo(right, top);
-                }
-                if (cardStyleId == 2) {
-                    cardPath.lineTo(right, bottom - cut);
-                    cardPath.lineTo(right - cut, bottom);
-                } else {
-                    cardPath.lineTo(right, bottom);
-                }
-                cardPath.lineTo(left, bottom);
-                cardPath.close();
-            } else {
-                float radius = dp(cardStyleId == 3 ? 8 : cardStyleId == 1 ? 6 : 4);
-                cardPath.addRoundRect(left, top, right, bottom, radius, radius, android.graphics.Path.Direction.CW);
-            }
+            // D-83f：卡片统一 12dp 圆角，不再按主题画切角。
+            cardPath.addRoundRect(left, top, right, bottom, dp(12), dp(12), android.graphics.Path.Direction.CW);
         }
 
         @Override
@@ -2378,14 +2449,40 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
             int width = View.MeasureSpec.makeMeasureSpec(View.MeasureSpec.getSize(widthMeasureSpec), View.MeasureSpec.EXACTLY);
             super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
-            if (getMeasuredHeight() < dp(122)) super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(dp(122), View.MeasureSpec.EXACTLY));
+            if (getMeasuredHeight() < dp(96)) super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(dp(96), View.MeasureSpec.EXACTLY));
         }
 
-        /** 连接事实缺失时保持未知，不把缺字段画成离线。 */
+        /** 连接事实缺失时保持未知，不把缺字段画成离线；离线时写服务器给的上次在线时间。 */
         static String statusOf(com.google.gson.JsonObject row) {
             if (row.has("cached") && !row.get("cached").isJsonNull() && row.get("cached").getAsBoolean()) return "状态未更新";
             if (!row.has("active") || row.get("active").isJsonNull()) return "未知";
-            return row.get("active").getAsBoolean() ? "在线" : "离线";
+            if (row.get("active").getAsBoolean()) return "● 在线";
+            long seen = row.has("activeAt") && row.get("activeAt").isJsonPrimitive() ? row.get("activeAt").getAsLong() : -1;
+            return seen > 0 ? "离线 · 上次在线 " + com.butang.codextop.CodexDates.format(seen) : "离线 · 时间未知";
+        }
+
+        static boolean offline(com.google.gson.JsonObject row) {
+            return row.has("active") && row.get("active").isJsonPrimitive() && !row.get("active").getAsBoolean()
+                    && !(row.has("cached") && row.get("cached").isJsonPrimitive() && row.get("cached").getAsBoolean());
+        }
+
+        /** 每种工具一行数量；手机没有该电脑会话时写“—”，不显示 0。离线时数字前加“上次”。 */
+        static String toolsOf(com.google.gson.JsonObject row) {
+            com.butang.codextop.CodexRuntime.ComputerSummary summary = row.has("id")
+                    ? com.butang.codextop.CodexRuntime.computerSummary(row.get("id").getAsString()) : null;
+            if (summary == null) return "Codex  —";
+            String counts = "待处理 " + summary.pending + " · 运行 " + summary.running + " · 出错 " + summary.error + " · 已结束 " + summary.finished;
+            if (summary.unknown > 0) counts += " · 未知 " + summary.unknown;
+            return "Codex  " + (offline(row) ? "上次 " : "") + counts;
+        }
+
+        static String projectsOf(com.google.gson.JsonObject row) {
+            com.butang.codextop.CodexRuntime.ComputerSummary summary = row.has("id")
+                    ? com.butang.codextop.CodexRuntime.computerSummary(row.get("id").getAsString()) : null;
+            if (summary == null || summary.projects.isEmpty()) return null;
+            int shown = Math.min(3, summary.projects.size());
+            String text = TextUtils.join("、", summary.projects.subList(0, shown));
+            return summary.projects.size() > shown ? text + " 等 " + summary.projects.size() + " 个" : text;
         }
 
         public static class Factory extends UItem.UItemFactory<ComputerCell> {
@@ -2396,7 +2493,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
             @Override
             public void bindView(View view, UItem item, boolean divider, UniversalAdapter adapter, UniversalRecyclerView listView) {
-                ((ComputerCell) view).bind(item.text == null ? "" : item.text.toString(), item.subtext == null ? "" : item.subtext.toString());
+                com.google.gson.JsonObject row = item.object instanceof com.google.gson.JsonObject ? (com.google.gson.JsonObject) item.object : new com.google.gson.JsonObject();
+                ((ComputerCell) view).bind(item.text == null ? "" : item.text.toString(), item.subtext == null ? "" : item.subtext.toString(),
+                        toolsOf(row), projectsOf(row), offline(row));
             }
             public static UItem of(com.google.gson.JsonObject row) {
                 UItem item = UItem.ofFactory(Factory.class);
@@ -2414,6 +2513,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             @Override
             public boolean contentsEquals(UItem a, UItem b) {
                 return equals(a, b) && TextUtils.equals(a.text, b.text) && TextUtils.equals(a.subtext, b.subtext)
+                        && a.object instanceof com.google.gson.JsonObject && b.object instanceof com.google.gson.JsonObject
+                        && TextUtils.equals(toolsOf((com.google.gson.JsonObject) a.object), toolsOf((com.google.gson.JsonObject) b.object))
+                        && TextUtils.equals(projectsOf((com.google.gson.JsonObject) a.object), projectsOf((com.google.gson.JsonObject) b.object))
                         && TextUtils.equals(text(a, "name"), text(b, "name"))
                         && java.util.Objects.equals(flag(a, "active"), flag(b, "active"))
                         && java.util.Objects.equals(flag(a, "cached"), flag(b, "cached"));
@@ -3145,7 +3247,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     /** 电脑与额度子页只保留返回，不带入根设置菜单。 */
     private void checkUi_menuItems() {
-        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && (codexBrowser() || codexQuota() || codexAppearance()) ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
+        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && !codexMyRoot() ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
         FragmentFloatingButton.setAnimatedVisibility(actionBar.getBackButton(), lerp(hasMainTabs ? 0f : 1f, 1f, animatorSearchPageVisible.getFloatValue()));
     }
 

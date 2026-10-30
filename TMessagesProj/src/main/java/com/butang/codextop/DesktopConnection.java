@@ -79,6 +79,10 @@ public final class DesktopConnection implements AutoCloseable {
             row.addProperty("id", machine.get("id").getAsString());
             row.addProperty("name", name);
             row.addProperty("active", machine.has("active") && machine.get("active").getAsBoolean());
+            // 服务器的最后在线时刻，供电脑页显示“上次在线”；缺失时不填，不估算。
+            if (machine.has("activeAt") && machine.get("activeAt").isJsonPrimitive()
+                    && machine.get("activeAt").getAsJsonPrimitive().isNumber())
+                row.addProperty("activeAt", machine.get("activeAt").getAsLong());
             result.add(row);
         }
         return result;

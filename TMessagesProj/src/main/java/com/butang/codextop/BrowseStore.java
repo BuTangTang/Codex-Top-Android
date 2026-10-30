@@ -115,6 +115,8 @@ public final class BrowseStore {
             if (!row.get(flag).isJsonPrimitive() || !row.getAsJsonPrimitive(flag).isBoolean())
                 throw new IOException("浏览状态格式无效");
             clean.addProperty(flag, row.get(flag).getAsBoolean());
+            if ("computers".equals(kind) && row.has("activeAt") && row.get("activeAt").isJsonPrimitive()
+                    && row.getAsJsonPrimitive("activeAt").isNumber()) clean.addProperty("activeAt", row.get("activeAt").getAsLong());
             if (!"computers".equals(kind)) {
                 JsonArray roots = new JsonArray();
                 for (JsonElement value : row.getAsJsonArray("rootPaths")) {

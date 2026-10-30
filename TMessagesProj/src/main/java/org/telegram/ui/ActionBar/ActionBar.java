@@ -238,11 +238,6 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
 
     /** 根页静态图形与字体几何；只在测量和主题刷新时准备，绘制不查状态或分配对象。 */
     private static final class CodexRootHeader {
-        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Path block = new Path();
-        private final String pageNumber;
         private final String fixedTitle;
         private int styleId;
         private int bodyHeight;
@@ -251,55 +246,28 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         private int titleLeft;
         private int blockRight;
         private boolean rtl;
-        private boolean drawBrand;
-        private float brandWidth;
-        private float numberWidth;
-        private float brandBaseline;
         private int titleColor;
-        private int titleOnAccent;
 
-        /** 保存真实页序和标题；数字仅表示会话、电脑、我的三个固定页码。 */
+        /** 保存三个固定根页的标题。 */
         private CodexRootHeader(int page) {
-            pageNumber = page == 1 ? "01" : page == 2 ? "02" : "03";
             fixedTitle = page == 1 ? "会话" : page == 2 ? "电脑" : "我的";
-            stroke.setStyle(Paint.Style.STROKE);
-            label.setTypeface(AndroidUtilities.bold());
         }
 
         /** 缓存已应用样式；不保存偏好，既有系统明暗切换仍由 Theme 管理。 */
         private void updateStyle(com.butang.codextop.CodexPixelPalette.Style style) {
             styleId = style.id;
-            fill.setColor(style.accentFill);
-            stroke.setColor(styleId == 4 ? style.ink : style.accentText);
-            stroke.setStrokeWidth(dp(styleId == 4 ? 1.1f : 1f));
-            label.setColor(style.secondary);
-            label.setTextSize(dp(11));
-            brandWidth = label.measureText("Codex Top");
-            numberWidth = label.measureText(pageNumber);
             titleColor = style.ink;
-            titleOnAccent = style.onAccentFill;
             bodyHeight = Math.max(bodyHeight, dp(minimumBodyDp()));
         }
 
-        /** 对照参考图保留各自标题区高度；更大字体实际测量后可以增长。 */
+        /** D-83：各主题统一普通标题区高度；更大字体实际测量后可以增长。 */
         private int minimumBodyDp() {
-            switch (styleId) {
-                case 2: return 108;
-                case 4: return 88;
-                case 6: return 72;
-                default: return 76;
-            }
+            return 56;
         }
 
-        /** 参考图的字号层级；这里只作用于两个字的根页标题。 */
+        /** D-83：普通字号标题，不再按主题放大。 */
         private int titleSizeDp() {
-            switch (styleId) {
-                case 2: return 42;
-                case 3: return 28;
-                case 4: return 34;
-                case 6: return 28;
-                default: return 30;
-            }
+            return 22;
         }
 
         /** 每轮测量先回到样式基准，再合并两个原标题视图的高度，避免覆盖动画使占位缩小。 */
@@ -313,14 +281,14 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
                                   int fullWidth, int menuWidth, float fontScale, boolean isRtl) {
             width = fullWidth;
             rtl = isRtl;
-            int indent = dp(styleId == 2 ? 36 : styleId == 3 ? 26 : styleId == 4 ? 28 : 18);
+            int indent = dp(16);
             titleLeft = Math.max(originalLeft, indent);
             int titleWidth = Math.max(0, availableWidth - (titleLeft - originalLeft));
             safeRight = Math.max(titleLeft, fullWidth - menuWidth - dp(16));
             boolean rootText = TextUtils.equals(fixedTitle, title.getText());
             int size = Math.max(1, Math.round(dp(rootText ? titleSizeDp() : 20) * Math.max(1f, fontScale)));
             title.setTextSizePx(size);
-            title.setTextColor(styleId == 3 || styleId == 4 ? titleOnAccent : titleColor);
+            title.setTextColor(titleColor);
             // 原连接状态等覆盖标题仍按单行省略；固定的两字页名才按安全宽度收缩。
             if (rootText && titleWidth > 0) {
                 float textWidth = title.getTextPaint().measureText(fixedTitle);
@@ -329,27 +297,12 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
             title.setGravity((rtl ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL);
             title.measure(MeasureSpec.makeMeasureSpec(titleWidth, MeasureSpec.AT_MOST),
                     MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
-            int numberHeight = dp(styleId == 2 ? 26 : 0);
-            bodyHeight = Math.max(bodyHeight, title.getTextHeight() + numberHeight + Math.max(dp(24), title.getPaddingTop() * 2));
+            bodyHeight = Math.max(bodyHeight, title.getTextHeight() + Math.max(dp(24), title.getPaddingTop() * 2));
             blockRight = Math.max(blockRight, Math.min(safeRight, Math.max(titleLeft + title.getTextWidth() + dp(24), dp(styleId == 4 ? 144 : 156))));
         }
 
-        /** 将本轮真实文字尺寸准备成静态路径；绘制阶段只消费缓存。 */
+        /** D-83：页头只有普通标题，不画产品字样、竖条或强调色色块。 */
         private void finishMeasure() {
-            drawBrand = (styleId == 2 || styleId == 3 || styleId == 4)
-                    && safeRight - blockRight >= brandWidth + dp(16);
-            brandBaseline = (bodyHeight - label.ascent() - label.descent()) / 2f;
-            block.reset();
-            if (styleId == 3 || styleId == 4) {
-                float cut = dp(styleId == 3 ? 24 : 12);
-                float left = dp(12), top = dp(12), bottom = bodyHeight - dp(12);
-                block.moveTo(left, top);
-                block.lineTo(blockRight - cut, top);
-                block.lineTo(blockRight, styleId == 3 ? top : top + cut);
-                block.lineTo(styleId == 3 ? blockRight - cut : blockRight, bottom);
-                block.lineTo(left, bottom);
-                block.close();
-            }
         }
 
         /** 按真实文本宽度镜像标题；菜单继续使用原位置和命中范围。 */
@@ -357,42 +310,13 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
             return rtl ? dp(12) + safeRight - titleLeft - measuredWidth : titleLeft;
         }
 
-        /** 页码在大标题上方占独立空间，其余样式在标题区内垂直居中。 */
+        /** 标题在标题区内垂直居中。 */
         private int titleY(int textHeight) {
-            int numberHeight = dp(styleId == 2 ? 26 : 0);
-            return numberHeight + (bodyHeight - numberHeight - textHeight) / 2;
+            return (bodyHeight - textHeight) / 2;
         }
 
-        /** 在原 titlesContainer 内绘制，让搜索和多选的原透明度统一隐藏静态装饰。 */
+        /** D-83：标题由原 SimpleTextView 绘制，这里不再画装饰。 */
         private void draw(Canvas canvas, int statusHeight) {
-            canvas.save();
-            canvas.translate(0, statusHeight);
-            if (rtl) {
-                canvas.translate(dp(12) + safeRight, 0);
-                canvas.scale(-1, 1);
-            }
-            if (styleId == 2) {
-                canvas.drawRect(dp(18), dp(14), dp(24), bodyHeight - dp(18), fill);
-            } else if (styleId == 3 || styleId == 4) {
-                canvas.drawPath(block, fill);
-                if (styleId == 4) {
-                    canvas.drawPath(block, stroke);
-                    canvas.drawRect(dp(12), dp(12), safeRight, bodyHeight - dp(12), stroke);
-                    canvas.drawLine(blockRight, dp(24), blockRight, bodyHeight - dp(12), stroke);
-                } else {
-                    canvas.drawLine(safeRight - dp(8), dp(24), safeRight, dp(24), stroke);
-                    canvas.drawLine(safeRight, dp(24), safeRight, dp(44), stroke);
-                    canvas.drawLine(safeRight - dp(8), dp(44), safeRight, dp(44), stroke);
-                }
-            }
-            canvas.restore();
-            // 字符本身不随图形镜像；绘制只消费测量时缓存的几何，不引入提示或统计。
-            if (styleId == 2) {
-                canvas.drawText(pageNumber, rtl ? dp(12) + safeRight - titleLeft - numberWidth : titleLeft, statusHeight + dp(25), label);
-            }
-            if (drawBrand) {
-                canvas.drawText("Codex Top", rtl ? dp(12) : safeRight - brandWidth, statusHeight + brandBaseline, label);
-            }
         }
     }
 

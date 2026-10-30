@@ -19,7 +19,7 @@ import javax.tools.ToolProvider;
  * 第二参数 width/style/search-exit/action-exit/preview/cache/draw-allocation 可执行编译后的行为负例。
  */
 public final class BlueprintHeaderLineTest {
-    private static final String BAR_SHA = "c2fc22b952cb8bce2ac929828a04e651e8e45413bb6450956a0d6fea07eb8468";
+    private static final String BAR_SHA = "d42b8361c189f0780b6787b5c0f58b78b3da884b76ee9cca4112422287ef2358";
     private static final String CHAT_SHA = "5bcc111b20576818e1e3c12173e908ab469e0b1a7bfe87c704468fba63df763b";
     private static final String PREVIEW = "            actionBar.setCodexPlainChatHeaderDividerVisible(codexPlainHeader && !value);\n";
     private static final String REFRESH = "                actionBar.updateColors();\n";

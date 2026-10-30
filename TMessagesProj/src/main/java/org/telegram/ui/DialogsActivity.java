@@ -7997,6 +7997,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 filterId = dialogFilter == null ? 0 : dialogFilter.id;
             }
             Object object = dialogsAdapter.getItem(position);
+            if (object instanceof com.butang.codextop.DialogArrangement.Row) {
+                com.butang.codextop.DialogArrangement.Row row = (com.butang.codextop.DialogArrangement.Row) object;
+                if (!actionBar.isActionModeShowed(null) && (row.type == com.butang.codextop.DialogArrangement.RowType.PROJECT_HEADER
+                        || row.type == com.butang.codextop.DialogArrangement.RowType.FINISHED_FOLD)) {
+                    com.butang.codextop.CodexRuntime.toggleArrangement(currentAccount, row);
+                }
+                return;
+            }
             if (delegate != null && dialogsAdapter.isAllowForwardAsStories() && adapter.getItemViewType(position) == DialogsAdapter.VIEW_TYPE_FORWARD_TO_STORIES_CELL) {
                 delegate.didSelectStories(this);
                 return;
@@ -8402,7 +8410,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     }
 
     private boolean onItemLongClick(RecyclerListView listView, View view, int position, float x, float y, int dialogsType, RecyclerListView.Adapter adapter) {
-        if (getParentActivity() == null || view instanceof DialogsHintCell) {
+        if (getParentActivity() == null || view instanceof DialogsHintCell || view instanceof org.telegram.ui.Cells.CodexGroupCell) {
             return false;
         }
         if (adapter.getItemViewType(position) == DialogsAdapter.VIEW_TYPE_FORWARD_TO_STORIES_CELL) {
@@ -10712,6 +10720,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         } else if (id == NotificationCenter.updateInterfaces) {
             Integer mask = (Integer) args[0];
             updateVisibleRows(mask);
+            // D-83：状态变化可能让会话移入置顶区或“已结束”，分组变了才重排。
+            if ((mask & MessagesController.UPDATE_MASK_STATUS) != 0 && com.butang.codextop.CodexRuntime.enabled()
+                    && viewPages != null && !dialogsListFrozen && com.butang.codextop.CodexRuntime.arrangementChanged()) {
+                for (ViewPage viewPage : viewPages) reloadViewPageDialogs(viewPage, false);
+            }
             if (filterTabsView != null && filterTabsView.getVisibility() == View.VISIBLE && (mask & MessagesController.UPDATE_MASK_READ_DIALOG_MESSAGE) != 0) {
                 filterTabsView.checkTabsCounter();
             }
