@@ -145,6 +145,21 @@ android {
         minSdkVersion 21
         targetSdkVersion 36
 
+        // 仅从显式私有配置文件提取客户端公开标识，绝不使用仓库的 Telegram 项目或服务端私钥。
+        def codexFcm = [:]
+        if (project.hasProperty('CODEX_FIREBASE_CONFIG')) {
+            def config = new groovy.json.JsonSlurper().parse(file(project.property('CODEX_FIREBASE_CONFIG')))
+            if (config.type == 'service_account') throw new GradleException('Server credentials cannot be bundled')
+            def client = config.client.find { it.client_info.android_client_info.package_name == 'com.butang.codextop.nativepreview.beta' }
+            if (client == null || config.project_info.project_id != 'codex-top') throw new GradleException('Wrong Codex Firebase client')
+            codexFcm = [APP_ID: client.client_info.mobilesdk_app_id, PROJECT_ID: config.project_info.project_id,
+                        SENDER_ID: config.project_info.project_number, API_KEY: client.api_key[0].current_key]
+            if (codexFcm.values().any { !(it instanceof String) || it.isEmpty() }) throw new GradleException('Incomplete Codex Firebase client')
+        }
+        ['APP_ID', 'PROJECT_ID', 'SENDER_ID', 'API_KEY'].each { key ->
+            buildConfigField 'String', 'CODEX_FCM_' + key, groovy.json.JsonOutput.toJson(codexFcm[key] ?: '')
+        }
+
         vectorDrawables.generatedDensities = ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi']
 
         multiDexEnabled true
@@ -236,6 +251,16 @@ android {
             buildConfigField "boolean", "BUNDLE", "false"
             buildConfigField "int", "VERSION_NUM", "7"
         }
+    }
+
+    // 产品更新源仅由正式构建注入，普通 Telegram 构建保持关闭。
+    defaultConfig {
+        def codexUpdateUrl = APP_PACKAGE == 'com.butang.codextop.nativepreview'
+                ? (project.findProperty('CODEX_UPDATE_MANIFEST_URL') ?: '').toString() : ''
+        if (codexUpdateUrl && (!codexUpdateUrl.startsWith('https://') || codexUpdateUrl.contains('\n'))) {
+            throw new GradleException('CODEX_UPDATE_MANIFEST_URL must use HTTPS')
+        }
+        buildConfigField 'String', 'CODEX_UPDATE_MANIFEST_URL', groovy.json.JsonOutput.toJson(codexUpdateUrl)
     }
 
     namespace 'org.telegram.messenger'

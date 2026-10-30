@@ -406,7 +406,7 @@ public final class DialogCellCodexSubtitleTest {
             MessageObject message;ArrayList<MessageObject> groupMessages;CharSequence lastMessageString;
             int currentEditDate,lastSendState;boolean lastUnreadState;
             Object currentMessagePaint;Parent parentFragment;
-            boolean isDialogCell,codexCompactLayout,useForceThreeLines;
+            boolean isDialogCell,codexCompactLayout,useForceThreeLines,codexSourceLayoutDirty;
             int messagePaddingStart=72;CheckBox checkBox;UpdateHelper updateHelper=new UpdateHelper();
             String codexStatusLabel;StaticLayout codexStatusLayout;
             int messageWidth,messageLeft,typingLeft,messageNameLeft,buttonLeft,codexStatusLeft,codexStatusRingLeft;

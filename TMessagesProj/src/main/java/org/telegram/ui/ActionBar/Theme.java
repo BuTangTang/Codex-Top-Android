@@ -2222,6 +2222,8 @@ public class Theme {
     private static ThemeInfo currentTheme;
     private static ThemeInfo currentNightTheme;
     private static ThemeInfo currentDayTheme;
+    private static int codexPixelLightStyle = 2;
+    private static int codexPixelDarkStyle = 1;
     private static ThemeInfo defaultTheme;
     private static ThemeInfo previousTheme;
     private static boolean changingWallpaper;
@@ -4059,6 +4061,8 @@ public class Theme {
         SharedPreferences preferences = MessagesController.getGlobalMainSettings();
         try {
             // 在原主题名恢复前迁移一次。自动夜间参数仍由下面的原读取保留，读完后再保存。
+            codexPixelLightStyle = codexPixelStyleForSlot(preferences.getInt("codexPixelLightStyle", 2), false);
+            codexPixelDarkStyle = codexPixelStyleForSlot(preferences.getInt("codexPixelDarkStyle", 1), true);
             String storedTheme = preferences.getString("theme", null);
             ThemeInfo resolvedStoredTheme = storedTheme == null ? null : themesDict.get(storedTheme);
             boolean codexPixelThemesMigrated = commitCodexPixelThemeMigration(
@@ -4466,7 +4470,7 @@ public class Theme {
         if (!codexPackage || (!"Day".equals(themeName) && !"Night".equals(themeName))) {
             return;
         }
-        SparseIntArray palette = dark ? com.butang.codextop.CodexPixelPalette.dark() : com.butang.codextop.CodexPixelPalette.light();
+        SparseIntArray palette = com.butang.codextop.CodexPixelPalette.byStyle(dark ? codexPixelDarkStyle : codexPixelLightStyle, dark);
         for (int index = 0; index < palette.size(); index++) {
             colors.put(palette.keyAt(index), palette.valueAt(index));
         }
@@ -4478,11 +4482,74 @@ public class Theme {
             return null;
         }
         BackgroundDrawableSettings settings = new BackgroundDrawableSettings();
-        settings.wallpaper = new com.butang.codextop.CodexPixelWallpaper(colors.get(key_chat_wallpaper), AndroidUtilities.density);
+        settings.wallpaper = new com.butang.codextop.CodexPixelWallpaper(
+                com.butang.codextop.CodexPixelPalette.metadata("Night".equals(themeName) ? codexPixelDarkStyle : codexPixelLightStyle, "Night".equals(themeName)),
+                AndroidUtilities.density);
         settings.isWallpaperMotion = Boolean.FALSE;
         settings.isPatternWallpaper = Boolean.FALSE;
         settings.isCustomTheme = Boolean.TRUE;
         return settings;
+    }
+
+    /** 当前实际日夜槽的本地样式；不读取账号、会话或网络。 */
+    public static com.butang.codextop.CodexPixelPalette.Style getCodexPixelStyle() {
+        boolean dark = currentTheme != null && currentTheme.isDark();
+        return com.butang.codextop.CodexPixelPalette.metadata(dark ? codexPixelDarkStyle : codexPixelLightStyle, dark);
+    }
+
+    /** 日夜槽不接受相反明暗的合法样式，损坏或旧偏好不会伪装 ThemeInfo 的明暗身份。 */
+    static int codexPixelStyleForSlot(int id, boolean dark) {
+        com.butang.codextop.CodexPixelPalette.Style style = com.butang.codextop.CodexPixelPalette.metadata(id, dark);
+        return style.dark == dark ? style.id : dark ? 1 : 2;
+    }
+
+    /** 设置页显示原系统策略或当前固定样式，不查询服务。 */
+    public static String getCodexPixelAppearanceLabel() {
+        return selectedAutoNightType == AUTO_NIGHT_TYPE_SYSTEM ? "跟随系统" : getCodexPixelStyle().name;
+    }
+
+    /** 0 为跟随系统；其它值固定到相应日夜槽。只在本机保存，禁用原 saveTheme 网络分支。 */
+    public static boolean selectCodexPixelAppearance(int styleId) {
+        if (!com.butang.codextop.CodexRuntime.enabled()) return false;
+        com.butang.codextop.CodexPixelPalette.Style style = com.butang.codextop.CodexPixelPalette.metadata(styleId);
+        if (styleId != 0 && style.id != styleId) return false;
+        ThemeInfo day = themesDict.get("Day");
+        ThemeInfo night = themesDict.get("Night");
+        if (day == null || night == null) return false;
+        int lightStyle = styleId != 0 && !style.dark ? styleId : codexPixelLightStyle;
+        int darkStyle = styleId != 0 && style.dark ? styleId : codexPixelDarkStyle;
+        boolean followSystem = styleId == 0;
+        ThemeInfo fixed = !followSystem && style.dark ? night : day;
+        SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+        String[] keys = {"codexPixelLightStyle", "codexPixelDarkStyle", "theme", "nighttheme", "selectedAutoNightType"};
+        java.util.Map<String, ?> previous = preferences.getAll();
+        boolean saved = preferences.edit().putInt(keys[0], lightStyle).putInt(keys[1], darkStyle)
+                .putString("theme", fixed.getKey()).putString("nighttheme", night.getKey())
+                .putInt("selectedAutoNightType", followSystem ? AUTO_NIGHT_TYPE_SYSTEM : AUTO_NIGHT_TYPE_NONE).commit();
+        if (!saved) {
+            SharedPreferences.Editor rollback = preferences.edit();
+            for (String key : keys) {
+                Object value = previous.get(key);
+                if (value instanceof String) rollback.putString(key, (String) value);
+                else if (value instanceof Integer) rollback.putInt(key, (Integer) value);
+                else rollback.remove(key);
+            }
+            rollback.commit();
+            return false;
+        }
+        codexPixelLightStyle = lightStyle;
+        codexPixelDarkStyle = darkStyle;
+        selectedAutoNightType = followSystem ? AUTO_NIGHT_TYPE_SYSTEM : AUTO_NIGHT_TYPE_NONE;
+        currentDayTheme = fixed;
+        currentNightTheme = night;
+        boolean useNight = followSystem && needSwitchToTheme() == 2;
+        isInNigthMode = useNight;
+        applyTheme(useNight ? night : fixed, false, false, useNight);
+        // 沿原主题宿主刷新所有可见控件与返回页面；仅改色表不会更新已绑定的背景和标题。
+        NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.needSetDayNightTheme,
+                useNight ? night : fixed, (useNight ? night : fixed).isDark(), null, -1);
+        checkAutoNightThemeConditions();
+        return true;
     }
 
     public static void saveAutoNightThemeConfig() {
@@ -5874,7 +5941,8 @@ public class Theme {
             FileLog.e(e);
         }
         BlurSettingsBottomSheet.onThemeApplyed();
-        if (previousTheme == null && save && !switchingNightTheme) {
+        if (previousTheme == null && save && !switchingNightTheme
+                && !(com.butang.codextop.CodexRuntime.enabled() && ("Day".equals(themeInfo.name) || "Night".equals(themeInfo.name)))) {
             MessagesController.getInstance(themeInfo.account).saveTheme(themeInfo, themeInfo.getAccent(false), nightTheme, false);
         }
     }
@@ -5985,7 +6053,8 @@ public class Theme {
                     } catch (Exception e) {
                         FileLog.e(e);
                     }
-                    if (previousTheme == null && save && !switchingNightTheme) {
+                    if (previousTheme == null && save && !switchingNightTheme
+                            && !(com.butang.codextop.CodexRuntime.enabled() && ("Day".equals(themeInfo.name) || "Night".equals(themeInfo.name)))) {
                         MessagesController.getInstance(themeInfo.account).saveTheme(themeInfo, themeInfo.getAccent(false), nightTheme, false);
                     }
                     if (onDone != null) {
@@ -6030,7 +6099,8 @@ public class Theme {
         } catch (Exception e) {
             FileLog.e(e);
         }
-        if (previousTheme == null && save && !switchingNightTheme) {
+        if (previousTheme == null && save && !switchingNightTheme
+                && !(com.butang.codextop.CodexRuntime.enabled() && ("Day".equals(themeInfo.name) || "Night".equals(themeInfo.name)))) {
             MessagesController.getInstance(themeInfo.account).saveTheme(themeInfo, themeInfo.getAccent(false), nightTheme, false);
         }
         if (onDone != null) {
@@ -9388,9 +9458,15 @@ public class Theme {
         }
     }
 
+    /** Codex 日夜壁纸仅在主线程同步加载，后台调用沿原队列交付资源与通知。 */
     public static void loadWallpaper(boolean async) {
         if (wallpaper != null) {
             return;
+        }
+        // 主线程同步重建自有小贴图；首次主题初始化在后台时不能直接发 UI 通知。
+        if (com.butang.codextop.CodexRuntime.enabled() && currentTheme != null
+                && ("Day".equals(currentTheme.name) || "Night".equals(currentTheme.name))) {
+            async = Thread.currentThread() != ApplicationLoader.applicationHandler.getLooper().getThread();
         }
         boolean defaultTheme = currentTheme.firstAccentIsDefault && currentTheme.currentAccentId == DEFALT_THEME_ACCENT_ID;
         File wallpaperFile;

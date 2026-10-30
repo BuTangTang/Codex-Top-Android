@@ -245,7 +245,7 @@ public final class RuntimeGoalCacheTest {
                 int[] cleared = {0}, clearFailed = {0};
                 logout(() -> cleared[0]++, error -> clearFailed[0]++);
                 for (int turn = 0; turn < 8 && cleared[0] == 0; turn++) {
-                    Utilities.globalQueue.all(); dialogQueue.all(); sendQueue.all(); approvalQueue.all(); transcriptQueue.all();
+                    Utilities.globalQueue.all(); dialogQueue.all(); sendQueue.all(); uploadQueue.all(); approvalQueue.all(); transcriptQueue.all();
                     historyQueue.all(); statusQueue.all(); prefetchQueue.all(); AndroidUtilities.ui.all();
                 }
                 check(cleared[0] == 1 && clearFailed[0] == 0 && session == null && !statuses.get(21, 40).goal.hasValue(), "成功退出没有清空原展示");
@@ -298,7 +298,10 @@ public final class RuntimeGoalCacheTest {
             static final java.util.List<Object> dialogs = new ArrayList<>();
             static final SessionStatus.Store statuses = new SessionStatus.Store();
             static final org.telegram.messenger.DispatchQueue statusQueue = new org.telegram.messenger.DispatchQueue("status"), dialogQueue = new org.telegram.messenger.DispatchQueue("dialog"), sendQueue = new org.telegram.messenger.DispatchQueue("send"), approvalQueue = new org.telegram.messenger.DispatchQueue("approval"), transcriptQueue = new org.telegram.messenger.DispatchQueue("transcript"), historyQueue = new org.telegram.messenger.DispatchQueue("history"), prefetchQueue = new org.telegram.messenger.DispatchQueue("prefetch");
-            static final Map<Object, Object> historyViews = new HashMap<>(), coldHistoryRequests = new HashMap<>();
+            static final org.telegram.messenger.DispatchQueue uploadQueue = new org.telegram.messenger.DispatchQueue("upload");
+            static final Map<Object, Object> preparedSends = new HashMap<>(), preparedDialogs = new HashMap<>(),
+                    historyViews = new HashMap<>(), coldHistoryRequests = new HashMap<>(), sendJobs = new HashMap<>();
+            static int preparedInFlight;
             static final class WatchConnectionWait { long generation, dialogId; Runnable runnable; }
             static WatchConnectionWait watchConnectionWait;
             static Runnable statusPoll;

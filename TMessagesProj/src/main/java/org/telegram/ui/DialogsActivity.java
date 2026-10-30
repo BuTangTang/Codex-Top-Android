@@ -1624,6 +1624,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         }
     }
 
+    /** 仅根页列表使用扩容标题区；其他会话页保留原静态高度，不带入 extraHeight。 */
+    private int codexListHeaderHeight() {
+        return actionBar.hasCodexRootHeader() ? actionBar.getHeaderContentHeight() : ActionBar.getCurrentActionBarHeight();
+    }
+
     private float getSearchFieldAdditionOffset() {
         return -lerp(dp(4), dp(SEARCH_FIELD_HEIGHT), animatorSearchVisible.getFloatValue());
     }
@@ -2044,6 +2049,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             firstLayout = true;
         }
 
+        /** 用实际标题区计算列表顶部占位，并保留原滚动锚点及搜索、多选留白。 */
         @Override
         protected void onMeasure(int widthSpec, int heightSpec) {
             int t = 0;
@@ -2064,7 +2070,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             }
 
             ignoreLayout = true;
-            t = ActionBar.getCurrentActionBarHeight() + (actionBar.getOccupyStatusBar() ? AndroidUtilities.statusBarHeight : 0);
+            // 列表与搜索读取同一标题区，防止大页头只下移搜索而覆盖第一行。
+            t = codexListHeaderHeight() + (actionBar.getOccupyStatusBar() ? AndroidUtilities.statusBarHeight : 0);
             if (hasStories && !actionModeFullyShowed) {
                 t += dp(DialogStoriesCell.HEIGHT_IN_DP);
             }
@@ -3226,6 +3233,11 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         filterTabsView = null;
         selectedDialogs.clear();
 
+        // 与首页搜索表面相同的严格范围；归档、选择、预置搜索和预览不使用大页头。
+        actionBar.setCodexRootHeader(com.butang.codextop.CodexRuntime.enabled() && hasMainTabs
+                && initialDialogsType == DIALOGS_TYPE_DEFAULT && folderId == 0 && communityId == 0
+                && !onlySelect && searchString == null && !inPreviewMode ? 1 : 0);
+
         maximumVelocity = ViewConfiguration.get(context).getScaledMaximumFlingVelocity();
 
         // 首页公共和列表资源保持；首次进入聊天仍由 ChatActivity 按原入口同步初始化。
@@ -3311,6 +3323,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
                 return super.dispatchTouchEvent(ev);
             }
         };
+        fragmentSearchField.setCodexPageChrome(com.butang.codextop.CodexRuntime.enabled() && hasMainTabs
+                && initialDialogsType == DIALOGS_TYPE_DEFAULT && folderId == 0 && communityId == 0
+                && !onlySelect && searchString == null && !inPreviewMode);
         fragmentSearchField.setPadding(dp(4), dp(4), dp(4), dp(4));
         fragmentSearchField.setPivotX(0);
         fragmentSearchField.setPivotY(0);
@@ -7083,6 +7098,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             tosAccepted = true;
         }
         final NotificationManager notificationManager = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        // Codex只请求任务通知权限，不沿用联系人、存储与来电权限链。
+        if (com.butang.codextop.CodexRuntime.enabled() && hasMainTabs && !onlySelect
+                && folderId == 0 && communityId == 0) {
+            com.butang.codextop.TaskNotifications.requestPermissionIfNeeded(getParentActivity());
+            com.butang.codextop.CodexPushCoordinator.reconcile();
+        }
         // 三个并列权限分支都排除 Codex，避免第一段跳过后落入来电权限引导。
         if (!com.butang.codextop.CodexRuntime.enabled() && tosAccepted && folderId == 0 && communityId == 0 && checkPermission && !onlySelect && Build.VERSION.SDK_INT >= 23) {
             Activity activity = getParentActivity();

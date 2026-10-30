@@ -203,6 +203,15 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     private boolean codexUsageSourcesRequested;
     /** 本页是否已经发起过浏览；先展示缓存不等于已经请求。 */
     private boolean codexBrowseRequested;
+    private String codexAppearanceError;
+    private final Runnable codexUpdateListener = () -> {
+        if (codexMyRoot()) updateCodexBrowserItems();
+    };
+
+    private boolean codexAppearance() {
+        return com.butang.codextop.CodexRuntime.enabled() && getArguments() != null
+                && getArguments().getBoolean("codexAppearance", false);
+    }
 
     /** 保留原额度子页的参数兼容，根页直接沿原设置行展示额度。 */
     private boolean codexQuota() {
@@ -217,7 +226,16 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     /** 仅“我的”根页承载直接额度展示，不改变电脑浏览和普通 Telegram 设置。 */
     private boolean codexMyRoot() {
-        return com.butang.codextop.CodexRuntime.enabled() && !codexBrowser() && !codexQuota();
+        return com.butang.codextop.CodexRuntime.enabled() && !codexBrowser() && !codexQuota() && !codexAppearance();
+    }
+
+    /** 三栏宿主中的电脑和我的才使用大页头，项目、会话、额度及外观子页保持原导航。 */
+    private int codexRootHeaderPage() {
+        if (!com.butang.codextop.CodexRuntime.enabled() || !hasMainTabs) return 0;
+        if (codexBrowser()) {
+            return getArguments().getString("codexMachine") == null && !codexConversations() ? 2 : 0;
+        }
+        return codexMyRoot() ? 3 : 0;
     }
 
     /** 根页使用明确选择的电脑，原详情页继续使用原参数来源。 */
@@ -392,17 +410,18 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     /** 额度优先使用原文字行；窗口与重置紧邻，原采集来源、预计及过期含义完整保留。 */
     private void fillCodexUsageItems(ArrayList<UItem> items) {
-        items.add(UItem.asHeader("Codex 额度"));
-        if (codexUsageMachineId() != null && codexUsage != null && codexUsage.available) {
-            items.add(codexUsageItem());
-        }
         if (codexMyRoot()) {
             items.add(SettingCell.Factory.ofCodex(25, 0, 0, 0, "来源电脑", codexUsageMachine != null
-                    ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel())
+                    ? TextUtils.isEmpty(codexUsageMachineName) ? "电脑" : codexUsageMachineName : codexUsageSourceLabel(),
+                    SettingCell.Factory.CODEX_SUBTITLE_TWO)
                     .setEnabled(!codexBrowseLoading || !codexBrowseRows.isEmpty()));
         } else {
             items.add(SettingCell.Factory.ofCodex(30, 0, 0, 0, "来源电脑",
-                    getArguments().getString("codexMachineName", "电脑")).setEnabled(false));
+                    getArguments().getString("codexMachineName", "电脑"), SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(false));
+        }
+        items.add(UItem.asHeader("Codex 额度"));
+        if (codexUsageMachineId() != null && codexUsage != null && codexUsage.available) {
+            items.add(codexUsageItem());
         }
         if (codexUsageMachineId() == null) {
             items.add(UItem.asShadow("选择来源电脑后显示该电脑的 Codex 额度"));
@@ -410,7 +429,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         }
         String status = codexUsageLoading && (codexUsage == null || !codexUsage.available) ? "正在读取" : codexUsageError != null ? codexUsageError
                 : codexUsage != null && !codexUsage.available ? codexUsage.unavailableMessage() : "按需更新当前电脑的额度";
-        items.add(SettingCell.Factory.ofCodex(33, 0, 0, 0, "刷新额度", status, SettingCell.Factory.CODEX_SUBTITLE_TWO).setEnabled(!codexUsageLoading));
+        if (codexUsage == null || !codexUsage.available) items.add(UItem.asShadow(status));
         items.add(UItem.asShadow("所选电脑采集时的 Codex 账号与额度"));
     }
 
@@ -508,6 +527,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             hasMainTabs = arguments.getBoolean("hasMainTabs", false);
         }
 
+        if (codexMyRoot()) com.butang.codextop.CodexAppUpdater.getInstance().addListener(codexUpdateListener);
         additionNavigationBarHeight = hasMainTabs ? dp(DialogsActivity.MAIN_TABS_HEIGHT_WITH_MARGINS) : 0;
         return super.onFragmentCreate();
     }
@@ -519,10 +539,25 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         super.clearViews();
     }
 
-    /** 原设置列表承载我的及电脑子栈，保留原版间距和返回动作。 */
+    /** 原设置列表承载我的及电脑子栈；根页先测大标题并同步列表安全区。 */
     @Override
     public View createView(Context context) {
+        final boolean rootHeader = codexRootHeaderPage() != 0;
         contentView = new SizeNotifierFrameLayout(context) {
+            /** 首次及尺寸变化先测页头，避免列表占位早于真实字体测量而盖住首行。 */
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                if (rootHeader && listView != null) {
+                    measureChildWithMargins(actionBar, widthMeasureSpec, 0, heightMeasureSpec, 0);
+                    int top = actionBar.getMeasuredHeight() + dp(12);
+                    if (listView.getPaddingTop() != top) {
+                        listView.setPadding(listView.getPaddingLeft(), top, listView.getPaddingRight(), listView.getPaddingBottom());
+                    }
+                }
+                super.onMeasure(widthMeasureSpec, heightMeasureSpec);
+            }
+
+
             @Override
             protected void dispatchDraw(Canvas canvas) {
                 if (Build.VERSION.SDK_INT >= 31 && scrollableViewNoiseSuppressor != null) {
@@ -642,9 +677,11 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
         };
         if (com.butang.codextop.CodexRuntime.enabled()) {
-            actionBar.setTitle(codexQuota() ? "Codex 额度" : codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "我的");
+            actionBar.setTitle(codexAppearance() ? "外观" : codexQuota() ? "Codex 额度" : codexBrowser() ? getArguments().getString("codexTitle", "电脑") : "我的");
+            // 子栈会移除 hasMainTabs；仅电脑列表与我的根页 opt-in，不看标题字符串。
+            actionBar.setCodexRootHeader(codexRootHeaderPage());
             searchItem.setVisibility(View.GONE);
-            otherItem.setVisibility(codexBrowser() || codexQuota() ? View.GONE : View.VISIBLE);
+            otherItem.setVisibility(codexBrowser() || codexQuota() || codexAppearance() ? View.GONE : View.VISIBLE);
         } else {
             search.loadFaqWebPage();
         }
@@ -839,6 +876,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     public void onFragmentDestroy() {
         ++codexUsageGeneration;
         ++codexBrowseGeneration;
+        if (com.butang.codextop.CodexRuntime.enabled()) com.butang.codextop.CodexAppUpdater.getInstance().removeListener(codexUpdateListener);
         super.onFragmentDestroy();
 
         getNotificationCenter().removeObserver(this, NotificationCenter.updateInterfaces);
@@ -891,7 +929,9 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
 
+    /** 原设置换色路径保持；显式根页同时刷新大标题缓存与实际安全区。 */
     public void updateColors() {
+        if (codexRootHeaderPage() != 0) actionBar.updateColors();
         actionBar.setTitleColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
         actionBar.setItemsColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText), false);
         contentView.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundGray));
@@ -957,10 +997,22 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     }
 
     private ArrayList<Integer> accountNumbers = new ArrayList<>();
-    /** “我的”保留额度优先布局；电脑子页按实体复用原语义素材，会话及辅助行不放装饰图标。 */
+    /** 使用实际标题区占位；“我的”保留额度优先布局，电脑子页继续复用原语义素材。 */
     private void fillItems(ArrayList<UItem> items, UniversalAdapter adapter) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
-            items.add(UItem.asSpace(ActionBar.getCurrentActionBarHeight()));
+            // 根页由实测 padding 承载页头，其余 Codex 子页保留原导航占位。
+            items.add(UItem.asSpace(codexRootHeaderPage() != 0 ? 0 : ActionBar.getCurrentActionBarHeight()));
+            if (codexAppearance()) {
+                boolean system = Theme.selectedAutoNightType == Theme.AUTO_NIGHT_TYPE_SYSTEM;
+                items.add(SettingCell.Factory.ofCodex(400, 0, 0, 0, "跟随系统", system ? "使用中 · 自动切换明暗" : "自动切换明暗"));
+                for (com.butang.codextop.CodexPixelPalette.Style style : com.butang.codextop.CodexPixelPalette.styles()) {
+                    boolean active = !system && Theme.getCodexPixelStyle().id == style.id;
+                    items.add(SettingCell.Factory.ofCodex(400 + style.id, 0, 0, 0, style.name,
+                            (active ? "使用中 · " : "") + (style.dark ? "深色" : "浅色")));
+                }
+                if (codexAppearanceError != null) items.add(UItem.asShadow(codexAppearanceError));
+                return;
+            }
             if (codexQuotaDetail()) {
                 fillCodexUsageItems(items);
                 return;
@@ -1003,11 +1055,14 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 return;
             }
             fillCodexUsageItems(items);
+            items.add(UItem.asHeader("账号与外观"));
             com.butang.codextop.CodexRuntime.AccountInfo account = com.butang.codextop.CodexRuntime.accountInfo();
             items.add(AccountMetaCell.Factory.of(
                     TextUtils.isEmpty(account.loginName) ? "账号资料暂不可用" : account.loginName,
-                    account.connectionLabel, account.server,
-                    "已读取的聊天记录保存在本机，联网后自动更新", getVersionName()));
+                    account.connectionLabel, null, null, getVersionName()));
+            items.add(SettingCell.Factory.ofCodex(34, 0, 0, 0, "外观", Theme.getCodexPixelAppearanceLabel()));
+            com.butang.codextop.CodexAppUpdater.Snapshot update = com.butang.codextop.CodexAppUpdater.getInstance().getSnapshot();
+            items.add(SettingCell.Factory.ofCodex(35, 0, 0, 0, update.title, update.detail));
             items.add(SettingCell.Factory.ofCodex(6, 0, 0, 0, "最近会话条数",
                     com.butang.codextop.CodexRuntime.recentDialogLimit() + " 条"));
             items.add(UItem.asShadow(null));
@@ -1176,6 +1231,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
     /** 根页只用原单选框切换额度来源和刷新；电脑子页保留原导航栈。 */
     private void onClick(UItem item, View view, int position, float x, float y) {
         if (com.butang.codextop.CodexRuntime.enabled()) {
+            if (codexAppearance()) {
+                if (item.id >= 400 && item.id <= 406) {
+                    codexAppearanceError = Theme.selectCodexPixelAppearance(item.id - 400) ? null : "外观未能保存，请重试";
+                    listView.adapter.update(false);
+                }
+                return;
+            }
             if (codexQuotaDetail()) {
                 if (item.id == 33) loadCodexUsage();
                 return;
@@ -1221,6 +1283,20 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             }
             if (item.id == 25) {
                 showCodexUsageSources();
+            } else if (item.id == 35) {
+                com.butang.codextop.CodexAppUpdater updater = com.butang.codextop.CodexAppUpdater.getInstance();
+                switch (updater.getSnapshot().state) {
+                    case READY: updater.install(getParentActivity()); break;
+                    case AVAILABLE:
+                    case PAUSED: updater.downloadNow(); break;
+                    case DOWNLOADING:
+                    case CHECKING: break;
+                    default: updater.checkNow(); break;
+                }
+            } else if (item.id == 34) {
+                Bundle appearance = new Bundle();
+                appearance.putBoolean("codexAppearance", true);
+                presentFragment(new SettingsActivity(appearance));
             } else if (item.id == 33) {
                 loadCodexUsage();
             } else if (item.id == 6) {
@@ -1898,6 +1974,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             values[2].setText(server);
             values[3].setText(cache);
             values[4].setText(version);
+            labels[2].setVisibility(server == null ? View.GONE : View.VISIBLE);
+            values[2].setVisibility(server == null ? View.GONE : View.VISIBLE);
+            labels[3].setVisibility(cache == null ? View.GONE : View.VISIBLE);
+            values[3].setVisibility(cache == null ? View.GONE : View.VISIBLE);
         }
 
         @Override
@@ -2079,13 +2159,15 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
                 scales.add(scale);
                 addView(scale, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 4, 0, 6, 0, 6));
                 addText("重置时间：" + line.reset, 13, false, false);
+                addText((state.stale ? "采集时间（已过期）：" : "采集时间：") + state.fetched, 15, false, true);
                 if (i < state.meters.size() - 1) {
                     View gap = new View(getContext());
                     addView(gap, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 8));
                 }
             }
-            addText(state.stale ? "采集时间（已过期）" : "采集时间", 13, false, false);
-            addText(state.fetched, 15, false, true);
+            if (state.meters.isEmpty()) {
+                addText((state.stale ? "采集时间（已过期）：" : "采集时间：") + state.fetched, 15, false, true);
+            }
             addText("采集账号", 13, false, false);
             addText(state.account, 15, false, true);
             updateColors();
@@ -2168,6 +2250,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         private final View edge;
         final MonitorView monitor;
         private final TextView nameView, statusView, openView;
+        private final Paint cardFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint cardStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Path cardPath = new android.graphics.Path();
+        private int cardStyleId;
 
         public static class MonitorView extends View {
             int color;
@@ -2190,7 +2276,10 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             super(context);
             this.resourcesProvider = resourcesProvider;
             setOrientation(HORIZONTAL);
-            setPadding(dp(16), dp(12), dp(16), dp(12));
+            // 外16/6与内16/16合并，整行仍只有原列表点击目标。
+            setPadding(dp(32), dp(22), dp(32), dp(22));
+            setWillNotDraw(false);
+            cardStrokePaint.setStyle(Paint.Style.STROKE);
             edge = new View(context);
             monitor = new MonitorView(context);
             LinearLayout text = new LinearLayout(context);
@@ -2198,12 +2287,13 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
             nameView = line(context, 18);
             statusView = line(context, 13);
             openView = line(context, 13);
-            openView.setText("查看项目");
+            openView.setText("查看项目 →");
+            openView.setGravity(Gravity.END);
             text.addView(nameView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-            text.addView(statusView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
-            text.addView(openView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 2, 0, 0));
+            text.addView(statusView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 4, 0, 0));
+            text.addView(openView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 12, 0, 0));
             addView(edge, LayoutHelper.createLinear(2, 28, Gravity.CENTER_VERTICAL, 0, 0, 10, 0));
-            addView(monitor, LayoutHelper.createLinear(24, 24, Gravity.CENTER_VERTICAL, 0, 0, 12, 0));
+            addView(monitor, LayoutHelper.createLinear(48, 48, Gravity.CENTER_VERTICAL, 0, 0, 16, 0));
             addView(text, LayoutHelper.createLinear(0, LayoutHelper.WRAP_CONTENT, 1f, Gravity.CENTER_VERTICAL, 0, 0, 0, 0));
             updateColors();
         }
@@ -2223,20 +2313,72 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
         @Override
         public void updateColors() {
             int accent = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText, resourcesProvider);
-            setBackgroundColor(Theme.getColor(Theme.key_dialogBackground, resourcesProvider));
+            int ink = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider);
+            cardStyleId = Theme.getCodexPixelStyle().id;
+            setBackgroundColor(0);
+            cardFillPaint.setColor(Theme.getColor(Theme.key_dialogBackground, resourcesProvider));
+            cardStrokePaint.setColor(cardStyleId == 6 ? accent : cardStyleId == 4 ? ink
+                    : Theme.getColor(Theme.key_divider, resourcesProvider));
+            cardStrokePaint.setStrokeWidth(dp(1));
             edge.setBackgroundColor(accent);
+            edge.setVisibility(cardStyleId == 3 ? VISIBLE : GONE);
             monitor.color = accent;
             monitor.invalidate();
-            nameView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider));
+            nameView.setTextColor(ink);
             statusView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText, resourcesProvider));
             openView.setTextColor(accent);
+            rebuildCardPath(getWidth(), getHeight());
+            invalidate();
+        }
+
+        @Override
+        protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            rebuildCardPath(w, h);
+        }
+
+        /** 尺寸或主题变化时复用轮廓，描边完整落在卡片可见边界内。 */
+        private void rebuildCardPath(int width, int height) {
+            cardPath.reset();
+            float inset = dp(1) / 2f;
+            float left = dp(16) + inset, top = dp(6) + inset;
+            float right = width - dp(16) - inset, bottom = height - dp(6) - inset;
+            if (right <= left || bottom <= top) return;
+            if (cardStyleId == 2 || cardStyleId == 4) {
+                float cut = Math.min(dp(8), Math.min(right - left, bottom - top) / 2f);
+                cardPath.moveTo(left, top);
+                if (cardStyleId == 4) {
+                    cardPath.lineTo(right - cut, top);
+                    cardPath.lineTo(right, top + cut);
+                } else {
+                    cardPath.lineTo(right, top);
+                }
+                if (cardStyleId == 2) {
+                    cardPath.lineTo(right, bottom - cut);
+                    cardPath.lineTo(right - cut, bottom);
+                } else {
+                    cardPath.lineTo(right, bottom);
+                }
+                cardPath.lineTo(left, bottom);
+                cardPath.close();
+            } else {
+                float radius = dp(cardStyleId == 3 ? 8 : cardStyleId == 1 ? 6 : 4);
+                cardPath.addRoundRect(left, top, right, bottom, radius, radius, android.graphics.Path.Direction.CW);
+            }
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            canvas.drawPath(cardPath, cardFillPaint);
+            canvas.drawPath(cardPath, cardStrokePaint);
         }
 
         @Override
         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
             int width = View.MeasureSpec.makeMeasureSpec(View.MeasureSpec.getSize(widthMeasureSpec), View.MeasureSpec.EXACTLY);
             super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
-            if (getMeasuredHeight() < dp(80)) super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(dp(80), View.MeasureSpec.EXACTLY));
+            if (getMeasuredHeight() < dp(122)) super.onMeasure(width, View.MeasureSpec.makeMeasureSpec(dp(122), View.MeasureSpec.EXACTLY));
         }
 
         /** 连接事实缺失时保持未知，不把缺字段画成离线。 */
@@ -3003,7 +3145,7 @@ public class SettingsActivity extends BaseFragment implements NotificationCenter
 
     /** 电脑与额度子页只保留返回，不带入根设置菜单。 */
     private void checkUi_menuItems() {
-        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && (codexBrowser() || codexQuota()) ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
+        FragmentFloatingButton.setAnimatedVisibility(otherItem, com.butang.codextop.CodexRuntime.enabled() && (codexBrowser() || codexQuota() || codexAppearance()) ? 0f : 1f - animatorSearchPageVisible.getFloatValue());
         FragmentFloatingButton.setAnimatedVisibility(actionBar.getBackButton(), lerp(hasMainTabs ? 0f : 1f, 1f, animatorSearchPageVisible.getFloatValue()));
     }
 

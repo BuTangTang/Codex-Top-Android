@@ -18,7 +18,7 @@ import javax.tools.ToolProvider;
 public final class StartupTraceTest {
     private static int checks;
 
-    /** 从默认或传入源码验证插桩顺序，再编译执行真实助手与绘制方法；临时产物在结束时清理。 */
+    /** 编译执行真实助手、启动调用片段与绘制方法，再核对插桩顺序；临时产物在结束时清理。 */
     public static void main(String[] args) throws Exception {
         Path appPath = Path.of(args.length > 0 ? args[0]
                 : "TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java");
@@ -28,7 +28,6 @@ public final class StartupTraceTest {
         var launch = StaticJavaParser.parse(launchPath).getClassByName("LaunchActivity").orElseThrow();
         check(app.getMethodsByName("beginCodexStartupTrace").size() == 1
                 && app.getMethodsByName("traceCodexStartup").size() == 1, "missing real startup trace helper");
-        verifyHooks(app, launch);
         StringBuilder actual = new StringBuilder();
         app.getFields().stream().filter(field -> field.getVariables().stream().anyMatch(variable ->
                 variable.getNameAsString().startsWith("codexStartup")
@@ -36,6 +35,10 @@ public final class StartupTraceTest {
                 .forEach(field -> actual.append(field).append('\n'));
         actual.append(method(app, "beginCodexStartupTrace")).append('\n');
         actual.append(method(app, "traceCodexStartup")).append('\n');
+        for (String name : new String[]{"beginCodexStartupSpan", "endCodexStartupSpan", "traceCodexStartupBreakdown"}) {
+            app.getMethodsByName(name).forEach(value -> actual.append(value).append('\n'));
+        }
+        actual.append(launchSlices(method(launch, "onCreate")));
         check(!actual.toString().contains("CodexRuntime") && !actual.toString().contains("FileLog."),
                 "trace must not initialize application logging or Codex runtime");
         var root = launch.findAll(ClassOrInterfaceDeclaration.class).stream()
@@ -67,7 +70,53 @@ public final class StartupTraceTest {
                 for (Path path : paths.sorted(Comparator.reverseOrder()).toArray(Path[]::new)) Files.delete(path);
             }
         }
+        verifyHooks(app, launch);
         System.out.println("PASS startup trace source boundaries: " + checks + " checks");
+    }
+
+    /** 保留真实空栈分支、挂载短路与 SDK 分支；只截去两段之外的业务，边界用合成组件替代。 */
+    private static String launchSlices(MethodDeclaration onCreate) {
+        var body = onCreate.getBody().orElseThrow();
+        var initial = body.getStatements().stream().filter(statement -> statement.isIfStmt()
+                && statement.asIfStmt().getCondition().toString().contains("actionBarLayout.getFragmentStack().isEmpty()"))
+                .findFirst().orElseThrow().asIfStmt().clone();
+        var statements = initial.getThenStmt().asBlockStmt().getStatements();
+        int restoration = 0;
+        while (restoration < statements.size() && !statements.get(restoration).isTryStmt()) restoration++;
+        check(restoration < statements.size(), "real saved-state boundary exists after initial fragment");
+        while (statements.size() > restoration) statements.remove(restoration);
+        var keyReady = body.getStatements().stream().filter(statement -> statement.isIfStmt()
+                && statement.findAll(MethodCallExpr.class).stream().anyMatch(call -> call.getNameAsString().equals("checkKeyReady")))
+                .findFirst().orElseThrow().clone();
+        StringBuilder source = new StringBuilder("static boolean runCreateSlice() {\n");
+        for (var statement : body.getStatements()) {
+            if (statement.isExpressionStmt() && statement.asExpressionStmt().getExpression().isVariableDeclarationExpr()
+                    && statement.asExpressionStmt().getExpression().asVariableDeclarationExpr().getVariables().stream()
+                    .anyMatch(variable -> variable.getNameAsString().startsWith("codexStartup"))) source.append(statement).append('\n');
+        }
+        source.append("BaseFragment freshMainTabsRoot = null;\n").append(localTraceCalls(initial)).append('\n');
+        source.append("SystemClock.now += 11;\n").append(localTraceCalls(keyReady)).append('\n');
+        String summary = "";
+        for (var statement : body.getStatements()) {
+            if (statement.findAll(MethodCallExpr.class).stream().anyMatch(call -> call.getNameAsString().equals("traceCodexStartupBreakdown")
+                    || call.getNameAsString().equals("traceCodexStartup") && call.getArgument(0).toString().equals("\"launch_create_end\""))) {
+                source.append(localTraceCalls(statement.clone())).append('\n');
+                if (statement.findAll(MethodCallExpr.class).stream().anyMatch(call -> call.getNameAsString().equals("traceCodexStartupBreakdown"))) {
+                    summary = localTraceCalls(statement.clone()).toString();
+                }
+            }
+        }
+        return source.append("return freshMainTabsRoot != null;\n}\n")
+                .append("static void emitSummary() {long codexStartupFragmentAddMs=37,codexStartupKeyReadyMs=53;\n")
+                .append(summary).append("\n}\n").toString();
+    }
+
+    /** 提取后仅去掉诊断助手的类限定名，仍执行原方法和原实参，不替换内部诊断实现。 */
+    private static Node localTraceCalls(Node node) {
+        for (var call : node.findAll(MethodCallExpr.class)) {
+            if (call.getScope().map(Object::toString).orElse("").equals("ApplicationLoader")) call.removeScope();
+        }
+        return node;
     }
 
     /** 取得指定类中的目标方法，供源码顺序检查与真实代码提取共同使用。 */
@@ -109,7 +158,13 @@ public final class StartupTraceTest {
                 check(stages.add(call.getArgument(0).asStringLiteralExpr().asString()), "each stage has only one production call site");
             }
         }
-        check(stages.size() == 19 && stages.size() <= 20, "bounded startup stages");
+        check(stages.size() == 19, "all nineteen original stages remain");
+        check(app.getMethodsByName("traceCodexStartupBreakdown").size() == 1 && stages.size() + 1 <= 20,
+                "one fixed breakdown keeps startup output bounded to twenty");
+        order(method(launch, "onCreate"), "beginCodexStartupSpan()", "actionBarLayout.addFragmentToStack(initialFragment)",
+                "endCodexStartupSpan(codexStartupFragmentAddStartedAt)", "FingerprintController.checkKeyReady()",
+                "endCodexStartupSpan(codexStartupKeyReadyStartedAt)", "checkFrameMetrics()",
+                "traceCodexStartupBreakdown(codexStartupFragmentAddMs, codexStartupKeyReadyMs)", "traceCodexStartup(\"launch_create_end\")");
     }
 
     /** 逐项检查指定源码片段的出现顺序，防止插桩移动或改变原初始化边界。 */
@@ -149,9 +204,36 @@ public final class StartupTraceTest {
         public final class StartupTraceProbe {
             static final class BuildConfig { static boolean DEBUG_VERSION; }
             static final class SystemClock {
-                static long now;static int reads;
-                static long elapsedRealtime(){reads++;return now;}
+                static long now;static int reads;static boolean failOnRead;
+                static long elapsedRealtime(){if(failOnRead)throw new AssertionError("disabled clock access");reads++;return now;}
             }
+            static final class Build {
+                static final class VERSION {static int SDK_INT;}
+                static final class VERSION_CODES {static final int M=23;}
+            }
+            static int currentAccount,addCalls,keyCalls,constructorCalls;
+            static boolean activated,addResult;
+            static Throwable addFailure,keyFailure;
+            static ActionBarLayout actionBarLayout,layersActionBarLayout;
+            static class BaseFragment {}
+            static final class MainTabsActivity extends BaseFragment {
+                MainTabsActivity(){constructorCalls++;SystemClock.now+=100;}
+            }
+            static final class UserConfig {
+                static UserConfig getInstance(int account){return new UserConfig();}
+                boolean isClientActivated(){return activated;}
+            }
+            static BaseFragment getClientNotActivatedFragment(){constructorCalls++;SystemClock.now+=100;return new BaseFragment();}
+            static final class ActionBarLayout {
+                final List<BaseFragment> stack=new ArrayList<>();
+                ActionBarLayout(int size){for(int i=0;i<size;i++)stack.add(new BaseFragment());}
+                List<BaseFragment> getFragmentStack(){return stack;}
+                boolean addFragmentToStack(BaseFragment fragment){addCalls++;SystemClock.now+=37;rethrow(addFailure);return addResult;}
+            }
+            static final class FingerprintController {
+                static void checkKeyReady(){keyCalls++;SystemClock.now+=53;rethrow(keyFailure);}
+            }
+            static void rethrow(Throwable error){if(error instanceof Error)throw (Error)error;if(error instanceof RuntimeException)throw (RuntimeException)error;}
             static int rootTraceCalls;
             static final class Canvas {}
             static class DrawBase { protected void dispatchDraw(Canvas canvas){} }
@@ -168,7 +250,78 @@ public final class StartupTraceTest {
                 codexStartupTraceChecked=false;codexStartupTraceEnabled=false;
                 codexStartupTraceStartedAt=0;codexStartupTraceStages=0;
                 BuildConfig.DEBUG_VERSION=debug;android.util.Log.loggable=loggable;
-                android.util.Log.queries=0;android.util.Log.records.clear();SystemClock.now=1000;SystemClock.reads=0;
+                android.util.Log.queries=0;android.util.Log.records.clear();SystemClock.now=1000;SystemClock.reads=0;SystemClock.failOnRead=false;
+                try {StartupTraceProbe.class.getDeclaredField("codexStartupBreakdownRecorded").setBoolean(null,false);}
+                catch(NoSuchFieldException oldSource){}catch(IllegalAccessException error){throw new AssertionError(error);}
+                prepare(0,-1,23,true,true);
+            }
+            static void prepare(int mainSize,int layerSize,int sdk,boolean active,boolean result) {
+                actionBarLayout=new ActionBarLayout(mainSize);layersActionBarLayout=layerSize<0?null:new ActionBarLayout(layerSize);
+                Build.VERSION.SDK_INT=sdk;activated=active;addResult=result;addCalls=keyCalls=constructorCalls=0;addFailure=keyFailure=null;
+            }
+            static String breakdown() {
+                String found=null;
+                for(String line:android.util.Log.records)if(line.contains("stage=launch_create_breakdown ")) {
+                    expect(found==null,"breakdown repeated within one process");found=line;
+                }
+                return found;
+            }
+            static void verifyBreakdown() throws InterruptedException {
+                reset(true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");
+                expect(runCreateSlice(),"successful real add condition retains fresh MainTabs root");
+                expect("CodexStartup|stage=launch_create_breakdown elapsedMs=201 fragmentAddMs=37 keyReadyMs=53".equals(breakdown()),
+                    "actual startup calls must emit separate durations excluding construction and intervening work");
+                expect(addCalls==1&&keyCalls==1&&constructorCalls==1,"original startup calls occur exactly once");
+                int reads=SystemClock.reads,lines=android.util.Log.records.size();SystemClock.failOnRead=true;
+                expect(runCreateSlice(),"recreated activity still performs original work");
+                expect(SystemClock.reads==reads&&android.util.Log.records.size()==lines,"recreation neither times nor repeats summary");
+                reset(true,true);SystemClock.failOnRead=true;
+                expect(runCreateSlice()&&SystemClock.reads==0&&android.util.Log.records.isEmpty(),"no diagnostic clock before Application starts trace");
+                for(boolean active:new boolean[]{false,true})for(boolean added:new boolean[]{false,true}) {
+                    reset(true,true);prepare(0,-1,23,active,added);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");
+                    expect(runCreateSlice()==(active&&added),"original add short circuit/fresh root semantics");
+                    expect(addCalls==1&&keyCalls==1,"false/non-MainTabs add keeps call counts");
+                    expect(breakdown().endsWith("fragmentAddMs=37 keyReadyMs=53"),"false/non-MainTabs return still has elapsed span");
+                }
+                for(int[] stacks:new int[][]{{1,-1},{0,1},{1,0},{0,0}}) {
+                    reset(true,true);prepare(stacks[0],stacks[1],23,true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");
+                    boolean empty=stacks[0]==0&&stacks[1]==0;
+                    expect(runCreateSlice()==empty,"both existing stack guards remain");
+                    expect(addCalls==(empty?1:0)&&constructorCalls==(empty?1:0),"nonempty stack skips construction and add");
+                    expect(breakdown().endsWith("fragmentAddMs="+(empty?37:-1)+" keyReadyMs=53"),"unexecuted add is minus one");
+                }
+                for(int sdk:new int[]{22,23,35}) {
+                    reset(true,true);prepare(0,-1,sdk,true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");runCreateSlice();
+                    expect(keyCalls==(sdk>=23?1:0),"original SDK key guard");
+                    expect(breakdown().endsWith("fragmentAddMs=37 keyReadyMs="+(sdk>=23?53:-1)),"unexecuted key check is minus one");
+                }
+                reset(true,true);prepare(1,-1,22,true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");runCreateSlice();
+                expect(addCalls==0&&keyCalls==0&&breakdown().endsWith("fragmentAddMs=-1 keyReadyMs=-1"),"both skipped spans remain unknown");
+                for(boolean add:new boolean[]{false,true})for(Throwable failure:new Throwable[]{new IllegalStateException("synthetic"),new AssertionError("synthetic")}) {
+                    reset(true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");
+                    if(add)addFailure=failure;else keyFailure=failure;
+                    Throwable caught=null;try{runCreateSlice();}catch(Throwable error){caught=error;}
+                    expect(caught==failure,"original startup exception/error propagates unchanged");
+                    expect(addCalls==1&&keyCalls==(add?0:1),"failed original call does not continue to later work");
+                    expect(breakdown()==null&&android.util.Log.records.size()==1,"failed startup never reports completion");
+                }
+                for(int gate=0;gate<3;gate++) {
+                    reset(gate!=0,gate!=1);SystemClock.failOnRead=true;
+                    beginCodexStartupTrace(gate==2?"org.telegram.messenger":"com.butang.codextop.nativepreview.beta");
+                    expect(runCreateSlice()&&addCalls==1&&keyCalls==1,"disabled gate preserves real startup work");
+                    expect(SystemClock.reads==0&&android.util.Log.records.isEmpty(),"disabled startup slices do not read clock or log");
+                }
+                reset(true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");
+                for(String stage:CODEX_STARTUP_STAGES)traceCodexStartup(stage);runCreateSlice();
+                expect(android.util.Log.records.size()==20,"nineteen original stages plus one fixed summary");
+                expect(breakdown().matches("CodexStartup[|]stage=launch_create_breakdown elapsedMs=[0-9]+ fragmentAddMs=[0-9]+ keyReadyMs=[0-9]+"),
+                    "summary contains only approved fixed names and numbers");
+                reset(true,true);beginCodexStartupTrace("com.butang.codextop.nativepreview.beta");
+                List<Thread> workers=new ArrayList<>();
+                for(int i=0;i<4;i++){Thread worker=new Thread(()->{for(int j=0;j<100;j++)emitSummary();});workers.add(worker);worker.start();}
+                for(Thread worker:workers)worker.join();
+                expect(android.util.Log.records.size()==2&&breakdown()!=null,"concurrent summary callbacks still log only once");
+                expect(SystemClock.reads==3,"duplicate summary callbacks do not read clock");
             }
             static void blocked(boolean debug,boolean loggable,String packageName,int queries) {
                 reset(debug,loggable);beginCodexStartupTrace(packageName);
@@ -178,6 +331,7 @@ public final class StartupTraceTest {
                 expect(android.util.Log.queries==queries,"package/debug must short circuit tag check");
             }
             public static void main(String[] args) throws Exception {
+                verifyBreakdown();
                 reset(true,true);traceCodexStartup("app_native_begin");
                 expect(android.util.Log.records.isEmpty()&&SystemClock.reads==0,"no mark before Application onCreate");
                 blocked(true,false,"com.butang.codextop.nativepreview.beta",1);

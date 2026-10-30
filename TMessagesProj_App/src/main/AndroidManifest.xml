@@ -4,12 +4,18 @@
     android:installLocation="auto">
 
     <application android:name="org.telegram.messenger.ApplicationLoaderImpl" tools:replace="name">
-        <!-- 独立包没有推送项目，不在 Application.onCreate 前启动 Firebase。 -->
+        <!-- 独立包使用显式项目配置，不让资源中的 Telegram 项目提前自动初始化。 -->
         <provider
             android:name="com.google.firebase.provider.FirebaseInitProvider"
             android:authorities="${applicationId}.firebaseinitprovider"
             android:enabled="${firebaseAutoInitEnabled}"
             tools:replace="android:enabled" />
+        <service android:name="com.butang.codextop.CodexFirebaseMessagingService"
+            android:enabled="${codexPushEnabled}" android:exported="false">
+            <intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter>
+        </service>
+        <service android:name="org.telegram.messenger.GcmPushListenerService"
+            android:enabled="${firebaseAutoInitEnabled}" tools:replace="android:enabled" />
         <service
             android:name="org.telegram.messenger.GoogleVoiceClientService"
             android:exported="true"

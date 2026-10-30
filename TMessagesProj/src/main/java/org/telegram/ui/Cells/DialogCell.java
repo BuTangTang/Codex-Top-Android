@@ -348,6 +348,12 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
 
     @Override
     public void updateColors() {
+        if (refreshCodexSource() || codexSourceName != null) {
+            codexSourceLayoutDirty = true;
+            updateLayout = true;
+            requestLayout();
+            invalidate();
+        }
     }
 
     private CommunityArrowDrawable communityArrowDrawable;
@@ -978,6 +984,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
 
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        refreshCodexSource();
         if (emojiStatusView != null) {
             emojiStatusView.measure(
                 MeasureSpec.makeMeasureSpec(dp(22), MeasureSpec.EXACTLY),
@@ -1240,12 +1247,13 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         final boolean compactCodexLayout = shouldUseCompactCodexLayout();
         if (isDialogCell) {
             boolean needUpdate = updateHelper.update();
-            if (!needUpdate && codexCompactLayout == compactCodexLayout
+            if (!needUpdate && !codexSourceLayoutDirty && codexCompactLayout == compactCodexLayout
                     && currentDialogFolderId == 0 && currentDialogCommunityId == 0 && encryptedChat == null) {
                 return;
             }
         }
         codexCompactLayout = compactCodexLayout;
+        codexSourceLayoutDirty = false;
         // 保留公开原间距；仅本次 Codex 文字布局使用紧凑前距，普通行和 RTL 公式不变。
         final int messagePaddingStart = getContentPaddingStart();
         codexStatusLabel = hasCodexStatusAvatar()
@@ -2635,6 +2643,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             drawMention = false;
         }
 
+        // 原草稿及发送者标签保留各自 spans；真实来源只补入原三行中间槽。
+        prepareCodexSourceGlyph(messageNameString);
+        messageNameString = codexSourceLabel(messageNameString);
+
         // 原计数、失败及标记槽已从 messageWidth 扣除，状态只占剩余文字区域，不能盖住它们。
         if (hasCodexStatusAvatar()) {
             com.butang.codextop.SessionStatus.Snapshot status = com.butang.codextop.CodexRuntime.status(currentDialogId);
@@ -2707,7 +2719,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                         messageNameString = s;
                     }
                 }
-                messageNameLayout = StaticLayoutEx.createStaticLayout(messageNameString, Theme.dialogs_messageNamePaint, messageWidth, Layout.Alignment.ALIGN_NORMAL, 1.0f, 0, false, TextUtils.TruncateAt.END, messageWidth, 1);
+                int sourceNameWidth = codexSourceNameLineWidth(messageWidth);
+                messageNameLayout = StaticLayoutEx.createStaticLayout(messageNameString, Theme.dialogs_messageNamePaint, sourceNameWidth, Layout.Alignment.ALIGN_NORMAL, 1.0f, 0, false, TextUtils.TruncateAt.END, sourceNameWidth, 1);
             } catch (Exception e) {
                 FileLog.e(e);
             }
@@ -2737,6 +2750,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         if ((!(useForceThreeLines || SharedConfig.useThreeLinesLayout) || isForumCell()) && hasTags()) {
             codexStatusTop -= dp(isForumCell() ? 10 : 11);
         }
+        applyCodexSourceOrder();
         animatedEmojiStack2 = AnimatedEmojiSpan.update(AnimatedEmojiDrawable.CACHE_TYPE_MESSAGES, this, animatedEmojiStack2, messageNameLayout);
 
 
@@ -2897,8 +2911,9 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 left = messageNameLayout.getLineLeft(0);
                 if (left == 0) {
                     widthpx = Math.ceil(messageNameLayout.getLineWidth(0));
-                    if (widthpx < messageWidth) {
-                        messageNameLeft += (messageWidth - widthpx);
+                    int sourceNameWidth = messageWidth - codexSourceGlyphReserve;
+                    if (widthpx < sourceNameWidth) {
+                        messageNameLeft += (sourceNameWidth - widthpx);
                     }
                 }
             }
@@ -2988,6 +3003,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 statusDrawableLeft = (int) (typingLeft + x2 + dp(3));
             }
         }
+        updateCodexSourceGlyphLayout();
         updateThumbsPosition();
     }
 
@@ -3251,6 +3267,10 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         boolean invalidate = false;
         boolean oldIsForumCell = isForumCell();
         boolean codexPreviewChanged = updateCodexPreview(mask);
+        if (refreshCodexSource()) {
+            requestLayout = rebuildLayout = invalidate = true;
+            requestLayout();
+        }
         drawAvatarSelector = false;
         ttlPeriod = 0;
 
@@ -3371,7 +3391,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
             }
 
             if (mask != 0) {
-                boolean continueUpdate = codexPreviewChanged
+                boolean continueUpdate = codexPreviewChanged || codexSourceLayoutDirty
                         || hasCodexStatusAvatar() && (mask & MessagesController.UPDATE_MASK_STATUS) != 0;
                 if (user != null && !MessagesController.isSupportUser(user) && !user.bot && (mask & MessagesController.UPDATE_MASK_STATUS) != 0) {
                     user = MessagesController.getInstance(currentAccount).getUser(user.id);
@@ -3819,6 +3839,159 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
     private int codexStatusLeft;
     private int codexStatusRingLeft;
     private int codexStatusTop;
+    private String codexSourceName;
+    private boolean codexSourceLayoutDirty;
+    private boolean codexSourceBelow;
+    private boolean codexSourceGlyphWanted;
+    private boolean codexSourceGlyphExclusive;
+    private boolean codexSourceGlyphVisible;
+    private int codexSourceGlyphReserve;
+    private float codexSourceGlyphTextOffsetX;
+    private float codexSourceGlyphLeft;
+    private float codexSourceGlyphTop;
+    private float codexSourceGlyphSize;
+    private final Paint codexSourceGlyphPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private boolean codexNativeForceThreeLines;
+
+    /** 五样式只读取已发布的真实电脑名；空来源和其他原生行保留原布局。 */
+    public static String codexSourceName(long dialogId) {
+        if (!com.butang.codextop.CodexRuntime.enabled()
+                || !com.butang.codextop.CodexRuntime.ownsConversation(dialogId)) {
+            return null;
+        }
+        int style = Theme.getCodexPixelStyle().id;
+        if (style != com.butang.codextop.CodexPixelPalette.STYLE_TERMINAL
+                && style != com.butang.codextop.CodexPixelPalette.STYLE_EDITORIAL
+                && style != com.butang.codextop.CodexPixelPalette.STYLE_INDUSTRIAL
+                && style != com.butang.codextop.CodexPixelPalette.STYLE_LIME
+                && style != com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT) {
+            return null;
+        }
+        String name = com.butang.codextop.CodexRuntime.conversationInfo(dialogId).machineName;
+        return TextUtils.isEmpty(name) || TextUtils.getTrimmedLength(name) == 0 ? null : name;
+    }
+
+    /** 绑定、原更新事件和测量阶段同步；绘制只消费缓存，不查询来源。 */
+    private boolean refreshCodexSource() {
+        String source = isDialogCell && customDialog == null && !isTopic && !isTransitionSupport
+                && !isForumCell() && currentDialogFolderId == 0 && currentDialogCommunityId == 0
+                ? codexSourceName(currentDialogId) : null;
+        int style = Theme.getCodexPixelStyle().id;
+        boolean below = source != null && (style == com.butang.codextop.CodexPixelPalette.STYLE_TERMINAL
+                || style == com.butang.codextop.CodexPixelPalette.STYLE_EDITORIAL
+                || style == com.butang.codextop.CodexPixelPalette.STYLE_LIME);
+        boolean glyphWanted = source != null && (style == com.butang.codextop.CodexPixelPalette.STYLE_TERMINAL
+                || style == com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT);
+        if (TextUtils.equals(codexSourceName, source) && codexSourceBelow == below
+                && codexSourceGlyphWanted == glyphWanted) {
+            return false;
+        }
+        if (codexSourceName == null && source != null) {
+            codexNativeForceThreeLines = useForceThreeLines;
+            useForceThreeLines = true;
+        } else if (source == null) {
+            useForceThreeLines = codexNativeForceThreeLines;
+        }
+        codexSourceName = source;
+        codexSourceBelow = below;
+        codexSourceGlyphWanted = glyphWanted;
+        codexSourceGlyphVisible = false;
+        codexSourceGlyphTextOffsetX = 0;
+        codexSourceLayoutDirty = true;
+        updateLayout = true;
+        return true;
+    }
+
+    private CharSequence codexSourceLabel(CharSequence nativeLabel) {
+        if (codexSourceName == null) {
+            return nativeLabel;
+        }
+        if (TextUtils.isEmpty(nativeLabel)) {
+            return codexSourceName;
+        }
+        if (TextUtils.equals(nativeLabel, codexSourceName)) {
+            return nativeLabel;
+        }
+        return new SpannableStringBuilder(nativeLabel).append(" · ").append(codexSourceName);
+    }
+
+    /** 图形只标识来源独占行，不将原草稿或发送者标签误标为电脑。 */
+    private void prepareCodexSourceGlyph(CharSequence nativeLabel) {
+        codexSourceGlyphExclusive = codexSourceGlyphWanted && TextUtils.isEmpty(nativeLabel);
+        codexSourceGlyphReserve = 0;
+        codexSourceGlyphVisible = false;
+        codexSourceGlyphTextOffsetX = 0;
+    }
+
+    /** 仅缩小原名字行；窄行保留原宽度，摘要、typing及状态列不占图形槽。 */
+    private int codexSourceNameLineWidth(int availableWidth) {
+        int reserve = dp(14);
+        codexSourceGlyphReserve = codexSourceGlyphExclusive && availableWidth >= reserve + dp(12)
+                ? reserve : 0;
+        return availableWidth - codexSourceGlyphReserve;
+    }
+
+    /** 原Bidi补偿完成后缓存相对行坐标；方向由真实段落决定。 */
+    private void updateCodexSourceGlyphLayout() {
+        codexSourceGlyphVisible = false;
+        codexSourceGlyphTextOffsetX = 0;
+        if (codexSourceGlyphReserve == 0 || messageNameLayout == null
+                || messageNameLayout.getLineCount() == 0 || hasTags() || isForumCell()) {
+            return;
+        }
+        boolean rtl = messageNameLayout.getParagraphDirection(0) < 0;
+        codexSourceGlyphSize = dp(10);
+        codexSourceGlyphLeft = rtl
+                ? messageNameLayout.getLineRight(0) + codexSourceGlyphReserve - codexSourceGlyphSize
+                : messageNameLayout.getLineLeft(0);
+        codexSourceGlyphTop = messageNameLayout.getLineBaseline(0)
+                + (Theme.dialogs_messageNamePaint.ascent() + Theme.dialogs_messageNamePaint.descent()) / 2f
+                - codexSourceGlyphSize / 2f;
+        codexSourceGlyphTextOffsetX = rtl ? 0 : codexSourceGlyphReserve;
+        codexSourceGlyphPaint.setStyle(Paint.Style.STROKE);
+        codexSourceGlyphPaint.setStrokeWidth(dp(1));
+        codexSourceGlyphVisible = true;
+    }
+
+    /** 缓存画笔和几何；颜色、透明度沿原名字行，不分配对象或查询来源。 */
+    private void drawCodexSourceGlyph(Canvas canvas) {
+        if (!codexSourceGlyphVisible) {
+            return;
+        }
+        codexSourceGlyphPaint.setColor(Theme.dialogs_messageNamePaint.getColor());
+        codexSourceGlyphPaint.setAlpha(Theme.dialogs_messageNamePaint.getAlpha());
+        float inset = codexSourceGlyphPaint.getStrokeWidth() / 2f;
+        float left = codexSourceGlyphLeft;
+        float top = codexSourceGlyphTop;
+        float size = codexSourceGlyphSize;
+        float center = left + size / 2f;
+        float bottom = top + size - inset;
+        canvas.drawRect(left + inset, top + inset, left + size - inset,
+                top + size * .7f - inset, codexSourceGlyphPaint);
+        canvas.drawLine(center, top + size * .7f, center, bottom, codexSourceGlyphPaint);
+        canvas.drawLine(left + size * .25f, bottom, left + size * .75f, bottom, codexSourceGlyphPaint);
+    }
+
+    /** 01/02/04沿原两行交换摘要和来源；右状态先取原位置，缩略图同步实际位移。 */
+    private void applyCodexSourceOrder() {
+        if (codexSourceName == null || !codexSourceBelow || messageNameLayout == null
+                || hasTags() || isForumCell()) {
+            return;
+        }
+        int nativeMessageTop = messageTop;
+        messageTop = messageNameTop;
+        messageNameTop = nativeMessageTop;
+        int delta = messageTop - nativeMessageTop;
+        for (int i = 0; i < thumbImage.length; ++i) {
+            thumbImage[i].setImageY(thumbImage[i].getImageY() + delta);
+        }
+    }
+
+    private void appendCodexSourceDescription(StringBuilder description) {
+        if (codexSourceName != null) {
+            description.append("来源电脑：").append(codexSourceName).append(". ");
+        }
+    }
 
     /** 仅识别真实 Codex 会话行；普通会话和归档继续使用原头像与布局。 */
     private boolean hasCodexStatusAvatar() {
@@ -4352,6 +4525,8 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
                 }
                 canvas.save();
                 canvas.translate(messageNameLeft, messageNameTop);
+                drawCodexSourceGlyph(canvas);
+                canvas.translate(codexSourceGlyphTextOffsetX, 0);
                 try {
                     SpoilerEffect.layoutDrawMaybe(messageNameLayout, canvas);
                     AnimatedEmojiSpan.drawAnimatedEmojis(canvas, messageNameLayout, animatedEmojiStack2, -.075f, null, 0, 0, 0, 1f, getAdaptiveEmojiColorFilter(1, messageNameLayout.getPaint().getColor()));
@@ -5708,6 +5883,7 @@ public class DialogCell extends BaseCell implements StoriesListPlaceProvider.Ava
         if (hasCodexStatusAvatar()) {
             sb.append(com.butang.codextop.CodexRuntime.status(currentDialogId).label).append(". ");
         }
+        appendCodexSourceDescription(sb);
         if (drawVerified) {
             sb.append(getString(R.string.AccDescrVerified));
             sb.append(". ");

@@ -118,10 +118,11 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
     private MainTabsLayout tabsView;
     private BlurredBackgroundDrawable tabsViewBackground;
     private View fadeView;
+    private Paint codexTabsBackgroundPaint;
 
     public MainTabsActivity() {
         super();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (!com.butang.codextop.CodexRuntime.enabled() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             iBlur3SourceTabGlass = new BlurredBackgroundSourceRenderNode(null);
             iBlur3SourceTabGlass.setupRenderer(new RenderNodeWithHash.Renderer() {
                 @Override
@@ -191,7 +192,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
             iBlur3SourceTabGlass = null;
         }
 
-        iBlur3SourceColor = new BlurredBackgroundSourceColor();
+        iBlur3SourceColor = com.butang.codextop.CodexRuntime.enabled() ? null : new BlurredBackgroundSourceColor();
 
         Bulletin.Delegate delegate = new Bulletin.Delegate() {
             @Override
@@ -302,7 +303,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         }
     }
 
-    /** 沿用原玻璃底栏，Codex 只提供会话、电脑和我的三个固定入口。 */
+    /** Codex沿原三栏导航绘制平面底；其他包保持原玻璃底栏。 */
     @Override
     public View createView(Context context) {
         super.createView(context);
@@ -365,31 +366,19 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         checkUi_callTabVisible(getUserConfig().showCallsTab, false);
 
         selectTab(viewPager.getCurrentPosition(), false);
-
-        iBlur3SourceColor.setColor(getThemedColor(Theme.key_windowBackgroundWhite));
-
-        final ViewPositionWatcher viewPositionWatcher = new ViewPositionWatcher(contentView);
-
-        BlurredBackgroundDrawableViewFactory iBlur3FactoryGlass = new BlurredBackgroundDrawableViewFactory(iBlur3SourceTabGlass != null ? iBlur3SourceTabGlass : iBlur3SourceColor);
-        iBlur3FactoryGlass.setSourceRootView(viewPositionWatcher, contentView);
-        iBlur3FactoryGlass.setLiquidGlassEffectAllowed(LiteMode.isEnabled(LiteMode.FLAG_LIQUID_GLASS));
-
-        tabsViewBackground = iBlur3FactoryGlass.create(tabsView, BlurredBackgroundProviderImpl.mainTabs(resourceProvider));
-        tabsViewBackground.setRadius(dp(DialogsActivity.MAIN_TABS_HEIGHT / 2f));
-        tabsViewBackground.setPadding(dp(DialogsActivity.MAIN_TABS_MARGIN - 0.334f));
-        tabsView.setBackground(tabsViewBackground);
-
-        BlurredBackgroundDrawableViewFactory iBlur3FactoryFade = new BlurredBackgroundDrawableViewFactory(iBlur3SourceColor);
-        iBlur3FactoryFade.setSourceRootView(viewPositionWatcher, contentView);
-
-        fadeView = new View(context);
-        BlurredBackgroundWithFadeDrawable fadeDrawable = new BlurredBackgroundWithFadeDrawable(iBlur3FactoryFade.create(fadeView, null));
-        fadeDrawable.setFadeHeight(dp(60), true);
-        fadeView.setBackground(fadeDrawable);
+        tabsView.setFlatAppearance(codex);
+        createTabsBackground(context);
 
         contentView.addView(fadeView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 0, Gravity.BOTTOM));
 
-        tabsViewWrapper = new FrameLayout(context);
+        tabsViewWrapper = new FrameLayout(context) {
+            @Override
+            protected void onDraw(Canvas canvas) {
+                drawCodexTabsBackground(canvas);
+                super.onDraw(canvas);
+            }
+        };
+        tabsViewWrapper.setWillNotDraw(!codex);
         tabsViewWrapper.setOnClickListener(v -> {});
         tabsViewWrapper.addView(tabsView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, DialogsActivity.MAIN_TABS_HEIGHT_WITH_MARGINS, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
         tabsViewWrapper.setClipToPadding(false);
@@ -406,6 +395,46 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         updateLayout();
         checkUnreadCount(false);
         return contentView;
+    }
+
+    /** 不增加视图；Codex的已有渐隐视图留空隐藏，不建立玻璃或渐隐采样来源。 */
+    private void createTabsBackground(Context context) {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            tabsViewBackground = null;
+            tabsView.setBackground(null);
+            codexTabsBackgroundPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            fadeView = new View(context);
+            fadeView.setVisibility(View.GONE);
+            return;
+        }
+        iBlur3SourceColor.setColor(getThemedColor(Theme.key_windowBackgroundWhite));
+        final ViewPositionWatcher viewPositionWatcher = new ViewPositionWatcher(contentView);
+        BlurredBackgroundDrawableViewFactory iBlur3FactoryGlass = new BlurredBackgroundDrawableViewFactory(iBlur3SourceTabGlass != null ? iBlur3SourceTabGlass : iBlur3SourceColor);
+        iBlur3FactoryGlass.setSourceRootView(viewPositionWatcher, contentView);
+        iBlur3FactoryGlass.setLiquidGlassEffectAllowed(LiteMode.isEnabled(LiteMode.FLAG_LIQUID_GLASS));
+        tabsViewBackground = iBlur3FactoryGlass.create(tabsView, BlurredBackgroundProviderImpl.mainTabs(resourceProvider));
+        tabsViewBackground.setRadius(dp(DialogsActivity.MAIN_TABS_HEIGHT / 2f));
+        tabsViewBackground.setPadding(dp(DialogsActivity.MAIN_TABS_MARGIN - 0.334f));
+        tabsView.setBackground(tabsViewBackground);
+        BlurredBackgroundDrawableViewFactory iBlur3FactoryFade = new BlurredBackgroundDrawableViewFactory(iBlur3SourceColor);
+        iBlur3FactoryFade.setSourceRootView(viewPositionWatcher, contentView);
+        fadeView = new View(context);
+        BlurredBackgroundWithFadeDrawable fadeDrawable = new BlurredBackgroundWithFadeDrawable(iBlur3FactoryFade.create(fadeView, null));
+        fadeDrawable.setFadeHeight(dp(60), true);
+        fadeView.setBackground(fadeDrawable);
+    }
+
+    /** 复用原wrapper的绘制区域和隐藏因子；静止时不调度帧、不分配位图或绘图对象。 */
+    private void drawCodexTabsBackground(Canvas canvas) {
+        if (!com.butang.codextop.CodexRuntime.enabled() || codexTabsBackgroundPaint == null
+                || tabsViewWrapper == null || tabsView == null || tabsView.getVisibility() != View.VISIBLE) return;
+        float factor = MathUtils.clamp(animatorTabsVisible.getFloatValue(), 0f, 1f);
+        if (factor <= 0f) return;
+        com.butang.codextop.CodexPixelPalette.Style style = Theme.getCodexPixelStyle();
+        codexTabsBackgroundPaint.setColor(Theme.multAlpha(style.surface, factor));
+        canvas.drawRect(0, 0, tabsViewWrapper.getWidth(), tabsViewWrapper.getHeight(), codexTabsBackgroundPaint);
+        codexTabsBackgroundPaint.setColor(Theme.multAlpha(style.outlineColor, factor));
+        canvas.drawRect(0, 0, tabsViewWrapper.getWidth(), Math.max(1f, AndroidUtilities.dpf2(style.outlineWidthDp)), codexTabsBackgroundPaint);
     }
 
     private void checkUnreadCount(boolean animated) {
@@ -872,6 +901,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
             GlassTabView tab = tabs[a];
             tab.setSelected(indexToPosition(a) == position, animated);
         }
+        if (com.butang.codextop.CodexRuntime.enabled() && tabsView != null) tabsView.invalidate();
     }
 
     public void setGestureSelectedOverride(float animatedPosition, boolean allow) {
@@ -1074,6 +1104,10 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
     }
 
     private void checkUi_fadeView() {
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            if (fadeView != null) fadeView.setVisibility(View.GONE);
+            return;
+        }
         if (viewPager == null || fadeView == null) {
             return;
         }
@@ -1105,6 +1139,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         tabsView.setEnabled(factor > 1);
         tabsView.setAlpha(factor);
         tabsView.setVisibility(factor > 0 ? View.VISIBLE : View.GONE);
+        if (com.butang.codextop.CodexRuntime.enabled()) tabsViewWrapper.invalidate();
     }
 
     /** Codex 的第三栏固定为我的，不受原通话偏好影响。 */
@@ -1214,12 +1249,12 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
 
     /* * */
 
-    private final @NonNull BlurredBackgroundSourceColor iBlur3SourceColor;
+    private final @Nullable BlurredBackgroundSourceColor iBlur3SourceColor;
     private final @Nullable BlurredBackgroundSourceRenderNode iBlur3SourceTabGlass;
 
     private final RectF fragmentPosition = new RectF();
     private void blur3_invalidateBlur() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || iBlur3SourceTabGlass == null || fragmentView == null) {
+        if (com.butang.codextop.CodexRuntime.enabled() || Build.VERSION.SDK_INT < Build.VERSION_CODES.S || iBlur3SourceTabGlass == null || fragmentView == null) {
             return;
         }
 
@@ -1231,6 +1266,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
     }
 
     private void blur3_updateFadeColors() {
+        if (com.butang.codextop.CodexRuntime.enabled()) return;
         iBlur3SourceColor.setColor(getEstBackgroundColor());
         if (fadeView != null) {
             fadeView.invalidate();
@@ -1249,6 +1285,7 @@ public class MainTabsActivity extends ViewPagerActivity implements NotificationC
         if (tabsView != null) {
             tabsView.invalidate();
         }
+        if (com.butang.codextop.CodexRuntime.enabled() && tabsViewWrapper != null) tabsViewWrapper.invalidate();
         if (tabs != null) {
             for (GlassTabView tabView : tabs) {
                 tabView.updateColorsLottie();

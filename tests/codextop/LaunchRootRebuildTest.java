@@ -138,6 +138,8 @@ public final class LaunchRootRebuildTest {
                 @Override View performCreateView(Object context){super.performCreateView(context);viewPager=new Pager();if(child.fragmentView==null)child.performCreateView(context);return fragmentView;}
             """;
     private static final String STUBS = """
+            // 本专项关闭诊断；真实计时与摘要由 StartupTraceTest 提取执行。
+            static class ApplicationLoader {static long beginCodexStartupSpan(){return -1;}static long endCodexStartupSpan(long startedAt){return -1;}}
             static class AndroidUtilities {static boolean tablet;static boolean isTablet(){return tablet;}static void removeFromParent(View v){if(v.parent!=null)v.parent.removeView(v);}}
             static class SharedConfig {static String passcodeHash="";static boolean appLocked,isWaitingForPasscodeEnter;}
             static class UserConfig {static boolean activated=true;long clientUserId=42;static UserConfig getInstance(int account){return new UserConfig();}boolean isClientActivated(){return activated;}}

@@ -21,14 +21,15 @@ public final class DesktopConnectionRpcTest {
         var unit = StaticJavaParser.parse(source.resolve("DesktopConnection.java"));
         StringBuilder methods = new StringBuilder();
         int extracted = 0;
-        var names=Set.of("rpc","candidates","base","isConnected","failPending","close",
+        var names=Set.of("rpc","rpcAsync","awaitRpc","retireFailedEmitTimer","whenConnected","completeConnectionWaiters","candidates","base","isConnected","failPending","close",
                 "attachmentUploadMaxBytes","clearAttachmentUploadLimit","status","userCodexSource");
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
             if (names.contains(method.getNameAsString())) { methods.append(method).append('\n'); extracted++; }
         }
         for(var field:unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class))
             if(field.getVariables().stream().anyMatch(v->v.getNameAsString().equals("attachmentUploadMaxBytes")
-                    ||v.getNameAsString().equals("attachmentUploadGeneration")))methods.append(field).append('\n');
+                    ||v.getNameAsString().equals("attachmentUploadGeneration")
+                    ||v.getNameAsString().equals("connectionWaiters") || v.getNameAsString().equals("pending")))methods.append(field).append('\n');
         var connected=unit.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class).stream()
                 .filter(m->m.getNameAsString().equals("on")&&m.getArguments().size()==2&&m.getArgument(0).toString().equals("Socket.EVENT_CONNECT"))
                 .findFirst().orElseThrow();
@@ -36,7 +37,9 @@ public final class DesktopConnectionRpcTest {
                 .append(connected.getArgument(1).asLambdaExpr().getBody()).append('\n');
         for (ClassOrInterfaceDeclaration type : unit.findAll(ClassOrInterfaceDeclaration.class)) {
             if (type.getNameAsString().equals("RpcNotDispatchedException")
-                    || type.getNameAsString().equals("SendRejectedException")) {
+                    || type.getNameAsString().equals("SendRejectedException")
+                    || type.getNameAsString().equals("PendingRpc")
+                    || type.getNameAsString().equals("BulkAckTrace")) {
                 methods.append(type).append('\n'); extracted++;
             }
         }
@@ -51,8 +54,23 @@ public final class DesktopConnectionRpcTest {
                     source.resolve("BulkTransferCrypto.java").toString()));
             Path build=temporary.resolve("BuildVars.java"),log=temporary.resolve("Log.java");
             Files.writeString(build,"package org.telegram.messenger; public class BuildVars {public static final boolean DEBUG_VERSION=false;}");
-            Files.writeString(log,"package android.util; public class Log {/** 不输出真实诊断。 */ public static int i(String a,String b){return 0;}}");
+            Files.writeString(log,"package android.util; public class Log {public static final int DEBUG=3; /** 旧场景保持关闭。 */ public static boolean isLoggable(String t,int l){return false;} /** 不输出真实诊断。 */ public static int i(String a,String b){return 0;}}");
             compile.add(build.toString());compile.add(log.toString());
+            // 仅补SEND诊断新增的平台类型，既有RPC场景及断言不变。
+            Path config=temporary.resolve("BuildConfig.java"),app=temporary.resolve("ApplicationLoader.java"),clock=temporary.resolve("SystemClock.java");
+            Files.writeString(config,"package org.telegram.messenger; public class BuildConfig {public static final boolean DEBUG_VERSION=false;}");
+            Files.writeString(app,"package org.telegram.messenger; public class ApplicationLoader {public static Context applicationContext; public static class Context {/** 合成包名。 */ public String getPackageName(){return \"org.telegram.messenger\";}}}");
+            Files.writeString(clock,"package android.os; public class SystemClock {/** 默认关闭路径不读诊断时钟。 */ public static long elapsedRealtime(){throw new AssertionError(\"disabled trace clock\");}}");
+            compile.add(config.toString());compile.add(app.toString());compile.add(clock.toString());
+            // 平台替身与实际生产方法单独用Java 8编译，测试场景自身可使用宿主JDK。
+            Path compatibility=temporary.resolve("java8");Files.createDirectories(compatibility);
+            Path compatibilityProbe=compatibility.resolve("DesktopRpcProbe.java");
+            Files.writeString(compatibilityProbe,FIXTURE+methods+"\n}");
+            var compatibleCompile=new ArrayList<>(compile);
+            compatibleCompile.set(3,compatibility.toString());compatibleCompile.set(4,compatibilityProbe.toString());
+            compatibleCompile.add(0,"8");compatibleCompile.add(0,"--release");
+            if(ToolProvider.getSystemJavaCompiler().run(null,null,null,compatibleCompile.toArray(String[]::new))!=0)
+                throw new AssertionError("真实RPC生产方法不兼容Java 8");
             if (ToolProvider.getSystemJavaCompiler().run(null, null, null, compile.toArray(String[]::new)) != 0)
                 throw new AssertionError("真实RPC夹具编译失败");
             try (var loader = new URLClassLoader(new java.net.URL[]{temporary.toUri().toURL()}, DesktopConnectionRpcTest.class.getClassLoader())) {
@@ -77,14 +95,17 @@ public final class DesktopConnectionRpcTest {
         import java.nio.file.*;
         import java.util.*;
         import java.util.concurrent.*;
+        import java.util.function.BooleanSupplier;
         import org.json.JSONObject;
         public final class DesktopRpcProbe implements AutoCloseable {
-            boolean closed;
+            volatile boolean closed;
             boolean hasConnected;
             String machineId="synthetic-machine";
-            final Set<CompletableFuture<JsonObject>> pending=new HashSet<>();
             final Crypto crypto=new Crypto();
             final Socket socket=new Socket();
+            SocketAckWireTrace wireTrace;
+            /** 旧回归只补新观察边界，原传输断言不变；完整观察在专项执行真实helper。 */
+            static final class SocketAckWireTrace { /** 原ACK边界空桩。 */ void ackEntered(int key){} /** 原派发代次空桩。 */ int emitEntered(int key){return 0;} /** 原emit返回观察空桩。 */ void emitReturned(int key,int generation){} /** 原超时观察空桩。 */ void timedOut(int key,int generation){} }
             static final class Crypto {
                 static final String PREFIX="synthetic-cipher:";
                 int decryptCalls;
@@ -101,6 +122,8 @@ public final class DesktopConnectionRpcTest {
             static abstract class AckWithTimeout {
                 /** 不执行真实计时器，超时由场景明确触发。 */
                 AckWithTimeout(int timeout){if(timeout!=25000)throw new AssertionError("ACK超时契约变化");}
+                /** 不跑真实时钟；本片异步硬期限另由专项明确推进。 */final void schedule(TimerTask task){}
+                /** 不创建真实Timer；保留产品清理调用。 */final void cancelTimer(){}
                 /** 向本次请求交付合成响应。 */
                 public abstract void onSuccess(Object... args);
                 /** 向本次请求交付合成超时。 */
@@ -112,11 +135,13 @@ public final class DesktopConnectionRpcTest {
                 static void exec(Runnable task){Runnable before=beforeRun;beforeRun=null;if(before!=null)before.run();task.run();}
             }
             static final class Socket {
-                boolean connected=true,timeout;
+                volatile boolean connected=true;
+                boolean timeout,noAck;
                 int emitted;
                 Object[] reply;
                 Object[] lateReply;
                 Runnable afterReply;
+                Runnable onEmit;
                 JSONObject request;
                 /** 只读取合成连接状态。 */
                 boolean connected(){return connected;}
@@ -124,6 +149,8 @@ public final class DesktopConnectionRpcTest {
                 void emit(String event,Object[] args,AckWithTimeout ack){
                     if(!"rpc-call".equals(event)||args.length!=1)throw new AssertionError("RPC传输入口变化");
                     emitted++;request=(JSONObject)args[0];
+                    if(onEmit!=null)onEmit.run();
+                    if(noAck)return;
                     if(timeout)ack.onTimeout();else ack.onSuccess(reply);
                     if(lateReply!=null)ack.onSuccess(lateReply);
                     if(afterReply!=null)afterReply.run();
@@ -151,6 +178,13 @@ public final class DesktopConnectionRpcTest {
             }
             /** 非可靠拒绝继续为包装后的未知结果，不自动转换成可重试发送。 */
             static void unknown(Exception error){check(error instanceof ExecutionException,"未知结果被错误解包");}
+            /** 在不同线程的确定闸门处交错断线与派发，不靠睡眠猜顺序。 */
+            static void await(CountDownLatch latch){
+                try{check(latch.await(5,TimeUnit.SECONDS),"合成并发闸门超时");}
+                catch(InterruptedException error){Thread.currentThread().interrupt();throw new AssertionError(error);}
+            }
+            /** 清理合成断线线程，不能让前一场景干扰下一请求。 */
+            static void join(Thread thread)throws Exception{thread.join(5000);check(!thread.isAlive(),"合成断线线程未结束");}
         """;
 
     // 场景描述输入与可观察结果；不在测试里重新实现响应判定算法。
@@ -244,8 +278,13 @@ public final class DesktopConnectionRpcTest {
                 JSONObject authorization=(JSONObject)p.socket.request.get("authorization");
                 check("session.write".equals(authorization.get("kind"))&&"synthetic-session".equals(authorization.get("sessionId")),"原send会话授权改变");
                 unknown(fails(probe("{\\"ok\\":false,\\"errorCode\\":\\"delivery_outcome_unknown\\"}"),send));
-                // 本片只修bulk，锁住既有send字段畸形时的errorCode判断，不扩大普通发送改动。
-                check(fails(probe("{\\"ok\\":\\"false\\",\\"errorCode\\":\\"synthetic_rejected\\"}"),send) instanceof SendRejectedException,"本片改变了既有send拒绝判断");
+                // 缺失或畸形的 ok 不能证明没有提交，errorCode 不能单独解锁重试。
+                for(String body:new String[]{"{\\"errorCode\\":\\"timeout\\"}",
+                        "{\\"ok\\":\\"false\\",\\"errorCode\\":\\"synthetic_rejected\\"}",
+                        "{\\"ok\\":null,\\"errorCode\\":\\"synthetic_rejected\\"}",
+                        "{\\"ok\\":0,\\"errorCode\\":\\"synthetic_rejected\\"}",
+                        "{\\"ok\\":{},\\"errorCode\\":\\"synthetic_rejected\\"}",
+                        "{\\"ok\\":[],\\"errorCode\\":\\"synthetic_rejected\\"}"}) unknown(fails(probe(body),send));
                 check(probe("{\\"ok\\":true,\\"extra\\":1}").rpc(send,params()).get("extra").getAsInt()==1,"原send成功字段改变");
 
                 for(Object[] reply:new Object[][]{new Object[]{},new Object[]{"invalid-envelope"},
@@ -269,6 +308,56 @@ public final class DesktopConnectionRpcTest {
                     EventThread.beforeRun=()->{if(close)beforeEmit.closed=true;else beforeEmit.socket.connected=false;};
                     check(fails(beforeEmit,bulk) instanceof RpcNotDispatchedException&&beforeEmit.socket.emitted==0,"事件队列第二门禁失效");
                 }
+                // 原断线/关闭事件确实调用failPending，不能只改变connected绕过在途完成竞态。
+                for(boolean close:new boolean[]{false,true}) {
+                    DesktopRpcProbe beforeEmit=probe("{}");
+                    EventThread.beforeRun=()->{if(close)beforeEmit.close();else{beforeEmit.socket.connected=false;beforeEmit.failPending();}};
+                    check(fails(beforeEmit,send) instanceof RpcNotDispatchedException&&beforeEmit.socket.emitted==0,"原断线入口在emit前误标未知结果");
+                    DesktopRpcProbe afterEmit=probe("{}");
+                    afterEmit.socket.onEmit=()->{if(close)afterEmit.close();else{afterEmit.socket.connected=false;afterEmit.failPending();}};
+                    Exception dispatched=fails(afterEmit,send);unknown(dispatched);
+                    check(dispatched.getCause() instanceof IOException&&afterEmit.socket.emitted==1,"emit后断线错误解锁重试");
+                    DesktopRpcProbe afterAck=probe("{\\"ok\\":true}");
+                    afterAck.socket.afterReply=()->{if(close)afterAck.close();else afterAck.failPending();};
+                    check(afterAck.rpc(send,params()).get("ok").getAsBoolean()&&afterAck.socket.emitted==1&&afterAck.pending.isEmpty(),"已完成ACK被断线覆盖");
+                }
+                // 等待方已取消的future尚未进入事件线程时，晚执行的派发门必须拒绝emit。
+                DesktopRpcProbe canceled=probe("{}");
+                EventThread.beforeRun=()->canceled.pending.iterator().next().cancel(false);
+                check(fails(canceled,send) instanceof CancellationException&&canceled.socket.emitted==0,"已取消请求晚执行仍emit");
+                // 双线程分别强制断线先胜和派发先胜，两个方向都使用生产future与同步状态。
+                for(boolean close:new boolean[]{false,true}) {
+                    DesktopRpcProbe beforeGate=probe("{}");Thread[] earlier=new Thread[1];CountDownLatch stopped=new CountDownLatch(1);
+                    EventThread.beforeRun=()->{
+                        earlier[0]=new Thread(()->{if(close)beforeGate.close();else beforeGate.failPending();stopped.countDown();},"synthetic-before-dispatch");
+                        earlier[0].start();await(stopped);
+                    };
+                    Exception before=fails(beforeGate,send);join(earlier[0]);
+                    check(before instanceof RpcNotDispatchedException&&beforeGate.socket.emitted==0,"另一线程断线先胜后仍emit");
+                    DesktopRpcProbe pastGate=probe("{}");Thread[] later=new Thread[1];CountDownLatch failed=new CountDownLatch(1);
+                    pastGate.socket.onEmit=()->{
+                        later[0]=new Thread(()->{if(close)pastGate.close();else pastGate.failPending();failed.countDown();},"synthetic-after-dispatch");
+                        later[0].start();await(failed);
+                    };
+                    Exception after=fails(pastGate,send);join(later[0]);unknown(after);
+                    check(after.getCause() instanceof IOException&&pastGate.socket.emitted==1,"派发先胜后被另一线程错误解锁");
+                    System.out.println("RPC_THREAD_ORDER close="+close+" beforeEmitted="+beforeGate.socket.emitted+" before="+before.getClass().getSimpleName()
+                            +" afterEmitted="+pastGate.socket.emitted+" after="+after.getClass().getSimpleName());
+                }
+                // 断线线程与派发线程竞争同一实际门锁；未发出只可为notDispatched，已发出只可为unknown。
+                int notDispatched=0,dispatched=0;
+                for(int attempt=0;attempt<200;attempt++) {
+                    DesktopRpcProbe concurrent=probe("{}");concurrent.socket.noAck=true;
+                    CountDownLatch start=new CountDownLatch(1);Thread[] disconnect=new Thread[1];
+                    EventThread.beforeRun=()->{
+                        disconnect[0]=new Thread(()->{await(start);concurrent.failPending();concurrent.socket.connected=false;},"synthetic-rpc-disconnect");
+                        disconnect[0].start();start.countDown();
+                    };
+                    Exception result=fails(concurrent,send);join(disconnect[0]);
+                    if(concurrent.socket.emitted==0){notDispatched++;check(result instanceof RpcNotDispatchedException,"未派发并发分支仍标未知");}
+                    else{dispatched++;unknown(result);check(result.getCause() instanceof IOException&&concurrent.socket.emitted==1,"已派发并发分支错误解锁");}
+                }
+                System.out.println("RPC_DISPATCH_RACE attempts=200 notDispatched="+notDispatched+" dispatched="+dispatched+" java8=true");
                 System.out.println("DesktopConnectionRpc: 真实列表限额、坏值与机器来源、断开重连迟到清理、bulk失败、超时、原send及未派发语义通过");
             }
         """;

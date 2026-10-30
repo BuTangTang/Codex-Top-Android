@@ -18,7 +18,7 @@ public final class GoalPinnedUiTest {
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
         String source=Files.readString(args.length==0?Path.of("TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java"):Path.of(args[0]));
         StringBuilder methods=new StringBuilder();
-        for(String name:new String[]{"updateCodexGoalPinnedView","hidePinnedMessageView","codexGoalInfo"}) {
+        for(String name:new String[]{"updateCodexGoalPinnedView","hasCodexPendingQuestion","openCodexPinnedEntry","hidePinnedMessageView","codexGoalInfo","codexGoalDuration","codexGoalUpdatedAt"}) {
             String actual=RuntimeGoalStatusTest.method(source,name);
             if(actual!=null)methods.append(StaticJavaParser.parseMethodDeclaration(actual)).append('\n');
             else if(name.equals("updateCodexGoalPinnedView"))methods.append("void updateCodexGoalPinnedView(boolean a){}\n");
@@ -75,6 +75,7 @@ public final class GoalPinnedUiTest {
     private static final String FIXTURE="""
         package com.butang.codextop;
         import com.google.gson.*;
+        import java.util.Calendar;
         public class GoalPinnedProbe {
             long dialog_id=7;int chatMode,nativePinCalls,nativeButtonCalls,nativeListCalls,paddingCalls,infoCalls,previewCalls;
             Object currentEncryptedChat;boolean report,setPinnedTextTranslationX;Bar actionBar=new Bar();
@@ -88,9 +89,12 @@ public final class GoalPinnedUiTest {
             static class Panel {boolean visible;int transitions;void setViewVisible(View v,boolean on,boolean animated){visible=on;transitions++;}}
             static class Bar {boolean selecting,search;boolean isActionModeShowed(){return selecting;}boolean isSearchFieldVisible(){return search;}}
             static class MotionEvent {static final int ACTION_UP=1,ACTION_MOVE=2;int action;MotionEvent(int a){action=a;}int getAction(){return action;}float getY(){return 4;}}
+            // 此入口测试仅替代本地格式器配置；独立详情测试另执行真实FastDateFormat和时区边界。
+            static class LocaleController {static LocaleController getInstance(){return new LocaleController();}java.text.SimpleDateFormat getFormatterStats(){java.text.SimpleDateFormat format=new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm",java.util.Locale.US);format.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));return format;}}
             class TouchBase {public boolean onTouchEvent(MotionEvent e){return true;}}
             boolean isReport(){return report;}void createPinnedMessageView(){pinnedMessageView=new View();pinnedMessageView.setTag(1);}
             void checkListViewPaddings(){paddingCalls++;}void showCodexConversationInfo(){infoCalls++;}
+            void showCodexQuestions(){}
             void finishPreviewFragment(){previewCalls++;}void movePreviewFragment(float dy){previewCalls++;}
             static void check(boolean b,String why){if(!b)throw new AssertionError(why);}
             static SessionStatus.Store store=new SessionStatus.Store();
@@ -109,7 +113,7 @@ public final class GoalPinnedUiTest {
                 check(p.pinnedNameTextView[0].text.equals("目标进行中")&&p.pinnedMessageTextView[0].text.equals("目标👋下一行\\n保持原文"),"目标状态或objective被伪造/截原文");
                 check(old.cancelled&&p.pinnedNextAnimation[0]==null&&p.paddingCalls==1,"残留pin动画或没沿原padding路径");
                 check(p.pinnedListButton.visibility==View.GONE&&p.closePinned.visibility==View.GONE&&p.pinnedProgress.visibility==View.GONE&&p.pinnedMessageButton[0].visibility==View.GONE,"目标误带pin操作");
-                String info=codexGoalInfo(CodexRuntime.value.goal);check(info.contains("Token预算：0")&&info.contains("已用Token：未知")&&info.contains("已用时间（秒）：0")&&info.contains("来源更新时间：0"),"null/零/秒/来源时刻展示失真");
+                String info=codexGoalInfo(CodexRuntime.value.goal);check(info.contains("Token预算：0")&&info.contains("已用Token：未知")&&info.contains("已用时间：0秒")&&info.contains("来源更新时间：1970-01-01 00:00"),"null/零/本地来源时刻展示失真");
                 p.barClick();p.barLongClick();p.closeClick();p.listClick();p.openPinnedMessagesList(false);p.new Touch().onTouchEvent(new MotionEvent(MotionEvent.ACTION_UP));p.new Touch().onTouchEvent(new MotionEvent(MotionEvent.ACTION_MOVE));
                 check(p.infoCalls==1&&p.nativePinCalls==0&&p.nativeListCalls==0&&p.previewCalls==0,"Codex进入真实pin或预览返回路径");
                 p.actionBar.selecting=true;p.updatePinnedMessageView(true,0);check(!p.topPanelLayout.visible&&p.paddingCalls==2,"原多选没有隐藏目标栏");

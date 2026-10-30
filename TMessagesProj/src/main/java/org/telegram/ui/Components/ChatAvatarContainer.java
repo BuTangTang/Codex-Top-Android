@@ -106,6 +106,10 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
 
     private int lastWidth = -1;
     private int largerWidth = -1;
+    private boolean codexPlainTitleLayout;
+    private boolean codexCenteredTitle;
+    private int codexTitleAreaLeft;
+    private int codexTitleAreaWidth;
 
 
     private AnimatorSet titleAnimation;
@@ -749,16 +753,79 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
         subtitleTextView.setTag(subtitle);
     }
 
+    /** 只缓存普通 Codex 顶栏的图示对齐，退出时恢复原副标题边距与缩宽路径。 */
+    public void setCodexHeaderAlignment(boolean enabled, int styleId) {
+        final boolean centered = enabled && (styleId == 1 || styleId == 2 || styleId == 4);
+        if (codexPlainTitleLayout == enabled && codexCenteredTitle == centered) {
+            return;
+        }
+        codexPlainTitleLayout = enabled;
+        codexCenteredTitle = centered;
+        if (subtitleTextView != null) {
+            subtitleTextView.setPadding(0, 0, centered ? 0 : dp(10), 0);
+        }
+        if (enabled) {
+            // 原缩宽副本缺少完整副标题图形；进入图示布局时取消它们，避免旧文字盖住新位置。
+            SimpleTextView titleCopy = titleTextLargerCopyView.getAndSet(null);
+            if (titleCopy != null) {
+                titleCopy.animate().cancel();
+                removeView(titleCopy);
+            }
+            SimpleTextView subtitleCopy = subtitleTextLargerCopyView.getAndSet(null);
+            if (subtitleCopy != null) {
+                subtitleCopy.animate().cancel();
+                removeView(subtitleCopy);
+            }
+        }
+        requestLayout();
+    }
+
+    /** 按实际父中线与两侧保留区取对称宽度，兼容原菜单把右边距扩大到 92dp。 */
+    private void updateCodexTitleArea(int width) {
+        int marginLeft = 0;
+        int parentWidth = width;
+        if (getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) getLayoutParams();
+            marginLeft = params.leftMargin;
+            parentWidth += params.leftMargin + params.rightMargin;
+        }
+        if (getParent() instanceof View && ((View) getParent()).getMeasuredWidth() > 0) {
+            parentWidth = ((View) getParent()).getMeasuredWidth();
+        }
+        final int center = parentWidth / 2 - marginLeft;
+        final int radius = Math.max(0, Math.min(center - dp(8), width - dp(8) - center));
+        codexTitleAreaLeft = center - radius;
+        codexTitleAreaWidth = radius * 2;
+    }
+
+    /** 用原文本布局的真实行宽收紧短行；长行保留左起点与右渐隐，侧图形计入整体宽度。 */
+    private void measureCodexCenteredText(SimpleTextView view, int height) {
+        final int contentWidth = view.getTextWidth() + view.getSideDrawablesSize()
+                + view.getPaddingLeft() + view.getPaddingRight();
+        view.measure(MeasureSpec.makeMeasureSpec(Math.min(codexTitleAreaWidth, Math.max(0, contentWidth)), MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(height, MeasureSpec.AT_MOST));
+    }
+
+    /** 保留原高度和共享测量，仅普通 Codex 居中短行收紧宽度并绕过旧缩宽副本。 */
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         final int width = MeasureSpec.getSize(widthMeasureSpec);
-        final int availableWidth = width - dp((avatarImageView.getVisibility() == VISIBLE ? 54 : 0) + 16);
+        if (codexCenteredTitle) {
+            updateCodexTitleArea(width);
+        }
+        final int availableWidth = codexCenteredTitle ? codexTitleAreaWidth : width - dp((avatarImageView.getVisibility() == VISIBLE ? 54 : 0) + 16);
         avatarImageView.measure(MeasureSpec.makeMeasureSpec(dp(avatarSizeInDp) - 2, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(dp(avatarSizeInDp) - 2, MeasureSpec.EXACTLY));
         titleTextView.measure(MeasureSpec.makeMeasureSpec(availableWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(dp(24 + 8), MeasureSpec.AT_MOST));
         if (subtitleTextView != null) {
             subtitleTextView.measure(MeasureSpec.makeMeasureSpec(availableWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(dp(20), MeasureSpec.AT_MOST));
         } else if (animatedSubtitleTextView != null) {
             animatedSubtitleTextView.measure(MeasureSpec.makeMeasureSpec(availableWidth, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(dp(20), MeasureSpec.AT_MOST));
+        }
+        if (codexCenteredTitle) {
+            measureCodexCenteredText(titleTextView, dp(24 + 8));
+            if (subtitleTextView != null) {
+                measureCodexCenteredText(subtitleTextView, dp(20));
+            }
         }
         if (communityItem != null) {
             communityItem.measure(MeasureSpec.makeMeasureSpec(dp(14), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(dp(14), MeasureSpec.EXACTLY));
@@ -773,7 +840,7 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
             starFgItem.measure(MeasureSpec.makeMeasureSpec(dp(20), MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(dp(20), MeasureSpec.EXACTLY));
         }
         setMeasuredDimension(width, MeasureSpec.getSize(heightMeasureSpec));
-        if (lastWidth != -1 && lastWidth != width && lastWidth > width) {
+        if (!codexPlainTitleLayout && lastWidth != -1 && lastWidth != width && lastWidth > width) {
             fadeOutToLessWidth(lastWidth);
         }
         SimpleTextView titleTextLargerCopyView = this.titleTextLargerCopyView.get();
@@ -852,6 +919,7 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
         glassMode = true;
     }
 
+    /** 沿原纵向位置排版；图示居中移动整个文字控件，避免长行的内部居中裁掉头部。 */
     @Override
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         final int actionBarHeight = ActionBar.getCurrentActionBarHeight();
@@ -860,14 +928,15 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
 
         avatarImageView.layout(1 + leftPadding, 1 + viewTop, 1 + leftPadding + avatarImageView.getMeasuredWidth(), 1 + viewTop + avatarImageView.getMeasuredHeight());
         int l = leftPadding + (avatarImageView.getVisibility() == VISIBLE ? dp(glassMode ? 49.66f : 55) : dp(glassMode ? 13 : 1)) + rightAvatarPadding;
+        final int titleLeft = codexCenteredTitle ? codexTitleAreaLeft + (codexTitleAreaWidth - titleTextView.getMeasuredWidth()) / 2 : l;
         SimpleTextView titleTextLargerCopyView = this.titleTextLargerCopyView.get();
         if (getSubtitleTextView().getVisibility() != GONE) {
-            titleTextView.layout(l, viewTop + dp(1.66f) - titleTextView.getPaddingTop(), l + titleTextView.getMeasuredWidth(), viewTop + titleTextView.getTextHeight() + dp(1.66f) - titleTextView.getPaddingTop() + titleTextView.getPaddingBottom());
+            titleTextView.layout(titleLeft, viewTop + dp(1.66f) - titleTextView.getPaddingTop(), titleLeft + titleTextView.getMeasuredWidth(), viewTop + titleTextView.getTextHeight() + dp(1.66f) - titleTextView.getPaddingTop() + titleTextView.getPaddingBottom());
             if (titleTextLargerCopyView != null) {
                 titleTextLargerCopyView.layout(l, viewTop + dp(1.66f), l + titleTextLargerCopyView.getMeasuredWidth(), viewTop + titleTextLargerCopyView.getTextHeight() + dp(1.66f));
             }
         } else {
-            titleTextView.layout(l, viewTop + dp(11) - titleTextView.getPaddingTop(), l + titleTextView.getMeasuredWidth(), viewTop + titleTextView.getTextHeight() + dp(11) - titleTextView.getPaddingTop() + titleTextView.getPaddingBottom());
+            titleTextView.layout(titleLeft, viewTop + dp(11) - titleTextView.getPaddingTop(), titleLeft + titleTextView.getMeasuredWidth(), viewTop + titleTextView.getTextHeight() + dp(11) - titleTextView.getPaddingTop() + titleTextView.getPaddingBottom());
             if (titleTextLargerCopyView != null) {
                 titleTextLargerCopyView.layout(l, viewTop + dp(10), l + titleTextLargerCopyView.getMeasuredWidth(), viewTop + titleTextLargerCopyView.getTextHeight() + dp(10));
             }
@@ -894,7 +963,8 @@ public class ChatAvatarContainer extends FrameLayout implements FactorAnimator.T
             starFgItem.layout(leftPadding + dp(28), viewTop + dp(24), leftPadding + dp(28) + starFgItem.getMeasuredWidth(), viewTop + dp(24) + starFgItem.getMeasuredHeight());
         }
         if (subtitleTextView != null) {
-            subtitleTextView.layout(l, subtitleTop, l + subtitleTextView.getMeasuredWidth(), subtitleTop + subtitleTextView.getTextHeight());
+            final int subtitleLeft = codexCenteredTitle ? codexTitleAreaLeft + (codexTitleAreaWidth - subtitleTextView.getMeasuredWidth()) / 2 : l;
+            subtitleTextView.layout(subtitleLeft, subtitleTop, subtitleLeft + subtitleTextView.getMeasuredWidth(), subtitleTop + subtitleTextView.getTextHeight());
         } else if (animatedSubtitleTextView != null) {
             animatedSubtitleTextView.layout(l, subtitleTop, l + animatedSubtitleTextView.getMeasuredWidth(), subtitleTop + animatedSubtitleTextView.getTextHeight());
         }

@@ -391,7 +391,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     private FrameMetricsOverlayView frameMetricsOverlayView;
     // private RefreshRateController refreshRateController;
 
-    /** 按原生命周期建立启动界面；仅普通 Codex 冷启动复用刚挂载的首页，其他入口保留原重建。 */
+    /** 按原生命周期建立启动界面；普通 Codex 冷启动复用首页，显式诊断另测同步挂载与指纹检查。 */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         ApplicationLoader.traceCodexStartup("launch_create_begin");
@@ -589,6 +589,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             .add(NotificationCenter.memoryLeakFoundException);
 
         LiteMode.addOnPowerSaverAppliedListener(onPowerSaverCallback = this::onPowerSaver);
+        long codexStartupFragmentAddMs = -1, codexStartupKeyReadyMs = -1;
         BaseFragment freshMainTabsRoot = null;
         if (actionBarLayout.getFragmentStack().isEmpty() && (layersActionBarLayout == null || layersActionBarLayout.getFragmentStack().isEmpty())) {
             BaseFragment initialFragment;
@@ -597,9 +598,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             } else {
                 initialFragment = new MainTabsActivity();
             }
+            long codexStartupFragmentAddStartedAt = ApplicationLoader.beginCodexStartupSpan();
             if (actionBarLayout.addFragmentToStack(initialFragment) && initialFragment instanceof MainTabsActivity) {
                 freshMainTabsRoot = initialFragment;
             }
+            codexStartupFragmentAddMs = ApplicationLoader.endCodexStartupSpan(codexStartupFragmentAddStartedAt);
 
             try {
                 if (savedInstanceState != null) {
@@ -718,7 +721,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         ApplicationLoader.startAppCenter(this);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            long codexStartupKeyReadyStartedAt = ApplicationLoader.beginCodexStartupSpan();
             FingerprintController.checkKeyReady();
+            codexStartupKeyReadyMs = ApplicationLoader.endCodexStartupSpan(codexStartupKeyReadyStartedAt);
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -877,6 +882,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         //    refreshRateController = new RefreshRateController(this);
         //}
         checkFrameMetrics();
+        ApplicationLoader.traceCodexStartupBreakdown(codexStartupFragmentAddMs, codexStartupKeyReadyMs);
         ApplicationLoader.traceCodexStartup("launch_create_end");
     }
 
@@ -1536,6 +1542,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         return handleIntent(intent, isNew, restore, fromPassword, null, true, false);
     }
 
+    /** 处理既有入口；Codex 通知只用本账号票据导航，并保留原应用锁校验。 */
     @SuppressLint("Range")
     private boolean handleIntent(Intent intent, boolean isNew, boolean restore, boolean fromPassword, Browser.Progress progress, boolean rebuildFragments, boolean openedTelegram) {
         if (GiftInfoBottomSheet.handleIntent(intent, progress)) {
@@ -1560,7 +1567,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         }
         int flags = intent.getFlags();
         String action = intent.getAction();
-        final int[] intentAccount = new int[]{intent.getIntExtra("currentAccount", UserConfig.selectedAccount)};
+        final boolean codexTaskNotification = com.butang.codextop.CodexRuntime.enabled()
+                && com.butang.codextop.TaskNotifications.ACTION.equals(action);
+        final int[] intentAccount = new int[]{codexTaskNotification ? UserConfig.selectedAccount
+                : intent.getIntExtra("currentAccount", UserConfig.selectedAccount)};
         switchToAccount(intentAccount[0], true);
         final boolean isVoipIntent = action != null && action.equals("voip");
         final boolean isVoipAnswerIntent = action != null && action.equals("voip_answer");
@@ -1576,6 +1586,16 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 passcodeSaveIntentIsRestore = restore;
                 return false;
             }
+        }
+        if (codexTaskNotification) {
+            com.butang.codextop.CodexRuntime.openTaskNotification(intent, dialogId -> {
+                if (isFinishing() || isDestroyed() || SharedConfig.appLocked
+                        || SharedConfig.isWaitingForPasscodeEnter) return;
+                Bundle args = new Bundle();
+                args.putLong("user_id", dialogId);
+                presentFragment(new ChatActivity(args));
+            });
+            return true;
         }
         boolean pushOpened = false;
         long push_user_id = 0;
@@ -6759,6 +6779,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     @Override
     protected void onPause() {
         super.onPause();
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            com.butang.codextop.CodexAppUpdater.getInstance().onBackground();
+        }
         isResumed = false;
         pipActivityHandler.onPause();
         NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.stopAllHeavyOperations, 4096);
@@ -6995,6 +7018,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     @Override
     protected void onResume() {
         super.onResume();
+        if (com.butang.codextop.CodexRuntime.enabled()) {
+            com.butang.codextop.CodexAppUpdater.getInstance().onForeground(BuildConfig.CODEX_UPDATE_MANIFEST_URL);
+        }
         isResumed = true;
         pipActivityHandler.onResume();
         if (onResumeStaticCallback != null) {

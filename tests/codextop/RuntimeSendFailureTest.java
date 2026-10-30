@@ -14,28 +14,46 @@ import javax.tools.ToolProvider;
 
 /** 提取真实发送、失败与恢复方法，使用真实Outbox和附件传输，仅替代Android及远端边界。 */
 public final class RuntimeSendFailureTest {
-    /** 所有消息、文件、账号和RPC均为合成样例；调用方提供现成Gson、JavaParser及NaCl依赖。 */
+    /** 所有消息、文件、账号和RPC均为合成样例；可选首参仅选择冻结Runtime，依赖使用现成本机包。 */
     public static void main(String[] args) throws Exception {
         Path source = Path.of("TMessagesProj/src/main/java/com/butang/codextop");
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
-        var unit = StaticJavaParser.parse(source.resolve("CodexRuntime.java"));
-        var names = Set.of("sendBatch", "finishSend", "restoredPending", "pendingMessage", "canRetryMessage",
+        var unit = StaticJavaParser.parse(args.length == 0 ? source.resolve("CodexRuntime.java") : Path.of(args[0]));
+        var names = new java.util.HashSet<>(Set.of("sendBatch", "prepareSend", "submitPreparedSend", "admitPreparedSends", "startPreparedSend", "linkedPreparedSend", "dispatchPreparedSend", "completePreparedSend", "sendJobCurrent", "finishSend", "restoredPending", "pendingMessage", "canRetryMessage",
                 "isAccountCurrent", "attachmentCurrent", "transfer", "isAttachmentMessage", "attachmentUploadFailureCode",
                 "dialogConnection", "attachmentUploadMaxBytes", "attachmentTooLarge", "loadMessages", "watchConversation",
-                "historyMessage", "historyObject", "saveHistory", "batchEchoed", "readHistory", "confirmPendingEcho");
+                "historyMessage", "historyObject", "saveHistory", "batchEchoed", "readHistory", "confirmPendingEcho",
+                "openHistoryView", "historyViewCurrent", "offerLatestHistory", "deliverHistoryPage", "finishAcceptedHistory"));
+        if (unit.findAll(MethodDeclaration.class).stream().anyMatch(m -> m.getNameAsString().equals("prepareWhenConnected"))) names.add("prepareWhenConnected");
+        // 冷协调器仅在真实源码存在时完整提取，旧冻结源不伪造新类型或实现。
+        var coldNames = Set.of("joinColdHistoryRequest", "dispatchColdHistoryRequest", "completeColdHistoryRequest", "takeColdHistoryHandoff", "deliverWatchedHistory");
+        boolean cold = unit.findAll(ClassOrInterfaceDeclaration.class).stream().anyMatch(type -> type.getNameAsString().equals("ColdHistoryRequest"));
+        // 首屏交接完整提取实际类型及通知守卫，旧冻结源不增加这些依赖。
+        boolean initial = unit.findAll(ClassOrInterfaceDeclaration.class).stream().anyMatch(type -> type.getNameAsString().equals("InitialLoadWaiter"));
+        var initialNames = Set.of("completeInitialLoadsFromLatest", "isHistoryPageCurrent");
         StringBuilder methods = new StringBuilder();
         int extracted = 0;
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
-            if (names.contains(method.getNameAsString())) { methods.append(method.toString().replace("org.telegram.messenger.MessageObject", "MessageObject")).append('\n'); extracted++; }
+            if (names.contains(method.getNameAsString()) || cold && coldNames.contains(method.getNameAsString())
+                    || initial && initialNames.contains(method.getNameAsString())) { methods.append(method.toString().replace("org.telegram.messenger.MessageObject", "MessageObject").replace("CodexRuntime::", "RuntimeSendFailureProbe::")).append('\n'); extracted++; }
         }
         for (ClassOrInterfaceDeclaration type : unit.findAll(ClassOrInterfaceDeclaration.class)) {
-            if (type.getNameAsString().equals("AttachmentState")) methods.append(type).append('\n');
+            if (Set.of("AttachmentState", "PreparedSend", "HistoryView", "HistoryPage").contains(type.getNameAsString())
+                    || cold && Set.of("ColdHistoryRequest", "ColdHistorySubscriber", "ColdHistoryResult", "ColdHistoryHandoff").contains(type.getNameAsString())
+                    || initial && type.getNameAsString().equals("InitialLoadWaiter")) methods.append(type).append('\n');
         }
-        if (extracted != names.size()) throw new AssertionError("真实发送入口发生变化，请核对夹具边界");
+        if (extracted != names.size() + 2 + (cold ? coldNames.size() : 0) + (initial ? initialNames.size() + 1 : 0))
+            throw new AssertionError("真实发送入口发生变化，请核对夹具边界");
+        // 与真实上传适配器一并提取全局许可，原场景不自行修改或扩大额度。
+        for(var field:unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class))
+            if(field.getVariables().stream().anyMatch(v->v.getNameAsString().equals("uploadAbortInFlight")))methods.append(field).append('\n');
         Path temporary = Files.createTempDirectory("codex-send-confirm-");
         try {
             Path probe = temporary.resolve("RuntimeSendFailureProbe.java");
-            Files.writeString(probe, FIXTURE + methods + SCENARIOS + "\n}");
+            // 每组清除候选真实协调器的原Map；只提供平台状态，合入仍执行被提取的方法。
+            String fixture = cold ? FIXTURE.replace("histories.clear();historyViews.clear();", "histories.clear();historyViews.clear();coldHistoryRequests.clear();") : FIXTURE;
+            String fields = cold ? "static final Map<Long, ColdHistoryRequest> coldHistoryRequests = new HashMap<>();\n" : "";
+            Files.writeString(probe, fixture + fields + methods + SCENARIOS + "\n}");
             var compile = new ArrayList<String>();
             compile.addAll(java.util.List.of("-cp", System.getProperty("java.class.path"), "-d", temporary.toString(), probe.toString()));
             for (String model : new String[]{"DesktopAttachment", "TranscriptText", "TranscriptStore", "AttachmentFiles",
@@ -78,15 +96,21 @@ public final class RuntimeSendFailureTest {
             /** 显示转换由 CodexMessageTextTest 独立覆盖；本夹具只保留原发送、落盘与身份断言。 */
             static final class CodexMessageText {static void apply(TLRPC.TL_message message){} static boolean isSourceReference(String text,String path){return false;}}
             static final class Queue {
-                final ArrayDeque<Runnable> tasks=new ArrayDeque<>();
+                final java.util.concurrent.ConcurrentLinkedQueue<Runnable> tasks=new java.util.concurrent.ConcurrentLinkedQueue<>();
                 /** 保留异步顺序以插入晚回执与账号切换。 */
                 void postRunnable(Runnable r){tasks.add(r);}
                 /** 只执行本次观察，保留下一轮延时边界但不制造轮询。 */void postRunnable(Runnable r,long delay){if(delay<=0)tasks.add(r);}
                 /** 执行已排队的本地回调，不使用真实主线程。 */
-                void all(){while(!tasks.isEmpty())tasks.remove().run();}
+                void all(){for(Runnable r;(r=tasks.poll())!=null;)r.run();}
+                /** 取消原期限，不运行被移除的回调。 */void cancelRunnable(Runnable r){tasks.remove(r);}
             }
-            static final Queue sendQueue=new Queue(),ui=new Queue();static Runnable onUiEnqueue;
-            static final class AndroidUtilities {/** 只排入合成界面队列，可在原异步边界注入写失败。 */static void runOnUIThread(Runnable r){if(onUiEnqueue!=null)onUiEnqueue.run();ui.postRunnable(r);}}
+            static final Queue sendQueue=new Queue(),uploadQueue=new Queue(),ui=new Queue();
+            static final Map<String,java.util.concurrent.CompletableFuture<Void>> sendReadiness=new HashMap<>();
+            static final Map<String,java.util.concurrent.atomic.AtomicBoolean> sendJobs=new java.util.concurrent.ConcurrentHashMap<>();
+            static final Map<Long,ArrayDeque<PreparedSend>> preparedSends=new HashMap<>();static final ArrayDeque<Long> preparedDialogs=new ArrayDeque<>();static int preparedInFlight;
+            /** 依次执行原首写、唯一附件作业和最终派发，不改变原场景的失败或回显断言。 */static void drainSend(){sendQueue.all();uploadQueue.all();sendQueue.all();}static Runnable onUiEnqueue;
+            static final class AndroidUtilities {/** 只排入合成界面队列，可在原异步边界注入写失败。 */static void runOnUIThread(Runnable r){if(onUiEnqueue!=null)onUiEnqueue.run();ui.postRunnable(r);}
+                /** 替代Android延迟回调边界，仍按原UI队列顺序执行。 */static void runOnUIThread(Runnable r,long delay){runOnUIThread(r);}}
             /** 原列表摘要发布边界由 RuntimeDialogPreviewTest 独立执行，不改变发送或收发事件计数。 */
             static void publishPendingPreview(int a,long e,long id,ArrayList<MessageObject> messages,boolean fresh){}
             /** 原历史摘要发布边界由 RuntimeDialogPreviewTest 独立执行，不改变本专项的原失败场景。 */
@@ -121,6 +145,18 @@ public final class RuntimeSendFailureTest {
             }
             static final class DesktopConnection {
                 final String machineId="synthetic-machine";
+                /** 旧回归只补新清理边界；仍调用同一合成bulk响应，原失败和取消断言不变。 */
+                java.util.concurrent.CompletableFuture<JsonObject> abortUploadAsync(JsonObject p,Object gate,java.util.function.BooleanSupplier permitted){
+                    java.util.concurrent.CompletableFuture<JsonObject> result=new java.util.concurrent.CompletableFuture<>();
+                    try{synchronized(gate){if(!permitted.getAsBoolean())throw new RpcNotDispatchedException();}result.complete(transfer("daemon.bulkTransfer.upload.abort",p));}
+                    catch(Exception e){result.completeExceptionally(e);}return result;
+                }
+                /** 满额回退沿同一合成响应；真正25秒等待由专属连接测试执行。 */
+                JsonObject abortUpload(JsonObject p,Object gate,java.util.function.BooleanSupplier permitted)throws Exception{
+                    return abortUploadAsync(p,gate,permitted).get(25,java.util.concurrent.TimeUnit.SECONDS);
+                }
+                /** 普通发送专项保持连接可用；断网时序另执行真实连接等待方法。 */java.util.concurrent.CompletableFuture<Void> whenConnected(){return connected?java.util.concurrent.CompletableFuture.completedFuture(null):new java.util.concurrent.CompletableFuture<>();}
+                /** 只提供合成传输状态。 */boolean isConnected(){return connected;}
                 int initCalls,sendCalls,openCalls;int rejectAt=1;String error="File exceeds upload size limit",failStage;Long uploadLimit;boolean connected=true;
                 String activeName,publicKey;Runnable onReject,onSend,onLimit;JsonObject transcriptPage,tailPage;
                 JsonObject transcript(String remote,String cursor){return transcriptPage;}
@@ -146,16 +182,33 @@ public final class RuntimeSendFailureTest {
                     sendCalls++;if(onSend!=null)onSend.run();if("send".equals(failStage))throw new IOException(error);
                     if("reject-send".equals(failStage))throw new SendRejectedException(error);
                 }
+                /** 只有RPC边界被替代；完成后仍由真实Runtime回原发送队列落盘。 */
+                java.util.concurrent.CompletableFuture<JsonObject> openConversationAsync(String remote,Object gate,java.util.function.BooleanSupplier permitted){
+                    java.util.concurrent.CompletableFuture<JsonObject> result=new java.util.concurrent.CompletableFuture<>();
+                    try{synchronized(gate){if(!permitted.getAsBoolean())throw new RpcNotDispatchedException();}result.complete(openConversation(remote));}catch(Exception e){result.completeExceptionally(e);}return result;
+                }
+                /** 新隐式关联入口仅桥接原合成RPC；本专项原失败和身份场景保持。 */
+                java.util.concurrent.CompletableFuture<JsonObject> linkConversationForSendAsync(String remote,Object gate,java.util.function.BooleanSupplier permitted){
+                    return openConversationAsync(remote,gate,permitted);
+                }
+                /** 合成回执保留原同步失败、明确拒绝及onSend注入边界。 */
+                java.util.concurrent.CompletableFuture<JsonObject> sendAsync(String linked,String text,String localId,List<DesktopAttachment> uploaded,Object gate,java.util.function.BooleanSupplier permitted){
+                    java.util.concurrent.CompletableFuture<JsonObject> result=new java.util.concurrent.CompletableFuture<>();
+                    try{synchronized(gate){if(!permitted.getAsBoolean())throw new RpcNotDispatchedException();}send(linked,text,localId,uploaded);result.complete(new JsonObject());}catch(Exception e){result.completeExceptionally(e);}return result;
+                }
                 static final class RpcNotDispatchedException extends IOException {}
                 static final class SendRejectedException extends IOException {/** 合成同字拒绝检查阶段隔离。 */SendRejectedException(String s){super(s);}}
             }
             static long accountGeneration;static Object session;static boolean loggingOut;
             static Path scenarioRoot;static OutboxStore store;static DesktopConnection connection;
             static final Map<String,Path> files=new HashMap<>();
-            static final Queue historyQueue=new Queue(),transcriptQueue=new Queue();
+            static final Queue historyQueue=new Queue(),transcriptQueue=new Queue(),prefetchQueue=new Queue();
             static final class Utilities {static final Queue globalQueue=new Queue();}
-            static final class ApplicationLoader {static final Object applicationContext=new Object();}
+            static final class ApplicationLoader {static boolean mainInterfacePaused;static final Object applicationContext=new Object();}
             static final Map<Long,TranscriptWindow> histories=new HashMap<>();
+            // 原D44页面类型来自生产提取，夹具仅提供合成页面容器及token分配器。
+            static final Map<Integer,HistoryView> historyViews=new java.util.concurrent.ConcurrentHashMap<>();
+            static final java.util.concurrent.atomic.AtomicLong historyTokens=new java.util.concurrent.atomic.AtomicLong();
             static long watchedDialog,watchGeneration;
             static boolean loggedIn(){return session!=null;}
             static void watchStatus(int a,long d,long g){}
@@ -163,7 +216,7 @@ public final class RuntimeSendFailureTest {
             static void logTranscriptFailure(String phase,Exception e,JsonObject page){throw new AssertionError("unexpected transcript failure at "+phase,e);}
             static TranscriptStore transcriptStore(long dialogId){return new TranscriptStore(scenarioRoot.resolve("history").toFile(),"server","account","machine");}
             static File cachedAttachment(File directory,String id,DesktopAttachment attachment){return null;}
-            /** 驱动真实队列的一轮，无网络或真实账号。 */static void flush(){for(int i=0;i<20;i++){Utilities.globalQueue.all();historyQueue.all();transcriptQueue.all();ui.all();if(Utilities.globalQueue.tasks.isEmpty()&&historyQueue.tasks.isEmpty()&&transcriptQueue.tasks.isEmpty()&&ui.tasks.isEmpty())return;}throw new AssertionError("fixture queue loop");}
+            /** 驱动真实队列的一轮，无网络或真实账号。 */static void flush(){for(int i=0;i<20;i++){Utilities.globalQueue.all();historyQueue.all();transcriptQueue.all();prefetchQueue.all();ui.all();if(Utilities.globalQueue.tasks.isEmpty()&&historyQueue.tasks.isEmpty()&&transcriptQueue.tasks.isEmpty()&&prefetchQueue.tasks.isEmpty()&&ui.tasks.isEmpty())return;}throw new AssertionError("fixture queue loop");}
             static JsonObject page(String id,String localId){JsonObject p=new JsonObject();JsonArray items=new JsonArray();if(id!=null){JsonObject item=new JsonObject();item.addProperty("id",id);item.addProperty("localId",localId);item.addProperty("createdAtMs",1000000);JsonObject raw=new JsonObject(),content=new JsonObject();raw.addProperty("role","user");content.addProperty("type","text");content.addProperty("text","synthetic send");raw.add("content",content);item.add("raw",raw);items.add(item);}p.add("items",items);p.addProperty("hasMore",false);p.addProperty("historyAvailability","available");p.addProperty("tailCursor","synthetic-tail");p.addProperty("nextCursor","synthetic-tail");return p;}
             static void startText(){SendMessageParams p=new SendMessageParams();p.message="synthetic send";sendBatch(0,p,new ArrayList<>(List.of(p)));}
 
@@ -177,12 +230,15 @@ public final class RuntimeSendFailureTest {
             /** 选择边界提供合成文件，不读取真实手机数据。 */static File selectedAttachment(int a,SendMessageParams p){return p.path==null?null:new File(p.path);}
             /** 此片不测试平台预览，原件存在性由真实暂存模型测试。 */static File attachmentFile(MessageObject m){return null;}
             /** 合成进度不改变失败判定。 */static void attachmentProgress(int a,long e,long d,String r,DesktopConnection c,String k,boolean u,long done,long total){}
+            /** 仅替代原进度显示边界，取消门和传输由真实方法执行。 */static void attachmentProgress(int a,long e,long d,String r,DesktopConnection c,java.util.concurrent.atomic.AtomicBoolean active,String k,boolean u,long done,long total){}
             /** 只提供本批气泡的进度关联键。 */static String attachmentKey(MessageObject m){return m.messageOwner.params.get("codexLocalId");}
             /** 不输出正文、路径或服务器错误。 */static void traceSend(String p,String id,long started){}
+            /** 原失败及队列组不观测完成诊断；专项替换真实helper，普通回归不依赖Android日志。 */
+            static void traceSendCompletion(String phase,String localId){}
             /** 每组真实状态使用独立目录及合成账号。 */static void reset(Path root)throws Exception{
-                histories.clear();historyQueue.tasks.clear();transcriptQueue.tasks.clear();Utilities.globalQueue.tasks.clear();watchGeneration++;watchedDialog=0;NotificationCenter.reconciled=0;NotificationCenter.loaded=0;
+                histories.clear();historyViews.clear();historyQueue.tasks.clear();prefetchQueue.tasks.clear();transcriptQueue.tasks.clear();Utilities.globalQueue.tasks.clear();watchGeneration++;watchedDialog=0;NotificationCenter.reconciled=0;NotificationCenter.loaded=0;
                 scenarioRoot=Files.createTempDirectory(root,"case-");accountGeneration++;session=new Object();loggingOut=false;onUiEnqueue=null;
-                files.clear();pendingMessages.clear();sendingBatches.clear();attachmentStates.clear();remoteIds.clear();dialogDirectories.clear();linkedSessions.clear();dialogMachines.clear();desktopConnections.clear();ui.tasks.clear();sendQueue.tasks.clear();
+                files.clear();pendingMessages.clear();sendingBatches.clear();attachmentStates.clear();remoteIds.clear();dialogDirectories.clear();linkedSessions.clear();dialogMachines.clear();desktopConnections.clear();ui.tasks.clear();sendQueue.tasks.clear();uploadQueue.tasks.clear();sendJobs.clear();sendReadiness.clear();preparedSends.clear();preparedDialogs.clear();preparedInFlight=0;
                 remoteIds.put(1L,"synthetic-thread");dialogDirectories.put(1L,"/synthetic/workspace");store=new OutboxStore(scenarioRoot.resolve("outbox").toFile(),"server","account","machine");connection=new DesktopConnection();
                 dialogMachines.put(1L,"synthetic-machine");desktopConnections.put("synthetic-machine",connection);
                 try(var recipient=BulkTransferCrypto.createRecipient()){connection.publicKey=recipient.publicKeyBase64;}
@@ -211,65 +267,65 @@ public final class RuntimeSendFailureTest {
             /** 覆盖实际发送、落盘和迟到回调，不重写产品阶段判断。 */
             private static void runFailureCases(Path root)throws Exception{
                 String expected="file_too_large";
-                reset(root);connection.uploadLimit=2L;start();String oversized=base();sendQueue.all();ui.all();expectCode(expected);
+                reset(root);connection.uploadLimit=2L;start();String oversized=base();drainSend();ui.all();expectCode(expected);
                 check(connection.openCalls==0&&connection.initCalls==0&&connection.sendCalls==0&&store.get(oversized).attachments.isEmpty()
                         &&store.get(oversized).selections.size()==2&&expected.equals(code(store.get(oversized))),"已知超限仍暂存、联网或丢原选择");
                 for(Long limit:new Long[]{null,3L,4L}){
                     reset(root);connection.uploadLimit=limit;DesktopConnection other=new DesktopConnection();other.uploadLimit=1L;desktopConnections.put("other-machine",other);
-                    start();sendQueue.all();ui.all();expectCode(null);check(connection.sendCalls==1&&connection.initCalls==2&&other.openCalls==0&&other.initCalls==0,"旧机未知、小文件或所属电脑绑定改变原发送");
+                    start();drainSend();ui.all();expectCode(null);check(connection.sendCalls==1&&connection.initCalls==2&&other.openCalls==0&&other.initCalls==0,"旧机未知、小文件或所属电脑绑定改变原发送");
                 }
                 for(String reason:new String[]{"File exceeds upload size limit","File exceeds the server-routed transfer size limit"}){
-                    reset(root);connection.failStage="upload";connection.error=reason;connection.rejectAt=2;start();String id=base();sendQueue.all();ui.all();expectCode(expected);
+                    reset(root);connection.failStage="upload";connection.error=reason;connection.rejectAt=2;start();String id=base();drainSend();ui.all();expectCode(expected);
                     OutboxStore.Item saved=store.get(id);check(expected.equals(code(saved))&&saved.uploaded.size()==1&&!saved.submissionUncertain&&connection.sendCalls==0,"第二件超限丢失原因、上传前缀或进入桌面发送");
                     pendingMessages.clear();ArrayList<MessageObject> restored=restoredPending(0,1,saved,Set.of());check(restored.size()==2,"重开丢附件气泡");expectCode(expected);
                     MessageObject active=restored.get(0);active.messageOwner.params.remove("codexSendFailure");active.messageOwner.send_state=MessageObject.MESSAGE_SEND_STATE_SENDING;
                     restoredPending(0,1,saved,Set.of());check(!active.messageOwner.params.containsKey("codexSendFailure"),"磁盘旧原因覆盖活跃气泡");
                     pendingMessages.clear();check(restoredPending(0,1,saved,Set.of(TranscriptText.attachmentIdentity(id,0),TranscriptText.attachmentIdentity(id,1))).isEmpty(),"已回显批次被恢复");
                 }
-                reset(root);connection.failStage="upload";connection.rejectAt=2;start();String prefixId=base();sendQueue.all();ui.all();
-                connection.uploadLimit=2L;int prefixInit=connection.initCalls;retry();sendQueue.all();ui.all();expectCode(expected);
+                reset(root);connection.failStage="upload";connection.rejectAt=2;start();String prefixId=base();drainSend();ui.all();
+                connection.uploadLimit=2L;int prefixInit=connection.initCalls;retry();drainSend();ui.all();expectCode(expected);
                 check(connection.initCalls==prefixInit&&store.get(prefixId).uploaded.size()==1&&store.get(prefixId).attachments.size()==2,"新限额导致已上传前缀重传或丢失");
-                Files.write(Path.of(store.get(prefixId).attachments.get(1).localPath),new byte[]{1});connection.uploadLimit=1L;retry();sendQueue.all();ui.all();
+                Files.write(Path.of(store.get(prefixId).attachments.get(1).localPath),new byte[]{1});connection.uploadLimit=1L;retry();drainSend();ui.all();
                 check(connection.initCalls==prefixInit+1&&connection.sendCalls==0,"已上传超新限额的前缀未跳过或改变文件绕过原摘要校验");
-                reset(root);connection.failStage="upload";connection.rejectAt=2;start();Files.write(files.get("second.bin"),new byte[]{1});prefixId=base();sendQueue.all();ui.all();
-                String priorPath=store.get(prefixId).uploaded.get(0).path;connection.uploadLimit=1L;connection.failStage=null;prefixInit=connection.initCalls;retry();sendQueue.all();ui.all();expectCode(null);
+                reset(root);connection.failStage="upload";connection.rejectAt=2;start();Files.write(files.get("second.bin"),new byte[]{1});prefixId=base();drainSend();ui.all();
+                String priorPath=store.get(prefixId).uploaded.get(0).path;connection.uploadLimit=1L;connection.failStage=null;prefixInit=connection.initCalls;retry();drainSend();ui.all();expectCode(null);
                 check(connection.initCalls==prefixInit+1&&connection.sendCalls==1&&store.get(prefixId).uploaded.size()==2&&store.get(prefixId).uploaded.get(0).path.equals(priorPath),"新小限额拒绝已上传大前缀或替换其路径");
                 reset(root);connection.uploadLimit=3L;start();String changed=base();
                 onUiEnqueue=()->{onUiEnqueue=null;try{Files.write(files.get("second.bin"),new byte[10]);}catch(IOException e){throw new RuntimeException(e);}};
-                sendQueue.all();ui.all();expectCode(expected);check(connection.initCalls==1&&connection.sendCalls==0&&store.get(changed).uploaded.size()==1&&store.get(changed).attachments.get(1).sizeBytes==10,"选择后增长未按最终实际大小拒绝或丢前缀");
-                reset(root);connection.uploadLimit=2L;start();String stale=base();connection.onLimit=()->accountGeneration++;sendQueue.all();ui.all();expectCode(null);
+                drainSend();ui.all();expectCode(expected);check(connection.initCalls==1&&connection.sendCalls==0&&store.get(changed).uploaded.size()==1&&store.get(changed).attachments.get(1).sizeBytes==10,"选择后增长未按最终实际大小拒绝或丢前缀");
+                reset(root);connection.uploadLimit=2L;start();String stale=base();connection.onLimit=()->accountGeneration++;drainSend();ui.all();expectCode(null);
                 check(code(store.get(stale))==null&&connection.initCalls==0&&connection.sendCalls==0,"旧账号预检写回原因或继续上传");
                 for(String stage:new String[]{"upload","open","send","reject-send"}){
-                    reset(root);connection.failStage=stage;connection.error=stage.equals("upload")?"synthetic generic error":"File exceeds upload size limit";start();String id=base();sendQueue.all();ui.all();expectCode(null);
+                    reset(root);connection.failStage=stage;connection.error=stage.equals("upload")?"synthetic generic error":"File exceeds upload size limit";start();String id=base();drainSend();ui.all();expectCode(null);
                     check(code(store.get(id))==null,"泛错或非上传阶段错误误记大小原因");
                 }
-                reset(root);connection.failStage="upload";start();String id=base();sendQueue.all();ui.all();expectCode(expected);
-                connection.failStage=null;int earlier=connection.initCalls;retry();expectCode(null);sendQueue.all();ui.all();expectCode(null);
+                reset(root);connection.failStage="upload";start();String id=base();drainSend();ui.all();expectCode(expected);
+                connection.failStage=null;int earlier=connection.initCalls;retry();expectCode(null);drainSend();ui.all();expectCode(null);
                 check(connection.initCalls==earlier+2&&connection.sendCalls==1&&code(store.get(id))==null&&store.get(id).submissionAccepted&&!store.get(id).submissionUncertain,"原身份重试未清旧原因或错误提交次数");
-                pendingMessages.clear();restoredPending(0,1,store.get(id),Set.of());expectCode(null);int calls=connection.sendCalls;retry();sendQueue.all();ui.all();check(connection.sendCalls==calls,"已接受结果重开后被再次投递");
+                pendingMessages.clear();restoredPending(0,1,store.get(id),Set.of());expectCode(null);int calls=connection.sendCalls;retry();drainSend();ui.all();check(connection.sendCalls==calls,"已接受结果重开后被再次投递");
 
-                reset(root);connection.failStage="upload";start();id=base();sendQueue.all();ui.all();final String clearing=id;blockWrite(id);retry();int before=connection.initCalls;sendQueue.all();ui.all();expectCode(null);
+                reset(root);connection.failStage="upload";start();id=base();drainSend();ui.all();final String clearing=id;blockWrite(id);retry();int before=connection.initCalls;drainSend();ui.all();expectCode(null);
                 check(connection.initCalls==before&&connection.sendCalls==0&&expected.equals(code(store.get(id))),"清旧原因写失败仍远端工作或损坏原记录");unblock(clearing);
                 reset(root);connection.failStage="upload";start();id=base();final String persisting=id;
-                connection.onReject=()->{try{blockWrite(persisting);}catch(Exception e){throw new RuntimeException(e);}};sendQueue.all();ui.all();expectCode(expected);
+                connection.onReject=()->{try{blockWrite(persisting);}catch(Exception e){throw new RuntimeException(e);}};drainSend();ui.all();expectCode(expected);
                 check(code(store.get(id))==null&&store.get(id).attachments.size()==2&&connection.sendCalls==0,"记原因写失败损坏原批次或伪装已持久化");unblock(id);
 
                 reset(root);start();id=base();final String beforeSubmit=id;
                 onUiEnqueue=()->{try{if(store.get(beforeSubmit).uploaded.size()==2){onUiEnqueue=null;blockWrite(beforeSubmit);}}catch(Exception e){throw new RuntimeException(e);}};
-                sendQueue.all();ui.all();expectCode(null);check(connection.sendCalls==0&&!store.get(id).submissionUncertain&&store.get(id).uploaded.size()==2,"未知状态首写失败仍桌面发送或丢上传前缀");unblock(id);
+                drainSend();ui.all();expectCode(null);check(connection.sendCalls==0&&!store.get(id).submissionUncertain&&store.get(id).uploaded.size()==2,"未知状态首写失败仍桌面发送或丢上传前缀");unblock(id);
                 reset(root);connection.failStage="reject-send";start();id=base();final String rejected=id;
-                connection.onSend=()->{try{blockWrite(rejected);}catch(Exception e){throw new RuntimeException(e);}};sendQueue.all();ui.all();expectCode(null);
+                connection.onSend=()->{try{blockWrite(rejected);}catch(Exception e){throw new RuntimeException(e);}};drainSend();ui.all();expectCode(null);
                 check(connection.sendCalls==1&&store.get(id).submissionUncertain,"可靠拒绝后落盘失败误允许重送");
                 for(MessageObject m:pendingMessages.values())check("true".equals(m.messageOwner.params.get("codexSendUncertain")),"未知持久化失败丢原界面语义");unblock(id);
 
-                reset(root);connection.failStage="upload";start();id=base();sendQueue.all();int notices=NotificationCenter.notices;accountGeneration++;ui.all();expectCode(null);check(NotificationCenter.notices==notices,"旧账号晚失败回调通知新账号");
+                reset(root);connection.failStage="upload";start();id=base();drainSend();int notices=NotificationCenter.notices;accountGeneration++;ui.all();expectCode(null);check(NotificationCenter.notices==notices,"旧账号晚失败回调通知新账号");
                 for(boolean replace:new boolean[]{false,true}){
-                    reset(root);connection.failStage="upload";start();id=base();sendQueue.all();Map<String,MessageObject> old=new HashMap<>(pendingMessages);pendingMessages.clear();
+                    reset(root);connection.failStage="upload";start();id=base();drainSend();Map<String,MessageObject> old=new HashMap<>(pendingMessages);pendingMessages.clear();
                     if(replace)for(var entry:old.entrySet())pendingMessages.put(entry.getKey(),new MessageObject(0,pendingMessage(1,-99,1000,"synthetic",id,0),true,false));
                     ui.all();for(MessageObject m:old.values())check(!m.messageOwner.params.containsKey("codexSendFailure"),"晚失败回执改写已移除或替换的原对象");expectCode(null);
                 }
-                reset(root);connection.failStage="upload";start();id=base();final String late=id;connection.onReject=()->{try{store.remove(late);}catch(Exception e){throw new RuntimeException(e);}};sendQueue.all();ui.all();check(store.get(id)==null,"原因写入复活已回显清理的Outbox");
-                reset(root);connection.failStage="upload";start();id=base();connection.onReject=()->accountGeneration++;sendQueue.all();ui.all();expectCode(null);check(code(store.get(id))==null,"旧账号上传结果持久化失败原因");
+                reset(root);connection.failStage="upload";start();id=base();final String late=id;connection.onReject=()->{try{store.remove(late);}catch(Exception e){throw new RuntimeException(e);}};drainSend();ui.all();check(store.get(id)==null,"原因写入复活已回显清理的Outbox");
+                reset(root);connection.failStage="upload";start();id=base();connection.onReject=()->accountGeneration++;drainSend();ui.all();expectCode(null);check(code(store.get(id))==null,"旧账号上传结果持久化失败原因");
                 var mapper=RuntimeSendFailureProbe.class.getDeclaredMethod("attachmentUploadFailureCode",IOException.class);mapper.setAccessible(true);
                 for(IOException error:new IOException[]{new IOException(),new IOException("prefix File exceeds upload size limit"),new IOException("File exceeds upload size limit "),
                         new IOException("synthetic generic error",new IOException("File exceeds upload size limit"))})
@@ -280,7 +336,7 @@ public final class RuntimeSendFailureTest {
             private static void runConfirmationCase(Path root,String test)throws Exception{
                 reset(root);
                 if("ack-cold".equals(test)){
-                    startText();String id=base();sendQueue.all();ui.all();
+                    startText();String id=base();drainSend();ui.all();
                     MessageObject accepted=pendingMessages.get(id);check(connection.sendCalls==1&&accepted.messageOwner.send_state==MessageObject.MESSAGE_SEND_STATE_SENT,"fixture: successful ACK did not mark original bubble sent");
                     OutboxStore.Item saved=new OutboxStore(scenarioRoot.resolve("outbox").toFile(),"server","account","machine").get(id);
                     check(saved!=null,"fixture: outbox not retained until echo");
@@ -289,42 +345,45 @@ public final class RuntimeSendFailureTest {
                     System.out.println("ACK_COLD sendCalls="+connection.sendCalls+" priorSent="+(accepted.messageOwner.send_state==0)+" restoredCount="+restored.size()+" restoredError="+(restored.get(0).messageOwner.send_state==2));
                     check(saved.submissionAccepted&&restored.size()==1&&restored.get(0).messageOwner.send_state==MessageObject.MESSAGE_SEND_STATE_SENT&&!canRetryMessage(restored.get(0)),"ACK success lost across cold restore: original accepted message became SEND_ERROR");
                 }else if("unknown-cold".equals(test)){
-                    connection.failStage="send";startText();String id=base();sendQueue.all();ui.all();
+                    connection.failStage="send";startText();String id=base();drainSend();ui.all();
                     MessageObject unknown=pendingMessages.get(id);check(unknown.messageOwner.send_state==1&&!canRetryMessage(unknown),"unknown send shown as definite error or permitted retry");
                     OutboxStore.Item saved=store.get(id);pendingMessages.clear();MessageObject restored=restoredPending(0,1,saved,Set.of()).get(0);
                     check(restored.messageOwner.send_state==1&&!canRetryMessage(restored),"unknown cold restore lost pending clock");
-                    int calls=connection.sendCalls;retry();sendQueue.all();ui.all();check(connection.sendCalls==calls,"unknown cold restore resent same request");
+                    int calls=connection.sendCalls;retry();drainSend();ui.all();check(connection.sendCalls==calls,"unknown cold restore resent same request");
                 }else if("ack-connection".equals(test)){
-                    startText();String id=base();sendQueue.all();desktopConnections.put("synthetic-machine",new DesktopConnection());ui.all();
+                    startText();String id=base();drainSend();desktopConnections.put("synthetic-machine",new DesktopConnection());ui.all();
                     check(pendingMessages.get(id).messageOwner.send_state==0,"successful ACK reversed by same-account connection replacement");
                 }else if("rejected-retry".equals(test)){
-                    connection.failStage="reject-send";startText();String id=base();sendQueue.all();ui.all();MessageObject rejected=pendingMessages.get(id);
+                    connection.failStage="reject-send";startText();String id=base();drainSend();ui.all();MessageObject rejected=pendingMessages.get(id);
                     check(rejected.messageOwner.send_state==2&&canRetryMessage(rejected)&&!store.get(id).submissionUncertain,"explicit rejection lost failure/retry");
-                    connection.failStage=null;retry();sendQueue.all();ui.all();check(connection.sendCalls==2&&pendingMessages.get(id)==rejected&&rejected.messageOwner.send_state==0,"manual retry changed original identity or failed ACK");
+                    connection.failStage=null;retry();drainSend();ui.all();check(connection.sendCalls==2&&pendingMessages.get(id)==rejected&&rejected.messageOwner.send_state==0,"manual retry changed original identity or failed ACK");
                 }else if("ack-late-account".equals(test)){
-                    startText();String id=base();sendQueue.all();MessageObject original=pendingMessages.get(id);accountGeneration++;ui.all();
+                    startText();String id=base();drainSend();MessageObject original=pendingMessages.get(id);accountGeneration++;ui.all();
                     check(original.messageOwner.send_state==1,"old account ACK changed visible message");
                 }else if("ack-late-remote".equals(test)){
-                    startText();String id=base();sendQueue.all();MessageObject original=pendingMessages.get(id);remoteIds.put(1L,"other-synthetic-thread");ui.all();
+                    startText();String id=base();drainSend();MessageObject original=pendingMessages.get(id);remoteIds.put(1L,"other-synthetic-thread");ui.all();
                     check(original.messageOwner.send_state==1,"old remote ACK changed newly bound conversation");
                 }else if("ack-write-failure".equals(test)){
                     startText();String id=base();connection.onSend=()->{try{blockWrite(id);}catch(Exception e){throw new RuntimeException(e);}};
-                    sendQueue.all();ui.all();MessageObject acknowledged=pendingMessages.get(id);
+                    drainSend();ui.all();MessageObject acknowledged=pendingMessages.get(id);
                     check(acknowledged.messageOwner.send_state==0&&!canRetryMessage(acknowledged),"ACK persistence failure falsely changed accepted memory state");
                     unblock(id);check(store.get(id).submissionUncertain,"write failure must retain original disk uncertainty");
                     pendingMessages.clear();MessageObject restored=restoredPending(0,1,store.get(id),Set.of()).get(0);
                     check(restored.messageOwner.send_state==1&&!canRetryMessage(restored),"failed persistence cold restore fabricated known failure");
                 }else if("partial-attachments".equals(test)){
-                    connection.failStage="send";start();String id=base();sendQueue.all();ui.all();OutboxStore.Item saved=store.get(id);
+                    connection.failStage="send";start();String id=base();drainSend();ui.all();OutboxStore.Item saved=store.get(id);
                     String second=TranscriptText.attachmentIdentity(id,1);MessageObject remaining=pendingMessages.get(second);
                     connection.transcriptPage=page("attachment-source",id);loadMessages(0,1,50,0,1,2,0,0);flush();
                     check(store.get(id)!=null&&store.get(id).uploaded.size()==2&&!pendingMessages.containsKey(id)&&pendingMessages.get(second)==remaining&&NotificationCenter.reconciled==1,"first attachment echo lost remaining member or original batch");
                     int firstSourceId=histories.get(1L).before(0,10).get(0).id;
-                    connection.tailPage=page("attachment-source:attachment:1",second);watchConversation(0,1);flush();
+                    connection.tailPage=page("attachment-source:attachment:1",second);
+                    // 同一合成远端已有第二条回显，最新页保留首条并含第二条，增量页仅含新增。
+                    connection.transcriptPage.getAsJsonArray("items").add(connection.tailPage.getAsJsonArray("items").get(0).deepCopy());
+                    watchConversation(0,1);flush();
                     check(store.get(id)==null&&pendingMessages.isEmpty()&&NotificationCenter.reconciled==2&&connection.sendCalls==1,"remaining attachment echo did not complete original batch exactly once");
                     check(histories.get(1L).before(0,10).stream().anyMatch(row->row.id==firstSourceId&&id.equals(row.message.localId)),"echo migration changed original cached source ID");
                 }else if("full-attachment-echo".equals(test)){
-                    start();String id=base();sendQueue.all();ui.all();OutboxStore.Item saved=store.get(id);
+                    start();String id=base();drainSend();ui.all();OutboxStore.Item saved=store.get(id);
                     JsonObject echo=page("batch-source",id),meta=new JsonObject(),happier=new JsonObject(),payload=new JsonObject();JsonArray attachments=new JsonArray();
                     for(DesktopAttachment attachment:saved.uploaded)attachments.add(attachment.toJson());payload.add("attachments",attachments);
                     happier.addProperty("kind","attachments.v1");happier.add("payload",payload);meta.add("happier",happier);
@@ -336,27 +395,29 @@ public final class RuntimeSendFailureTest {
                         connection.transcriptPage=page("early-echo",id);loadMessages(0,1,50,0,1,2,0,0);flush();
                         check(store.get(id)==null&&!pendingMessages.containsKey(id)&&NotificationCenter.reconciled==1,"fixture: echo failed to precede ACK");
                     }catch(Exception error){throw new RuntimeException(error);}};
-                    sendQueue.all();ui.all();check(store.get(id)==null&&!pendingMessages.containsKey(id)&&NotificationCenter.reconciled==1&&connection.sendCalls==1,"late ACK resurrected echoed outbox or negative bubble");
+                    drainSend();ui.all();check(store.get(id)==null&&!pendingMessages.containsKey(id)&&NotificationCenter.reconciled==1&&connection.sendCalls==1,"late ACK resurrected echoed outbox or negative bubble");
                     check(!original.messageOwner.params.containsKey("codexSendAccepted"),"late ACK modified already migrated original object");
                 }else if("echo-isolation".equals(test)){
-                    connection.failStage="send";startText();String id=base();sendQueue.all();ui.all();MessageObject original=pendingMessages.get(id);
+                    connection.failStage="send";startText();String id=base();drainSend();ui.all();MessageObject original=pendingMessages.get(id);
                     JsonObject agent=page("synthetic-agent",id);agent.getAsJsonArray("items").get(0).getAsJsonObject().getAsJsonObject("raw").addProperty("role","agent");
                     connection.transcriptPage=agent;loadMessages(0,1,50,0,1,2,0,0);flush();
                     check(pendingMessages.get(id)==original&&store.get(id)!=null&&NotificationCenter.reconciled==0,"assistant localId falsely confirmed outgoing send");
                     TLRPC.TL_message other=pendingMessage(2,50,1000,"synthetic send",id,0);other.out=true;
                     check(!confirmPendingEcho(0,2,other)&&pendingMessages.get(id)==original,"other dialog migrated original pending bubble");
                 }else if("accepted-no-downgrade".equals(test)){
-                    startText();String id=base();sendQueue.all();ui.all();MessageObject original=pendingMessages.get(id);
+                    startText();String id=base();drainSend();ui.all();MessageObject original=pendingMessages.get(id);
                     finishSend(0,accountGeneration,id,new ArrayList<>(List.of(original)),"synthetic-thread",connection,false,true,null);ui.all();
                     check(original.messageOwner.send_state==0&&!canRetryMessage(original)&&!original.messageOwner.params.containsKey("codexSendUncertain"),"late unknown overwrote accepted state");
                 }else{
                     // 已发但ACK未取得，构造原未知失败；随后仅用真实历史／增量方法读同localId回显。
-                    connection.failStage="send";startText();String id=base();sendQueue.all();ui.all();
+                    connection.failStage="send";startText();String id=base();drainSend();ui.all();
                     MessageObject pending=pendingMessages.get(id);check(pending.messageOwner.send_state!=0,"fixture: unknown send falsely marked accepted");
                     connection.transcriptPage="history-first".equals(test)?page("synthetic-source",id):page(null,null);
                     connection.tailPage=page("synthetic-source",id);
                     loadMessages(0,1,50,0,1,2,0,0);flush();
                     check(NotificationCenter.loaded==1,"fixture: actual history load not delivered");
+                    // 回显产生后，同一远端最新页也必须反映该正文，不能只有增量模拟响应更新。
+                    connection.transcriptPage=connection.tailPage;
                     watchConversation(0,1);flush();
                     boolean echoSaved=histories.get(1L).before(0,100).stream().anyMatch(row->id.equals(row.message.localId));
                     System.out.println("ECHO case="+test+" matchingEchoInHistory="+echoSaved+" outboxRemoved="+(store.get(id)==null)+" pendingRemoved="+!pendingMessages.containsKey(id)+" migrationNotifications="+NotificationCenter.reconciled);

@@ -49,6 +49,17 @@ public final class CodexRuntime {
     private static final Map<Integer, HistoryView> historyViews = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.atomic.AtomicLong historyTokens = new java.util.concurrent.atomic.AtomicLong();
     private static final org.telegram.messenger.DispatchQueue sendQueue = new org.telegram.messenger.DispatchQueue("codex-send");
+    // 一个流式附件作业负责暂存、摘要和上传；首写、删除与消息派发仍归sendQueue。
+    private static final org.telegram.messenger.DispatchQueue uploadQueue = new org.telegram.messenger.DispatchQueue("codex-upload");
+    // 全局仅一个清理可脱离上传队列等待；满额仍同步清理，不丢弃作业或形成另一条无界队列。
+    private static final java.util.concurrent.atomic.AtomicBoolean uploadAbortInFlight = new java.util.concurrent.atomic.AtomicBoolean();
+    private static final Map<String, java.util.concurrent.atomic.AtomicBoolean> sendJobs = new java.util.concurrent.ConcurrentHashMap<>();
+    // 仅sendQueue管理当前新批次的派发前等待；不扫描或自动重投已失败Outbox。
+    private static final Map<String, java.util.concurrent.CompletableFuture<Void>> sendReadiness = new HashMap<>();
+    // 仅sendQueue访问：准备完成的批次按会话等待当前RPC终态，不等待权威回显。
+    private static final Map<Long, java.util.ArrayDeque<PreparedSend>> preparedSends = new HashMap<>();
+    private static final java.util.ArrayDeque<Long> preparedDialogs = new java.util.ArrayDeque<>();
+    private static int preparedInFlight;
     // 审批读取可能等待桌面加载；独立串行执行，避免阻塞普通消息发送。
     private static final org.telegram.messenger.DispatchQueue approvalQueue = new org.telegram.messenger.DispatchQueue("codex-approval");
     private static final org.telegram.messenger.DispatchQueue transcriptQueue = new org.telegram.messenger.DispatchQueue("codex-transcript");
@@ -134,12 +145,14 @@ public final class CodexRuntime {
         loggedIn();
         if (!draftOwnerSaved) throw new java.io.IOException("草稿账号归属尚未保存");
         PasswordLogin.Session next = PasswordLogin.login(SERVER, name, password);
-        try { new SessionStore(ApplicationLoader.applicationContext).save(next); }
+        try { synchronized (TaskNotifications.class) { new SessionStore(ApplicationLoader.applicationContext).save(next); } }
         catch (Exception error) { next.close(); throw error; }
         if (session != null) session.close();
+        TaskNotifications.clear();
         session = next;
         accountGeneration++;
         sessionRestored = true;
+        CodexPushCoordinator.onLogin();
     }
 
     /** 已恢复会话只读内存，UI 不等待后台连接的类锁；首次调用仍沿原冷恢复入口。 */
@@ -152,7 +165,7 @@ public final class CodexRuntime {
     private static synchronized void restoreSession() {
         if (!sessionRestored && ApplicationLoader.applicationContext != null) {
             try {
-                session = new SessionStore(ApplicationLoader.applicationContext).read();
+                synchronized (TaskNotifications.class) { session = new SessionStore(ApplicationLoader.applicationContext).read(); }
             } catch (Exception error) {
                 // 无法解密时留在原登录页，不输出凭据也不伪造已登录。
                 session = null;
@@ -177,15 +190,18 @@ public final class CodexRuntime {
         if (loggingOut) return;
         final int previewAccount = org.telegram.messenger.UserConfig.selectedAccount;
         loggingOut = true;
+        CodexPushCoordinator.onLogout(session);
+        TaskNotifications.clear();
         accountGeneration++;
         watchGeneration++;
         watchedDialog = 0;
         Utilities.globalQueue.postRunnable(() -> {
-            try { new SessionStore(ApplicationLoader.applicationContext).clear(); }
+            try { synchronized (TaskNotifications.class) { new SessionStore(ApplicationLoader.applicationContext).clear(); } }
             catch (Exception error) {
                 AndroidUtilities.runOnUIThread(() -> {
                     statuses.rearmUnconfirmedGoalRestore();
                     loggingOut = false;
+                    CodexPushCoordinator.onLogin();
                     listRefreshScheduled = false;
                     loading = false;
                     connectedComputersPrefetching = false;
@@ -195,10 +211,11 @@ public final class CodexRuntime {
             }
             // 关闭 socket 会立即结束已发出的等待；仍在创建的连接在 openDesktop 返回前拒绝加入。
             for (DesktopConnection connection : desktopConnections.values()) connection.close();
-            org.telegram.messenger.DispatchQueue[] queues = {dialogQueue, sendQueue, approvalQueue, transcriptQueue,
+            org.telegram.messenger.DispatchQueue[] queues = {dialogQueue, sendQueue, uploadQueue, approvalQueue, transcriptQueue,
                     historyQueue, statusQueue, prefetchQueue, Utilities.globalQueue};
             java.util.concurrent.atomic.AtomicInteger remaining = new java.util.concurrent.atomic.AtomicInteger(queues.length);
             for (org.telegram.messenger.DispatchQueue queue : queues) queue.postRunnable(() -> {
+                if (queue == sendQueue) { preparedSends.clear(); preparedDialogs.clear(); preparedInFlight = 0; }
                 if (queue == statusQueue) {
                     if (statusPoll != null) statusQueue.cancelRunnable(statusPoll);
                     statusPoll = null;
@@ -229,7 +246,7 @@ public final class CodexRuntime {
                         }
                         dialogs.clear();
                         histories.clear(); historyViews.clear(); coldHistoryRequests.clear(); linkedSessions.clear(); pendingMessages.clear();
-                        attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear();
+                        attachmentGroups.clear(); attachmentStates.clear(); attachmentCallbacks.clear(); sendingBatches.clear(); sendJobs.clear();
                         statuses.clear(); dialogTitles.clear(); dialogDirectories.clear(); machineNames.clear();
                         prefetchedRevisions.clear(); prefetching.clear();
                         connectedComputersPrefetching = false;
@@ -314,6 +331,7 @@ public final class CodexRuntime {
         AndroidUtilities.runOnUIThread(() -> {
             if (!isAccountCurrent(accountEpoch) || desktopConnections.get(connection.machineId) != connection) return;
             statuses.unavailable(connection.machineId, disconnectedAt);
+            TaskNotifications.disconnected();
             NotificationCenter.getInstance(org.telegram.messenger.UserConfig.selectedAccount)
                     .postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
         });
@@ -492,6 +510,42 @@ public final class CodexRuntime {
         });
     }
 
+    /** 只消费现有状态 owner 的当前事实，不增加请求、轮询或后台服务。 */
+    private static void notifyAcceptedStatus(long dialogId, String machine, String remote,
+            JsonObject response, long receivedAt) {
+        PasswordLogin.Session owner = session;
+        if (owner == null || loggingOut || remote == null || remote.isEmpty()) return;
+        JsonObject observation = null;
+        if (response != null) {
+            com.google.gson.JsonElement raw = response.get("observation");
+            if (response.has("details") && response.get("details").isJsonObject())
+                raw = response.getAsJsonObject("details").get("codexObservation");
+            if (raw != null && raw.isJsonObject()) observation = raw.getAsJsonObject();
+        }
+        TaskNotifications.accept(TranscriptStore.digest(owner.server + "\n" + owner.accountId),
+                machine, remote, statuses.get(dialogId, android.os.SystemClock.elapsedRealtime()), observation, receivedAt);
+    }
+
+    /** 通知票据由当前账号私有存储解析；后台恢复稳定编号后，仍核对账号代次才导航。 */
+    public static void openTaskNotification(android.content.Intent intent, java.util.function.Consumer<Long> opened) {
+        if (!enabled() || !loggedIn()) return;
+        final PasswordLogin.Session owner = session;
+        final long epoch = accountGeneration;
+        final int account = org.telegram.messenger.UserConfig.selectedAccount;
+        TaskNotifications.Route route = TaskNotifications.resolve(
+                TranscriptStore.digest(owner.server + "\n" + owner.accountId), intent);
+        if (route == null) return;
+        Utilities.globalQueue.postRunnable(() -> {
+            long local = bindDialog(route.machine, route.remote, owner, epoch);
+            AndroidUtilities.runOnUIThread(() -> {
+                if (local == 0 || !isAccountCurrent(epoch) || session != owner
+                        || account != org.telegram.messenger.UserConfig.selectedAccount) return;
+                publishDialogUser(account, local, dialogTitles.getOrDefault(local, "未命名对话"));
+                opened.accept(local);
+            });
+        });
+    }
+
     /** 原列表直接读取当前快照；此方法与快照替换都限定在界面线程。 */
     public static ArrayList<TLRPC.Dialog> dialogs() { return dialogs; }
 
@@ -656,6 +710,53 @@ public final class CodexRuntime {
         }, progress);
     }
 
+    /** 上传取消后只保留原abort；首个清理异步等待，满额同步回退，原错误无需总是再等清理ACK。 */
+    private static AttachmentTransfer transfer(long epoch, long dialogId, String remote, DesktopConnection connection,
+            java.util.concurrent.atomic.AtomicBoolean active, AttachmentTransfer.Progress progress) {
+        return new AttachmentTransfer((method, params) -> {
+            boolean abort = "daemon.bulkTransfer.upload.abort".equals(method);
+            if (!attachmentCurrent(epoch, dialogId, remote, connection) || !abort && !active.get())
+                throw new IOException("附件作业已结束");
+            JsonObject result;
+            if (abort) {
+                // 取消位仅作为原派发门；清理允许active=false，但账号、会话及连接实例仍须匹配。
+                java.util.function.BooleanSupplier permitted = () -> attachmentCurrent(epoch, dialogId, remote, connection);
+                if (uploadAbortInFlight.compareAndSet(false, true)) {
+                    boolean observed = false;
+                    try {
+                        connection.abortUploadAsync(params, active, permitted).whenComplete((value, error) -> uploadAbortInFlight.set(false));
+                        observed = true;
+                        // 原AttachmentTransfer.abort忽略返回值；null不代表远端清理成功，也不更新消息状态。
+                        return null;
+                    } finally {
+                        if (!observed) uploadAbortInFlight.set(false);
+                    }
+                }
+                result = connection.abortUpload(params, active, permitted);
+            } else {
+                result = connection.transfer(method, params);
+            }
+            // 取消恰好发生在init回执时，仍让原传输器取得uploadId；下个分块会停止并执行既有abort。
+            if (!attachmentCurrent(epoch, dialogId, remote, connection)
+                    || !abort && !active.get() && !"daemon.bulkTransfer.upload.init".equals(method))
+                throw new IOException("附件作业已结束");
+            return result;
+        }, progress);
+    }
+
+    /** 上传进度同时核对本批取消位，已经入UI队列的晚进度也不能改写删除后的状态。 */
+    private static void attachmentProgress(int account, long epoch, long dialogId, String remote,
+            DesktopConnection connection, java.util.concurrent.atomic.AtomicBoolean active,
+            String key, boolean upload, long done, long total) {
+        AndroidUtilities.runOnUIThread(() -> {
+            if (!sendJobCurrent(epoch, dialogId, remote, active)
+                    || !attachmentCurrent(epoch, dialogId, remote, connection)) return;
+            attachmentStates.put(key, new AttachmentState(true, upload, false, done, total));
+            NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces,
+                    MessagesController.UPDATE_MASK_SEND_STATE);
+        });
+    }
+
     /** 分块回调仅更新原气泡；不重新装载聊天历史或改变列表滚动。 */
     private static void attachmentProgress(int account, long epoch, long dialogId, String remote,
             DesktopConnection connection, String key, boolean upload, long done, long total) {
@@ -739,11 +840,70 @@ public final class CodexRuntime {
         return expected;
     }
 
-    /** 已接受或结果未知均等待同身份回显，不能从原菜单重复提交。 */
+    /** 只读原消息的投递参数；已接受优先，未知结果不等于仍在传输。 */
+    public static boolean isMessageDeliveryUncertain(MessageObject message) {
+        return message != null && message.messageOwner != null && message.messageOwner.params != null
+                && message.messageOwner.params.containsKey("codexLocalId")
+                && "true".equals(message.messageOwner.params.get("codexSendUncertain"))
+                && !"true".equals(message.messageOwner.params.get("codexSendAccepted"));
+    }
+
+    /** 已接受或结果未知等待同身份回显；原批次正发送或移除时也不能从菜单再次提交。 */
     public static boolean canRetryMessage(MessageObject message) {
-        return message != null && (message.messageOwner.params == null
-                || !"true".equals(message.messageOwner.params.get("codexSendUncertain"))
-                && !"true".equals(message.messageOwner.params.get("codexSendAccepted")));
+        if (message == null || message.messageOwner == null) return false;
+        if (message.messageOwner.params == null) return true;
+        String batch = message.messageOwner.params.getOrDefault("codexBatchLocalId", message.messageOwner.params.get("codexLocalId"));
+        return !"true".equals(message.messageOwner.params.get("codexSendUncertain"))
+                && !"true".equals(message.messageOwner.params.get("codexSendAccepted"))
+                && (batch == null || !sendingBatches.contains(batch));
+    }
+
+    /** 原菜单的一次只读资格，不缓存消息状态；点击时须重新读取。非null才可本地移除。 */
+    public static final class PendingMessageMenu {
+        public final boolean restoreText, removeGroup;
+        /** 只携带本次菜单展示结果，后续点击不能把该快照当作操作许可。 */
+        private PendingMessageMenu(boolean restoreText, boolean removeGroup) {
+            this.restoreText = restoreText; this.removeGroup = removeGroup;
+        }
+    }
+
+    /** 只认当前账号拥有的原待发对象；历史正号、相同localId旧对象和仍在执行的批次都无入口。 */
+    public static PendingMessageMenu pendingMessageMenu(int account, long dialogId, MessageObject message) {
+        if (!enabled() || !isAccountCurrent(accountGeneration) || account != org.telegram.messenger.UserConfig.selectedAccount
+                || !ownsConversation(dialogId) || !ownsPendingMessage(account, dialogId, message)) return null;
+        String batch = message.messageOwner.params.getOrDefault("codexBatchLocalId", message.messageOwner.params.get("codexLocalId"));
+        if (batch == null || batch.isEmpty() || sendingBatches.contains(batch)) return null;
+        java.util.concurrent.atomic.AtomicBoolean job = sendJobs.get(batch);
+        if (job != null && job.get()) return null;
+        int count = 0;
+        boolean group = false;
+        for (MessageObject member : pendingMessages.values()) {
+            if (member == null || member.messageOwner == null || member.messageOwner.params == null
+                    || !batch.equals(member.messageOwner.params.getOrDefault("codexBatchLocalId", member.messageOwner.params.get("codexLocalId")))) continue;
+            if (!ownsPendingMessage(account, dialogId, member)
+                    || "true".equals(member.messageOwner.params.get("codexSendAccepted"))
+                    || !member.isSendError() && !isMessageDeliveryUncertain(member)) return null;
+            count++;
+            // 只剩后续附件时也明确按原batch移除，不能把组操作伪装成单个附件。
+            String index = member.messageOwner.params.get("codexAttachmentIndex");
+            if (index != null && !"0".equals(index)) group = true;
+        }
+        if (count == 0) return null;
+        boolean restore = message.isSendError() && !isMessageDeliveryUncertain(message) && count == 1 && !group
+                && !isAttachmentMessage(message)
+                && (message.messageOwner.media == null || message.messageOwner.media instanceof TLRPC.TL_messageMediaEmpty)
+                && (message.messageOwner.entities == null || message.messageOwner.entities.isEmpty())
+                && message.messageOwner.message != null && !message.messageOwner.message.isEmpty();
+        return new PendingMessageMenu(restore, group || count > 1);
+    }
+
+    /** UI线程只读现有pending owner，不按正文、编号相等或localId相同冒认另一个对象。 */
+    private static boolean ownsPendingMessage(int account, long dialogId, MessageObject message) {
+        if (message == null || message.messageOwner == null || message.messageOwner.params == null
+                || message.currentAccount != account || message.getDialogId() != dialogId
+                || message.getId() >= 0 || !message.isOut()) return false;
+        String localId = message.messageOwner.params.get("codexLocalId");
+        return localId != null && !localId.isEmpty() && pendingMessages.get(localId) == message;
     }
 
     /** 原输入框清空后立刻产生本地气泡；同组图片或文件收齐后只提交一个桌面输入。 */
@@ -846,16 +1006,13 @@ public final class CodexRuntime {
         final long sendStarted = android.os.SystemClock.elapsedRealtime();
         final ArrayList<Map<String, String>> selectedMetadata = new ArrayList<>();
         for (MessageObject pending : messages) selectedMetadata.add(new HashMap<>(pending.messageOwner.params));
-        // UI 可继续输入；暂存、摘要、上传和一次桌面发送始终串行进入既有发送队列。
+        // 首写与最终派发保留原发送顺序；附件流式工作独立串行，不挡住后发文字。
         sendQueue.postRunnable(() -> {
-            DesktopConnection connection = null;
-            boolean uncertain = false;
-            String failureCode = null;
             try {
+                if (!isAccountCurrent(epoch) || !remote.equals(remoteIds.get(dialogId))) return;
                 traceSend("queue", base, sendStarted);
-                OutboxStore.Item stored = outbox.get(base);
-                uncertain = stored != null && stored.submissionUncertain;
-                if (stored == null) {
+                OutboxStore.Item admitted = outbox.get(base);
+                if (admitted == null) {
                     ArrayList<OutboxStore.Selection> choices = new ArrayList<>();
                     for (Map<String, String> metadata : selectedMetadata) {
                         if (metadata.containsKey("codexSelectedFile")) {
@@ -869,106 +1026,332 @@ public final class CodexRuntime {
                         }
                     }
                     MessageObject first = messages.get(0);
-                    stored = OutboxStore.Item.selected(base, remote, first.messageOwner.message, first.getId(), first.messageOwner.date, choices);
+                    admitted = OutboxStore.Item.selected(base, remote, first.messageOwner.message, first.getId(), first.messageOwner.date, choices);
                     // 任何附件读取之前先记录完整选择；首写本身失败时只能保留内存气泡。
-                    outbox.put(stored);
+                    outbox.put(admitted);
                 }
                 traceSend("persisted", base, sendStarted);
                 if (!isAccountCurrent(epoch)) return;
-                if (stored.submissionAccepted) { finishSend(account, epoch, base, messages, remote, null, true, false, null); return; }
+                if (admitted.submissionAccepted) { finishSend(account, epoch, base, messages, remote, null, true, false, null); return; }
                 // 原请求可能已派发；即使用户点击重试也等待回显，不重复进入桌面发送。
-                if (stored.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true, null); return; }
+                if (admitted.submissionUncertain) { finishSend(account, epoch, base, messages, remote, null, false, true, null); return; }
                 // 清除旧解释必须先落盘；失败时停止本次远端工作，不能留下新失败的旧原因。
-                if (stored.failureCode != null) outbox.markFailureCode(base, null);
-                // 完整选择已保存再预检；已上传前缀不再受新的上传上限约束或被重传。
-                for (int i = stored.uploaded.size(); i < stored.attachmentCount(); i++) {
-                    String path = i < stored.attachments.size() ? stored.attachments.get(i).localPath : stored.selections.get(i).localPath;
-                    if (attachmentTooLarge(dialogId, path == null ? null : new File(path))) {
-                        failureCode = OutboxStore.FAILURE_FILE_TOO_LARGE;
-                        throw new IOException("附件超过该电脑的上传上限");
-                    }
-                }
-                ArrayList<DesktopAttachment.Pending> staged = new ArrayList<>(stored.attachments);
-                for (int i = staged.size(); i < stored.selections.size(); i++) {
-                    if (!isAccountCurrent(epoch)) return;
-                    OutboxStore.Selection choice = stored.selections.get(i);
-                    String localId = TranscriptText.attachmentIdentity(base, i);
-                    DesktopAttachment.Pending original = AttachmentFiles.stage(
-                            choice.localPath == null ? null : new File(choice.localPath), choice.name, choice.kind, choice.mimeType,
-                            directory, "send\n" + localId);
-                    staged.add(original);
-                    outbox.rememberStaged(base, staged);
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (!isAccountCurrent(epoch)) return;
-                        MessageObject pending = pendingMessages.get(localId);
-                        if (pending == null || pending.getDialogId() != dialogId) return;
-                        AttachmentMessages.applyPending((TLRPC.TL_message) pending.messageOwner, original);
-                        pending.attachPathExists = pending.mediaExists = true;
-                        pending.generateThumbs(false);
-                    });
-                }
-                stored = outbox.get(base);
-                if (stored == null || !stored.isPrepared()) throw new IOException("附件尚未全部暂存");
-                connection = dialogConnection(dialogId);
-                if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话所属电脑尚未连接");
-                String linked = linkedSessions.get(dialogId);
-                if (linked == null) {
-                    linked = connection.openConversation(remote).get("sessionId").getAsString();
-                    if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话连接已变化");
-                    linkedSessions.put(dialogId, linked);
-                }
-                traceSend("linked", base, sendStarted);
-                final DesktopConnection transferConnection = connection;
-                ArrayList<DesktopAttachment> uploaded = new ArrayList<>(stored.uploaded);
-                if (!stored.attachments.isEmpty() && (cwd == null || cwd.isEmpty())) throw new IOException("原会话工作目录暂不可用");
-                for (int i = uploaded.size(); i < stored.attachments.size(); i++) {
-                    final DesktopAttachment.Pending original = stored.attachments.get(i);
-                    final String localId = TranscriptText.attachmentIdentity(base, i);
-                    final String key = epoch + ":" + dialogId + ":" + localId;
-                    AttachmentTransfer.Result result;
-                    // 选择后的文件或限额可能变化，实际上传前再次读取本件字节数。
-                    if (attachmentTooLarge(dialogId, new File(original.localPath))) {
-                        failureCode = OutboxStore.FAILURE_FILE_TOO_LARGE;
-                        throw new IOException("附件超过该电脑的上传上限");
-                    }
-                    try {
-                        result = transfer(epoch, dialogId, remote, transferConnection,
-                                (done, total) -> attachmentProgress(account, epoch, dialogId, remote, transferConnection, key, true, done, total))
-                                .upload(new File(original.localPath), original.kind, localId, cwd);
-                    } catch (IOException uploadFailure) {
-                        // 只有本次上传的明确拒绝可标大小，其他阶段错误继续原失败语义。
-                        failureCode = attachmentUploadFailureCode(uploadFailure);
-                        throw uploadFailure;
-                    }
-                    uploaded.add(original.uploaded(result.path, result.sizeBytes, result.sha256));
-                    outbox.rememberUploaded(base, uploaded);
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (isAccountCurrent(epoch)) attachmentStates.put(key,
-                                new AttachmentState(false, true, false, original.sizeBytes, original.sizeBytes));
-                    });
-                }
-                if (!attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话连接已变化");
-                outbox.markSubmissionUncertain(base, true);
-                uncertain = true;
-                try { connection.send(linked, stored.text, stored.localId, uploaded); }
-                catch (DesktopConnection.RpcNotDispatchedException | DesktopConnection.SendRejectedException notAccepted) {
-                    outbox.markSubmissionUncertain(base, false);
-                    uncertain = false;
-                    throw notAccepted;
-                }
-                traceSend("ack", base, sendStarted);
-                // ACK事实沿原记录落盘；磁盘失败不推翻当前已接受，冷恢复仍只按已存未知等待回显。
-                try { outbox.markSubmissionAccepted(base); }
-                catch (IOException error) { android.util.Log.w("CodexBridge", "send_ack_persist_failed"); }
-                finishSend(account, epoch, base, messages, remote, connection, true, false, null);
+                if (admitted.failureCode != null) outbox.markFailureCode(base, null);
+                final java.util.concurrent.atomic.AtomicBoolean active = new java.util.concurrent.atomic.AtomicBoolean(true);
+                sendJobs.put(base, active);
+                prepareWhenConnected(account, epoch, dialogId, remote, cwd, directory, outbox,
+                        base, messages, sendStarted, active);
             } catch (Exception error) {
-                if (failureCode != null && !uncertain && isAccountCurrent(epoch)) {
-                    try { outbox.markFailureCode(base, failureCode); }
-                    catch (IOException ignored) { /* 保留原待发记录；当前气泡仍可解释，重开只认已落盘事实。 */ }
-                }
-                finishSend(account, epoch, base, messages, remote, connection, false, uncertain, failureCode);
+                finishSend(account, epoch, base, messages, remote, null, false, false, null);
             }
         });
+    }
+
+    /** 已持久化的新批次沿原连接异步等就绪；25秒期限不占UI、发送或附件工作队列。 */
+    private static void prepareWhenConnected(int account, long epoch, long dialogId, String remote, String cwd,
+            File directory, OutboxStore outbox, String base, ArrayList<MessageObject> messages, long sendStarted,
+            java.util.concurrent.atomic.AtomicBoolean active) {
+        final DesktopConnection connection = dialogConnection(dialogId);
+        if (!attachmentCurrent(epoch, dialogId, remote, connection)) {
+            sendJobs.remove(base, active);
+            finishSend(account, epoch, base, messages, remote, connection, false, false, null);
+            return;
+        }
+        final java.util.concurrent.CompletableFuture<Void> ready = connection.whenConnected();
+        sendReadiness.put(base, ready);
+        final long deadline = android.os.SystemClock.elapsedRealtime() + 25000;
+        final boolean waited = !ready.isDone();
+        final Runnable timeout = () -> ready.completeExceptionally(new IOException("电脑连接恢复超时"));
+        if (waited) {
+            traceSend("wait_ready", base, sendStarted);
+            sendQueue.postRunnable(timeout, 25000);
+        }
+        // Socket事件只排回原发送队列；Outbox核对、期限清理和准入保持串行。
+        ready.whenComplete((ignored, error) -> sendQueue.postRunnable(() -> {
+            sendQueue.cancelRunnable(timeout);
+            if (!sendReadiness.remove(base, ready)) return;
+            boolean forwarded = false;
+            try {
+                if (!sendJobCurrent(epoch, dialogId, remote, active)) return;
+                OutboxStore.Item stored = outbox.get(base);
+                if (stored == null) return;
+                if (!remote.equals(stored.remote)) throw new IOException("对话归属已变化");
+                // 等待期间到达的提交事实优先；任何已接受或未知批次都不能再次派发。
+                if (stored.submissionAccepted || stored.submissionUncertain) {
+                    finishSend(account, epoch, base, messages, remote, connection,
+                            stored.submissionAccepted, stored.submissionUncertain, null);
+                    return;
+                }
+                if (error != null || waited && android.os.SystemClock.elapsedRealtime() >= deadline
+                        || !attachmentCurrent(epoch, dialogId, remote, connection) || !connection.isConnected())
+                    throw new IOException("对话连接尚未恢复");
+                if (waited) traceSend("ready", base, sendStarted);
+                final Runnable work = () -> prepareSend(account, epoch, dialogId, remote, cwd, directory, outbox,
+                        base, messages, sendStarted, active, connection);
+                if (stored.attachmentCount() > 0) uploadQueue.postRunnable(work);
+                else work.run();
+                forwarded = true;
+            } catch (Exception failure) {
+                finishSend(account, epoch, base, messages, remote, connection, false, false, null);
+            } finally {
+                if (!forwarded) sendJobs.remove(base, active);
+            }
+        }));
+    }
+
+    /** 单个附件队列沿准入时的原连接暂存上传；已删除记录不再首写，完成后回原队列派发。 */
+    private static void prepareSend(int account, long epoch, long dialogId, String remote, String cwd, File directory,
+            OutboxStore outbox, String base, ArrayList<MessageObject> messages, long sendStarted,
+            java.util.concurrent.atomic.AtomicBoolean active, DesktopConnection connection) {
+        boolean uncertain = false;
+        String failureCode = null;
+        boolean forwarded = false;
+        try {
+            if (!sendJobCurrent(epoch, dialogId, remote, active)) return;
+            OutboxStore.Item stored = outbox.get(base);
+            if (stored == null) return;
+            // 完整选择已保存再预检；已上传前缀不再受新的上传上限约束或被重传。
+            for (int i = stored.uploaded.size(); i < stored.attachmentCount(); i++) {
+                String path = i < stored.attachments.size() ? stored.attachments.get(i).localPath : stored.selections.get(i).localPath;
+                if (attachmentTooLarge(dialogId, path == null ? null : new File(path))) {
+                    failureCode = OutboxStore.FAILURE_FILE_TOO_LARGE;
+                    throw new IOException("附件超过该电脑的上传上限");
+                }
+            }
+            ArrayList<DesktopAttachment.Pending> staged = new ArrayList<>(stored.attachments);
+            for (int i = staged.size(); i < stored.selections.size(); i++) {
+                if (!sendJobCurrent(epoch, dialogId, remote, active)) return;
+                OutboxStore.Selection choice = stored.selections.get(i);
+                String localId = TranscriptText.attachmentIdentity(base, i);
+                DesktopAttachment.Pending original = AttachmentFiles.stage(
+                        choice.localPath == null ? null : new File(choice.localPath), choice.name, choice.kind, choice.mimeType,
+                        directory, "send\n" + localId);
+                if (!sendJobCurrent(epoch, dialogId, remote, active)) return;
+                staged.add(original);
+                outbox.rememberStaged(base, staged);
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (!sendJobCurrent(epoch, dialogId, remote, active)) return;
+                    MessageObject pending = pendingMessages.get(localId);
+                    if (pending == null || pending.getDialogId() != dialogId) return;
+                    AttachmentMessages.applyPending((TLRPC.TL_message) pending.messageOwner, original);
+                    pending.attachPathExists = pending.mediaExists = true;
+                    pending.generateThumbs(false);
+                });
+            }
+            stored = outbox.get(base);
+            if (stored == null || !stored.isPrepared()) throw new IOException("附件尚未全部暂存");
+            if (!sendJobCurrent(epoch, dialogId, remote, active)
+                    || !attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话所属电脑尚未连接");
+            final DesktopConnection transferConnection = connection;
+            ArrayList<DesktopAttachment> uploaded = new ArrayList<>(stored.uploaded);
+            if (!stored.attachments.isEmpty() && (cwd == null || cwd.isEmpty())) throw new IOException("原会话工作目录暂不可用");
+            for (int i = uploaded.size(); i < stored.attachments.size(); i++) {
+                final DesktopAttachment.Pending original = stored.attachments.get(i);
+                final String localId = TranscriptText.attachmentIdentity(base, i);
+                final String key = epoch + ":" + dialogId + ":" + localId;
+                AttachmentTransfer.Result result;
+                // 选择后的文件或限额可能变化，实际上传前再次读取本件字节数。
+                if (attachmentTooLarge(dialogId, new File(original.localPath))) {
+                    failureCode = OutboxStore.FAILURE_FILE_TOO_LARGE;
+                    throw new IOException("附件超过该电脑的上传上限");
+                }
+                try {
+                    result = transfer(epoch, dialogId, remote, transferConnection, active,
+                            (done, total) -> attachmentProgress(account, epoch, dialogId, remote, transferConnection, active, key, true, done, total))
+                            .upload(new File(original.localPath), original.kind, localId, cwd);
+                } catch (IOException uploadFailure) {
+                    // 只有本次上传的明确拒绝可标大小，其他阶段错误继续原失败语义。
+                    failureCode = attachmentUploadFailureCode(uploadFailure);
+                    throw uploadFailure;
+                }
+                if (!sendJobCurrent(epoch, dialogId, remote, active)) return;
+                uploaded.add(original.uploaded(result.path, result.sizeBytes, result.sha256));
+                outbox.rememberUploaded(base, uploaded);
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (sendJobCurrent(epoch, dialogId, remote, active)
+                            && attachmentCurrent(epoch, dialogId, remote, transferConnection)) attachmentStates.put(key,
+                            new AttachmentState(false, true, false, original.sizeBytes, original.sizeBytes));
+                });
+            }
+            if (!sendJobCurrent(epoch, dialogId, remote, active)
+                    || !attachmentCurrent(epoch, dialogId, remote, connection)) throw new IOException("对话连接已变化");
+            traceSend("prepared", base, sendStarted);
+            submitPreparedSend(account, epoch, dialogId, remote, outbox, base, messages, connection, sendStarted, active);
+            forwarded = true;
+        } catch (Exception error) {
+            if (active.get() && failureCode != null && !uncertain && isAccountCurrent(epoch)) {
+                try { outbox.markFailureCode(base, failureCode); }
+                catch (IOException ignored) { /* 保留原待发记录；当前气泡仍可解释，重开只认已落盘事实。 */ }
+            }
+            finishSend(account, epoch, base, messages, remote, connection, false, uncertain, failureCode);
+        } finally {
+            if (!forwarded) sendJobs.remove(base, active);
+        }
+    }
+
+    /** 仅保存本次已准备批次的引用；原Outbox仍是唯一持久化身份和提交事实。 */
+    private static final class PreparedSend {
+        final int account;
+        final long epoch, dialogId, sendStarted;
+        final String remote, base;
+        final OutboxStore outbox;
+        final ArrayList<MessageObject> messages;
+        final DesktopConnection connection;
+        final java.util.concurrent.atomic.AtomicBoolean active;
+        boolean uncertain;
+
+        PreparedSend(int account, long epoch, long dialogId, String remote, OutboxStore outbox, String base,
+                ArrayList<MessageObject> messages, DesktopConnection connection, long sendStarted,
+                java.util.concurrent.atomic.AtomicBoolean active) {
+            this.account = account; this.epoch = epoch; this.dialogId = dialogId; this.remote = remote;
+            this.outbox = outbox; this.base = base; this.messages = messages; this.connection = connection;
+            this.sendStarted = sendStarted; this.active = active;
+        }
+    }
+
+    /** 准备完成后才按会话等待；首写、删除及其他会话不等待网络回执。 */
+    private static void submitPreparedSend(int account, long epoch, long dialogId, String remote, OutboxStore outbox,
+            String base, ArrayList<MessageObject> messages, DesktopConnection connection, long sendStarted,
+            java.util.concurrent.atomic.AtomicBoolean active) {
+        sendQueue.postRunnable(() -> {
+            PreparedSend send = new PreparedSend(account, epoch, dialogId, remote, outbox, base, messages,
+                    connection, sendStarted, active);
+            java.util.ArrayDeque<PreparedSend> ready = preparedSends.get(dialogId);
+            if (ready == null) {
+                ready = new java.util.ArrayDeque<>(); preparedSends.put(dialogId, ready); preparedDialogs.addLast(dialogId);
+            }
+            ready.addLast(send);
+            admitPreparedSends();
+        });
+    }
+
+    /** 最多两条关联/发送链在途；待位会话FIFO轮转，首写和上传不消耗名额。 */
+    private static void admitPreparedSends() {
+        while (preparedInFlight < 2 && !preparedDialogs.isEmpty()) {
+            Long dialogId = preparedDialogs.removeFirst();
+            java.util.ArrayDeque<PreparedSend> ready = preparedSends.get(dialogId);
+            if (ready == null || ready.isEmpty()) continue;
+            preparedInFlight++;
+            traceSend("admitted", ready.peekFirst().base, ready.peekFirst().sendStarted);
+            startPreparedSend(ready.peekFirst());
+        }
+    }
+
+    /** 原关联RPC只等待future；回执回原队列后再核对归属和原记录。 */
+    private static void startPreparedSend(PreparedSend send) {
+        try {
+            if (!sendJobCurrent(send.epoch, send.dialogId, send.remote, send.active)) {
+                completePreparedSend(send, false, null); return;
+            }
+            if (!attachmentCurrent(send.epoch, send.dialogId, send.remote, send.connection)) throw new IOException("对话连接已变化");
+            OutboxStore.Item stored = send.outbox.get(send.base);
+            if (stored == null) { completePreparedSend(send, false, null); return; }
+            if (stored.submissionAccepted || stored.submissionUncertain) {
+                send.uncertain = stored.submissionUncertain;
+                completePreparedSend(send, stored.submissionAccepted, null); return;
+            }
+            if (!stored.remote.equals(send.remote) || !stored.isPrepared() || stored.uploaded.size() != stored.attachmentCount())
+                throw new IOException("原批次尚未完成准备");
+            String linked = linkedSessions.get(send.dialogId);
+            if (linked != null) { dispatchPreparedSend(send, linked); return; }
+            send.connection.linkConversationForSendAsync(send.remote, send.active,
+                    () -> sendJobCurrent(send.epoch, send.dialogId, send.remote, send.active)
+                            && attachmentCurrent(send.epoch, send.dialogId, send.remote, send.connection))
+                    .whenComplete((result, error) -> sendQueue.postRunnable(() -> linkedPreparedSend(send, result, error)));
+        } catch (Exception error) { completePreparedSend(send, false, error); }
+    }
+
+    /** 关联完成后才发布当前会话身份；旧账号、删除和换连接不能继续发送。 */
+    private static void linkedPreparedSend(PreparedSend send, JsonObject result, Throwable error) {
+        if (error != null) { completePreparedSend(send, false, error); return; }
+        try {
+            if (!sendJobCurrent(send.epoch, send.dialogId, send.remote, send.active)) {
+                completePreparedSend(send, false, null); return;
+            }
+            if (!attachmentCurrent(send.epoch, send.dialogId, send.remote, send.connection)) throw new IOException("对话连接已变化");
+            String linked = result.get("sessionId").getAsString();
+            String existing = linkedSessions.putIfAbsent(send.dialogId, linked);
+            traceSend("link_ack", send.base, send.sendStarted);
+            dispatchPreparedSend(send, existing == null ? linked : existing);
+        } catch (Exception failure) { completePreparedSend(send, false, failure); }
+    }
+
+    /** 派发前原身份记未知；与连接层共用取消门，零派发和明确拒绝才清未知。 */
+    private static void dispatchPreparedSend(PreparedSend send, String linked) {
+        try {
+            if (!sendJobCurrent(send.epoch, send.dialogId, send.remote, send.active)) {
+                completePreparedSend(send, false, null); return;
+            }
+            if (!attachmentCurrent(send.epoch, send.dialogId, send.remote, send.connection)) throw new IOException("对话连接已变化");
+            OutboxStore.Item stored = send.outbox.get(send.base);
+            if (stored == null) { completePreparedSend(send, false, null); return; }
+            if (stored.submissionAccepted || stored.submissionUncertain) {
+                send.uncertain = stored.submissionUncertain;
+                completePreparedSend(send, stored.submissionAccepted, null); return;
+            }
+            if (!stored.remote.equals(send.remote) || !stored.isPrepared() || stored.uploaded.size() != stored.attachmentCount())
+                throw new IOException("原批次尚未完成准备");
+            traceSend("linked", send.base, send.sendStarted);
+            send.outbox.markSubmissionUncertain(send.base, true);
+            send.uncertain = true;
+            send.connection.sendAsync(linked, stored.text, stored.localId, new ArrayList<>(stored.uploaded), send.active,
+                    () -> sendJobCurrent(send.epoch, send.dialogId, send.remote, send.active)
+                            && attachmentCurrent(send.epoch, send.dialogId, send.remote, send.connection))
+                    .whenComplete((result, error) -> {
+                        // 先记录完成通知，再沿原队列处理终态，用于区分回执与本地排队耗时。
+                        traceSendCompletion("completion_post", send.base);
+                        sendQueue.postRunnable(() -> {
+                            traceSendCompletion("completion_run", send.base);
+                            completePreparedSend(send, error == null, error);
+                        });
+                    });
+        } catch (Exception error) { completePreparedSend(send, false, error); }
+    }
+
+    /** ACK、拒绝、断线或超时即释放会话门；unknown只限制原localId，不阻挡新消息。 */
+    private static void completePreparedSend(PreparedSend send, boolean success, Throwable error) {
+        java.util.ArrayDeque<PreparedSend> ready = preparedSends.get(send.dialogId);
+        if (ready == null || ready.peekFirst() != send) return;
+        try {
+            // 成功ACK是原账号和会话的事实，不能因连接替换而降级；删除后不复活记录。
+            if (isAccountCurrent(send.epoch) && send.remote.equals(remoteIds.get(send.dialogId))) {
+                if (success) {
+                    traceSend("ack", send.base, send.sendStarted);
+                    try { send.outbox.markSubmissionAccepted(send.base); }
+                    catch (IOException failure) { android.util.Log.w("CodexBridge", "send_ack_persist_failed"); }
+                    finishSend(send.account, send.epoch, send.base, send.messages, send.remote, send.connection, true, false, null);
+                } else {
+                    OutboxStore.Item stored = send.outbox.get(send.base);
+                    if (stored == null) return;
+                    if (stored.submissionAccepted) {
+                        finishSend(send.account, send.epoch, send.base, send.messages, send.remote, send.connection, true, false, null);
+                        return;
+                    }
+                    while (error instanceof java.util.concurrent.CompletionException && error.getCause() != null) error = error.getCause();
+                    if (send.uncertain && (error instanceof DesktopConnection.RpcNotDispatchedException
+                            || error instanceof DesktopConnection.SendRejectedException)) {
+                        send.outbox.markSubmissionUncertain(send.base, false);
+                        send.uncertain = false;
+                    }
+                    finishSend(send.account, send.epoch, send.base, send.messages, send.remote, send.connection, false, send.uncertain, null);
+                }
+            }
+        } catch (Exception failure) {
+            finishSend(send.account, send.epoch, send.base, send.messages, send.remote, send.connection, false, send.uncertain, null);
+        } finally {
+            sendJobs.remove(send.base, send.active);
+            ready.removeFirst();
+            preparedInFlight--;
+            if (ready.isEmpty()) preparedSends.remove(send.dialogId);
+            else preparedDialogs.addLast(send.dialogId);
+            sendQueue.postRunnable(CodexRuntime::admitPreparedSends);
+        }
+    }
+
+    /** 轻量取消位只限制本批作业；热路径不逐分块重新读取Outbox磁盘。 */
+    private static boolean sendJobCurrent(long epoch, long dialogId, String remote,
+            java.util.concurrent.atomic.AtomicBoolean active) {
+        return active.get() && isAccountCurrent(epoch) && remote.equals(remoteIds.get(dialogId));
     }
 
     /** 仅匹配上传层已确认的两条大小拒绝，不递归原因或持久化任意服务器正文。 */
@@ -978,6 +1361,18 @@ public final class CodexRuntime {
                 ? OutboxStore.FAILURE_FILE_TOO_LARGE : null;
     }
 
+    /** 显式诊断时记录原完成回调入队及执行时刻；默认不读时钟或拼串，日志故障不影响送达结算。 */
+    private static void traceSendCompletion(String phase, String localId) {
+        if (!org.telegram.messenger.BuildConfig.DEBUG_VERSION) return;
+        try {
+            if (!android.util.Log.isLoggable("CodexSendAck", android.util.Log.DEBUG)
+                    || ApplicationLoader.applicationContext == null
+                    || !ApplicationLoader.applicationContext.getPackageName().startsWith("com.butang.codextop.nativepreview")) return;
+            android.util.Log.i("CodexSendAck", "send_ack_phase=" + phase + " key=" + localId.hashCode()
+                    + " elapsedRealtimeMs=" + android.os.SystemClock.elapsedRealtime());
+        } catch (Throwable ignored) { /* 诊断不能改变原队列和完成通知语义。 */ }
+    }
+
     /** 保留原收发分段计时，仅记录阶段与随机消息身份摘要，不记录正文或文件路径。 */
     private static void traceSend(String phase, String localId, long started) {
         if (org.telegram.messenger.BuildVars.DEBUG_VERSION) android.util.Log.i("CodexBridge",
@@ -985,7 +1380,7 @@ public final class CodexRuntime {
                         + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - started));
     }
 
-    /** 原账号与会话的ACK不因连接替换失效；未知使用原等待时钟，明确失败才显示重试。 */
+    /** 原账号与会话的ACK不因连接替换失效；未知保留原投递状态，呈现单独区分，明确失败才显示重试。 */
     private static void finishSend(int account, long epoch, String base, ArrayList<MessageObject> messages,
             String remote, DesktopConnection connection, boolean success, boolean uncertain, String failureCode) {
         AndroidUtilities.runOnUIThread(() -> {
@@ -1319,7 +1714,9 @@ public final class CodexRuntime {
             AndroidUtilities.runOnUIThread(() -> {
                 if (!isAccountCurrent(epoch) || generation != watchGeneration || watchedDialog != dialogId) return;
                 // 发布前再取界面上的最新事实。仍过期可以交给原表单停用，不能当成可回答。
-                if (loaded == null || !loaded.current()) callback.accept(null, "电脑连接已变化，请重新查看问题。");
+                // RPC超时或解析失败没有证明连接变化；先保留读取失败，仅成功快照再核对身份。
+                if (loaded == null) callback.accept(null, message);
+                else if (!loaded.current()) callback.accept(null, "电脑连接已变化，请重新查看问题。");
                 else {
                     long expiry = statuses.currentExpiry(dialogId, loaded.machine, android.os.SystemClock.elapsedRealtime());
                     loaded.adoptExpiry(expiry);
@@ -1595,7 +1992,7 @@ public final class CodexRuntime {
         });
     }
 
-    /** 原失败气泡的删除只清理手机待发记录，不操作桌面消息。 */
+    /** 原失败气泡的删除只清理手机待发记录；UI同步预占原批次门，落盘与UI清理结束才释放。 */
     public static boolean deletePendingMessages(int account, long dialogId, ArrayList<Integer> messageIds) {
         final long accountEpoch = accountGeneration;
         if (!isAccountCurrent(accountEpoch)) return false;
@@ -1604,9 +2001,22 @@ public final class CodexRuntime {
         final ArrayList<Integer> selected = new ArrayList<>(messageIds);
         final String remote = remoteIds.get(dialogId);
         final OutboxStore outbox = outboxStore(dialogId);
+        final HashMap<String, MessageObject> pendingAtDelete = new HashMap<>();
+        final java.util.HashSet<String> reservedBatches = new java.util.HashSet<>();
+        for (Map.Entry<String, MessageObject> entry : pendingMessages.entrySet()) {
+            MessageObject pending = entry.getValue();
+            if (pending.getDialogId() != dialogId) continue;
+            pendingAtDelete.put(entry.getKey(), pending);
+            if (selected.contains(pending.getId())) {
+                String batch = pending.messageOwner.params.getOrDefault("codexBatchLocalId", entry.getKey());
+                // 只认本次新取得的门；原在途作业仍沿既有取消路径处理。
+                if (batch != null && sendingBatches.add(batch)) reservedBatches.add(batch);
+            }
+        }
         // 与发送落盘串行，避免删除完成后较早排队的发送又把记录写回来。
         sendQueue.postRunnable(() -> {
             if (!isAccountCurrent(accountEpoch)) return;
+            final ArrayList<String> removedBatches = new ArrayList<>();
             try {
                 for (OutboxStore.Item item : outbox.list(remote)) {
                     int count = Math.max(1, item.attachmentCount());
@@ -1614,13 +2024,28 @@ public final class CodexRuntime {
                     for (int i = 0; i < count; i++) if (selected.contains(item.messageId - i)) remove = true;
                     if (remove) {
                         outbox.remove(item.localId);
+                        removedBatches.add(item.localId);
+                        // 删除落盘成功后才取消作业；在途RPC仅允许沿原连接释放自己的upload。
+                        java.util.concurrent.atomic.AtomicBoolean active = sendJobs.get(item.localId);
+                        if (active != null) synchronized (active) { active.set(false); }
+                        java.util.concurrent.CompletableFuture<Void> ready = sendReadiness.get(item.localId);
+                        if (ready != null) ready.cancel(false);
                         for (int i = 0; i < count; i++) if (!selected.contains(item.messageId - i)) selected.add(item.messageId - i);
                     }
                 }
                 AndroidUtilities.runOnUIThread(() -> {
                     if (!isAccountCurrent(accountEpoch)) return;
+                    // 同号消息若已换成另一个对象，旧删除通知也不能把新对象从界面清掉。
+                    for (Map.Entry<String, MessageObject> entry : pendingMessages.entrySet()) {
+                        MessageObject pending = entry.getValue();
+                        if (pending.getDialogId() == dialogId && pendingAtDelete.get(entry.getKey()) != pending)
+                            selected.remove(Integer.valueOf(pending.getId()));
+                    }
                     pendingMessages.entrySet().removeIf(entry -> entry.getValue().getDialogId() == dialogId
-                            && selected.contains(entry.getValue().getId()));
+                            && pendingAtDelete.get(entry.getKey()) == entry.getValue() && selected.contains(entry.getValue().getId()));
+                    // 原对象移除后才开门，避免UI删除回调前的重试又首写已删Outbox。
+                    sendingBatches.removeAll(removedBatches);
+                    sendingBatches.removeAll(reservedBatches);
                     ArrayList<MessageObject> preview = MessagesController.getInstance(account).dialogMessage.get(dialogId);
                     if (preview != null && !preview.isEmpty() && selected.contains(preview.get(0).getId())) {
                         MessagesController.getInstance(account).dialogMessage.remove(dialogId);
@@ -1633,6 +2058,9 @@ public final class CodexRuntime {
             } catch (Exception error) {
                 // 持久化失败时保留原气泡，不宣称删除成功。
                 android.util.Log.w("CodexBridge", "pending_delete_failed");
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (isAccountCurrent(accountEpoch)) sendingBatches.removeAll(reservedBatches);
+                });
             }
         });
         return true;
@@ -2647,6 +3075,7 @@ public final class CodexRuntime {
                             observationSession = linked;
                             observationLease = attached.get("leaseId").getAsString();
                             observationRenewAt = android.os.SystemClock.elapsedRealtime() + 30000;
+                            connection.ensureTaskNotifications(remote, linked);
                         }
                         if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,linked,connection))return;
                         observationStartedAt = android.os.SystemClock.elapsedRealtime();
@@ -2681,6 +3110,7 @@ public final class CodexRuntime {
                     if(!statusTargetCurrent(account,accountEpoch,dialogId,generation,machine,remote,linked,connection)
                             ||(observed!=null&&connection!=null&&!connection.isConnected()))return;
                     statuses.observation(dialogId, machine, remote, observed, startedAt, receivedAt);
+                    notifyAcceptedStatus(dialogId, machine, remote, observed, receivedAt);
                     NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.updateInterfaces, MessagesController.UPDATE_MASK_STATUS);
                 });
                 if (isAccountCurrent(accountEpoch) && generation == watchGeneration && watchedDialog == dialogId)
@@ -3639,6 +4069,7 @@ public final class CodexRuntime {
 
     /** 原网络广播在主线程通知；仅前台已登录且尚无连接时立即尝试，原 loading 门禁合并并发。 */
     public static void onNetworkAvailable() {
+        if (enabled()) CodexPushCoordinator.reconcile();
         if (!enabled() || ApplicationLoader.mainInterfacePaused || session == null || loggingOut || desktop != null) return;
         if (org.telegram.messenger.BuildVars.DEBUG_VERSION)
             android.util.Log.i("CodexBridge", "connection_open=network_available");
@@ -3683,6 +4114,7 @@ public final class CodexRuntime {
         String remote = remoteValue != null && remoteValue.isJsonPrimitive() && remoteValue.getAsJsonPrimitive().isString()
                 ? remoteValue.getAsString() : "";
         PasswordLogin.Session owner = session;
+        if (!cached) notifyAcceptedStatus(dialogId, machine, remote, candidate, receivedAt);
         if (owner != null && !remote.isEmpty() && statuses.claimGoalRestore(dialogId, machine))
             scheduleGoalRestore(dialogId, machine, remote, owner, accountGeneration, batch);
         String title = candidate.has("title") && candidate.get("title").isJsonPrimitive()
@@ -3883,6 +4315,7 @@ public final class CodexRuntime {
                 AndroidUtilities.runOnUIThread(() -> {
                     if (!isAccountCurrent(accountEpoch)) return;
                     if (failedMachine != null) statuses.listFailed(failedMachine, failedRequestStartedAt);
+                    TaskNotifications.disconnected();
                     loading = false;
                     loadError = "电脑会话暂时无法读取";
                     if (dialogs.isEmpty()) NotificationCenter.getInstance(account).postNotificationName(NotificationCenter.dialogsNeedReload);

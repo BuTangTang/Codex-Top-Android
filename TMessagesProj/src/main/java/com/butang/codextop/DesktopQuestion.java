@@ -22,12 +22,12 @@ public final class DesktopQuestion {
         private Option(String label, String description) { this.label = label; this.description = description; }
     }
 
-    /** 每题只选一个答案；缺失的历史能力标记不会授予自填或显示保密答案。 */
+    /** 每题提交一个非空答案；原题标记保留，自填不受选项限制。 */
     public static final class Question {
         public final String id, header, question;
         public final boolean isOther, isSecret;
         public final ArrayList<Option> options;
-        /** 保留原题字段及其允许的输入方式。 */
+        /** 保留原题字段及保密标记。 */
         private Question(JsonObject value) throws IOException {
             id = required(value, "id"); header = optional(value, "header"); question = required(value, "question");
             isOther = flag(value, "isOther"); isSecret = flag(value, "isSecret");
@@ -37,12 +37,9 @@ public final class DesktopQuestion {
                 options.add(new Option(required(option, "label"), optional(option, "description")));
             }
         }
-        /** 只有原题允许时接受自填；选项和无选项文本均按单答案提交。 */
+        /** 每题均可选择原选项或自行输入，空白回答不能提交。 */
         public boolean accepts(String answer) {
-            if (answer == null || answer.trim().isEmpty()) return false;
-            if (options.isEmpty() || isOther) return true;
-            for (Option option : options) if (option.label.equals(answer)) return true;
-            return false;
+            return answer != null && !answer.trim().isEmpty();
         }
     }
 

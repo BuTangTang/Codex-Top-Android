@@ -79,6 +79,7 @@ public class ApplicationLoader extends Application {
     private static boolean codexStartupTraceEnabled;
     private static long codexStartupTraceStartedAt;
     private static int codexStartupTraceStages;
+    private static boolean codexStartupBreakdownRecorded;
 
     /** 按包名、调试构建和显式日志开关初始化诊断；进程内只采样一次开关并记录单调时钟起点。 */
     private static synchronized void beginCodexStartupTrace(String packageName) {
@@ -112,6 +113,28 @@ public class ApplicationLoader extends Application {
                 return;
             }
         }
+    }
+
+    /** 仅显式启用且本进程尚未输出摘要时采样；关闭诊断或重复启动不读时钟。 */
+    public static synchronized long beginCodexStartupSpan() {
+        return codexStartupTraceEnabled && !codexStartupBreakdownRecorded ? SystemClock.elapsedRealtime() : -1;
+    }
+
+    /** 只计算实际开始并正常返回的同步片段；未采样保留 -1，不伪装成零耗时。 */
+    public static synchronized long endCodexStartupSpan(long startedAt) {
+        return startedAt >= 0 && codexStartupTraceEnabled && !codexStartupBreakdownRecorded
+                ? SystemClock.elapsedRealtime() - startedAt : -1;
+    }
+
+    /** 保留原十九阶段，额外仅输出一次固定数字摘要；关闭时不读时钟或拼接日志。 */
+    public static synchronized void traceCodexStartupBreakdown(long fragmentAddMs, long keyReadyMs) {
+        if (!codexStartupTraceEnabled || codexStartupBreakdownRecorded) {
+            return;
+        }
+        codexStartupBreakdownRecorded = true;
+        android.util.Log.d("CodexStartup", "stage=launch_create_breakdown elapsedMs="
+                + (SystemClock.elapsedRealtime() - codexStartupTraceStartedAt)
+                + " fragmentAddMs=" + fragmentAddMs + " keyReadyMs=" + keyReadyMs);
     }
 
     public static volatile boolean isScreenOn = false;
@@ -384,6 +407,9 @@ public class ApplicationLoader extends Application {
         if (applicationContext == null) {
             applicationContext = getApplicationContext();
         }
+
+        // 独立项目显式初始化，后台 FCM 唤醒也能恢复账号；不初始化 Telegram 推送账号。
+        com.butang.codextop.CodexPushBootstrap.initialize(applicationContext);
 
         traceCodexStartup("app_native_begin");
         NativeLoader.initNativeLibs(ApplicationLoader.applicationContext);

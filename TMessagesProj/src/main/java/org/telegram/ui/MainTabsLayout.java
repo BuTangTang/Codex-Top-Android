@@ -7,6 +7,7 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -283,8 +284,23 @@ public class MainTabsLayout extends AnimatedLinearLayout {
     private final Runnable restoreDrawSelector = () -> setSkipDrawSelector(false);
 
     private boolean drawCustomSelector;
+    private boolean flatAppearance;
+    private Paint flatMarkerPaint;
+    private Path flatMarkerPath;
+
+    /** 初始化全部原tab后启用；只换绘制，不改变测量、点击或长按导航。 */
+    public void setFlatAppearance(boolean flat) {
+        if (flatAppearance == flat) return;
+        flatAppearance = flat;
+        if (flat && flatMarkerPaint == null) {
+            flatMarkerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            flatMarkerPath = new Path();
+        }
+        setSkipDrawSelector(drawCustomSelector);
+    }
+
     private void setSkipDrawSelector(boolean skipDrawSelector) {
-        drawCustomSelector = skipDrawSelector;
+        drawCustomSelector = !flatAppearance && skipDrawSelector;
         if (drawCustomSelector) {
             selectorPaint.setColor(Theme.multAlpha(Theme.getColor(Theme.key_glass_tabSelected, resourcesProvider), 0.09f));
         }
@@ -295,7 +311,7 @@ public class MainTabsLayout extends AnimatedLinearLayout {
             }
 
             if (child instanceof GlassTabView) {
-                ((GlassTabView) child).setSkipDrawSelector(skipDrawSelector);
+                ((GlassTabView) child).setSkipDrawSelector(flatAppearance || skipDrawSelector);
             }
         }
         invalidate();
@@ -309,7 +325,10 @@ public class MainTabsLayout extends AnimatedLinearLayout {
 
     @Override
     protected void dispatchDraw(@NonNull Canvas canvas) {
-        if (drawCustomSelector) {
+        if (flatAppearance) {
+            View selected = findSelectedTab();
+            if (selected != null) drawFlatMarker(canvas, selected);
+        } else if (drawCustomSelector) {
             final float x = animatedLongSelectedViewCenterX + animatedLongSelectedViewOffsetX;
             final float sWidth = getInterpolatedWidthByX(x, this);
             final float sHeight = getHeight() - getPaddingTop() - getPaddingBottom();
@@ -321,6 +340,39 @@ public class MainTabsLayout extends AnimatedLinearLayout {
         }
 
         super.dispatchDraw(canvas);
+    }
+
+    /** 直接跟随原已选tab的物理位置，RTL和原手势不另算索引，也不调度新动画。 */
+    private void drawFlatMarker(Canvas canvas, View selected) {
+        if (flatMarkerPaint == null || selected.getWidth() <= 0 || selected.getHeight() <= 0) return;
+        com.butang.codextop.CodexPixelPalette.Style style = Theme.getCodexPixelStyle();
+        float left = selected.getX(), right = left + selected.getWidth();
+        float top = selected.getY(), bottom = top + selected.getHeight();
+        flatMarkerPaint.setStyle(Paint.Style.FILL);
+        flatMarkerPaint.setColor(style.accentText);
+        if (style.id == com.butang.codextop.CodexPixelPalette.STYLE_LIME) {
+            flatMarkerPaint.setColor(style.accentFill);
+            canvas.drawRect(left + dp(4), top, right - dp(4), bottom, flatMarkerPaint);
+            flatMarkerPaint.setColor(style.accentText);
+        } else if (style.id == com.butang.codextop.CodexPixelPalette.STYLE_INDUSTRIAL) {
+            float y = Math.max(0, top - dp(4));
+            flatMarkerPath.reset();
+            flatMarkerPath.moveTo(left + dp(12), y);
+            flatMarkerPath.lineTo(right - dp(12), y);
+            flatMarkerPath.lineTo(right - dp(8), y + dp(2));
+            flatMarkerPath.lineTo(left + dp(8), y + dp(2));
+            flatMarkerPath.close();
+            canvas.drawPath(flatMarkerPath, flatMarkerPaint);
+            return;
+        } else if (style.id == com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT) {
+            flatMarkerPaint.setStyle(Paint.Style.STROKE);
+            flatMarkerPaint.setStrokeWidth(Math.max(1f, AndroidUtilities.dpf2(style.outlineWidthDp)));
+            canvas.drawRect(left + dp(4), top, right - dp(4), bottom, flatMarkerPaint);
+            flatMarkerPaint.setStyle(Paint.Style.FILL);
+        }
+        float y = Math.min(getHeight() - dp(4), bottom + dp(4));
+        float inset = Math.min(dp(16), selected.getWidth() / 4f);
+        canvas.drawRect(left + inset, y, right - inset, y + Math.max(1, dp(2)), flatMarkerPaint);
     }
 
 

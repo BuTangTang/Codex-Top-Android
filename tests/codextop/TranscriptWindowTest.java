@@ -67,8 +67,30 @@ public final class TranscriptWindowTest {
         missingTailRecovery();
         latestPageMissingCachedAnchor();
         emptyProjectedHistory();
+        aroundAnchorEdges();
         System.out.println("TranscriptWindow: 重叠去重、旧页顺序、完整性与游标校验通过");
     }
+
+    /** 围绕读取只选择已有记录，零页、缺锚点及首末补齐都不改变缓存和游标。 */
+    private static void aroundAnchorEdges() throws Exception {
+        TranscriptWindow window = new TranscriptWindow();
+        if (!window.around(123, 5).isEmpty()) throw new AssertionError("空窗口产生了锚点消息");
+        window.prepend(page(item("a") + "," + item("b") + "," + item("c"), true, "older", "tail"));
+        var before = window.snapshot();
+        int b = window.before(0, 3).get(1).id;
+        if (!window.around(b, 0).isEmpty() || !window.around(b, -1).isEmpty())
+            throw new AssertionError("非正页大小仍交付消息");
+        var oldest = window.around(Integer.MIN_VALUE, 2);
+        if (oldest.size() != 2 || !"b".equals(oldest.get(0).message.id) || !"a".equals(oldest.get(1).message.id))
+            throw new AssertionError("早于缓存的锚点没有从最旧端补齐");
+        for (int anchor : new int[]{0, Integer.MAX_VALUE}) {
+            var latest = window.around(anchor, 2);
+            if (latest.size() != 2 || !"c".equals(latest.get(0).message.id) || !"b".equals(latest.get(1).message.id))
+                throw new AssertionError("晚于缓存或未指定锚点没有回退最新端");
+        }
+        if (!before.equals(window.snapshot())) throw new AssertionError("围绕读取改变缓存身份或分页游标");
+    }
+
     /** 缺尾游标必须以缓存最新项作连续锚点；恢复不改变旧正文、编号或历史分页位置。 */
     private static void missingTailRecovery() throws Exception {
         TranscriptWindow window = new TranscriptWindow();

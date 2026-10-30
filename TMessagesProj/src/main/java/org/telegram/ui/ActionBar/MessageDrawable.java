@@ -84,6 +84,7 @@ public class MessageDrawable extends Drawable {
     };
     /** 与气泡九宫格同一索引。0 表示这一格没有描边。 */
     private int[][] outlineColor = new int[4][4];
+    private float[][] outlineWidth = new float[4][4];
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MEDIA = 1;
@@ -321,11 +322,15 @@ public class MessageDrawable extends Drawable {
 
     /** 按原气泡形状和颜色复用九宫格；文字描边仅在缓存成功重建后记入同一索引。 */
     public Drawable getBackgroundDrawable() {
+        com.butang.codextop.CodexPixelPalette.Style style = textBubbleStyle();
+        boolean styledRadius = style != null && overrideRoundRadius == 0 && overrideRounding <= 0;
         int newRad;
         if (overrideRoundRadius != 0) {
             newRad = overrideRoundRadius;
         } else if (overrideRounding > 0) {
             newRad = 0;
+        } else if (styledRadius) {
+            newRad = dp(textBubbleRadiusDp(style.id));
         } else {
             newRad = dp(SharedConfig.bubbleRadius);
         }
@@ -358,18 +363,22 @@ public class MessageDrawable extends Drawable {
 
         boolean drawWithShadow = gradientShader == null && !isSelected && !isCrossfadeBackground;
         int shadowColor = getColor(isOut ? Theme.key_chat_outBubbleShadow : Theme.key_chat_inBubbleShadow);
-        int outline = textOutlineColor();
-        if (lastDrawWithShadow != drawWithShadow || currentBackgroundDrawableRadius[idx2][idx] != newRad || (drawWithShadow && shadowDrawableColor[idx] != shadowColor) || backgroundDrawableColor[idx2][idx] != color || outlineColor[idx2][idx] != outline) {
-            currentBackgroundDrawableRadius[idx2][idx] = newRad;
+        int outline = style == null ? 0 : style.outlineColor;
+        float width = style == null ? 0 : AndroidUtilities.dpf2(style.outlineWidthDp);
+        if (backgroundDrawable[idx2][idx] == null || lastDrawWithShadow != drawWithShadow || currentBackgroundDrawableRadius[idx2][idx] != newRad || (drawWithShadow && shadowDrawableColor[idx] != shadowColor) || backgroundDrawableColor[idx2][idx] != color || outlineColor[idx2][idx] != outline || outlineWidth[idx2][idx] != width) {
+            int originalRadius = overrideRoundRadius;
+            PathDrawParams originalPathCache = pathDrawCacheParams;
+            backupRect.set(getBounds());
             try {
                 Bitmap bitmap = Bitmap.createBitmap(dp(50), dp(40), Bitmap.Config.ARGB_8888);
                 Canvas canvas = new Canvas(bitmap);
-
-                backupRect.set(getBounds());
+                // 仅在小缓存烘焙中复用原路径生成；不污染调用方的自定义Paint路径缓存。
+                if (styledRadius) {
+                    overrideRoundRadius = newRad;
+                    pathDrawCacheParams = null;
+                }
 
                 if (drawWithShadow) {
-                    shadowDrawableColor[idx] = shadowColor;
-
                     Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
                     LinearGradient gradientShader = new LinearGradient(0, 0, 0, dp(40), new int[]{0x155F6569, 0x295F6569}, null, Shader.TileMode.CLAMP);
@@ -399,7 +408,7 @@ public class MessageDrawable extends Drawable {
                 draw(canvas, shadowPaint);
                 if (outline != 0) {
                     shadowPaint.setStyle(Paint.Style.STROKE);
-                    shadowPaint.setStrokeWidth(AndroidUtilities.dpf2(isOut ? 1.5f : 1f));
+                    shadowPaint.setStrokeWidth(width);
                     shadowPaint.setColor(outline);
                     draw(canvas, shadowPaint);
                 }
@@ -407,28 +416,39 @@ public class MessageDrawable extends Drawable {
                 NinePatchDrawable patch = new NinePatchDrawable(bitmap, getByteBuffer(bitmap.getWidth() / 2 - 1, bitmap.getWidth() / 2 + 1, bitmap.getHeight() / 2 - 1, bitmap.getHeight() / 2 + 1, color).array(), new Rect(), null);
                 patch.setAlpha(alpha);
                 backgroundDrawable[idx2][idx] = patch;
-                // 重建失败时保留旧描边标记，让下一次取缓存继续尝试本次主题变化。
+                // 全部像素键只在NinePatch成功创建后更新，失败时保留旧缓存并继续重试。
+                currentBackgroundDrawableRadius[idx2][idx] = newRad;
+                backgroundDrawableColor[idx2][idx] = color;
                 outlineColor[idx2][idx] = outline;
-                setBounds(backupRect);
+                outlineWidth[idx2][idx] = width;
+                if (drawWithShadow) shadowDrawableColor[idx] = shadowColor;
+                lastDrawWithShadow = drawWithShadow;
             } catch (Throwable ignore) {
-
+            } finally {
+                overrideRoundRadius = originalRadius;
+                pathDrawCacheParams = originalPathCache;
+                setBounds(backupRect);
             }
         }
-        lastDrawWithShadow = drawWithShadow;
-        backgroundDrawableColor[idx2][idx] = color;
         return backgroundDrawable[idx2][idx];
     }
 
-    /** 只给 Codex 包里正在显示的 Day/Night 文字气泡加边。媒体、预览和其它主题返回 0。 */
-    private int textOutlineColor() {
-        if (currentType != TYPE_TEXT || !com.butang.codextop.CodexRuntime.enabled()) return 0;
+    /** 只给Codex的当前Day/Night文字气泡选择本地样式；媒体、预览和其他主题保持原路径。 */
+    private com.butang.codextop.CodexPixelPalette.Style textBubbleStyle() {
+        if (currentType != TYPE_TEXT || !com.butang.codextop.CodexRuntime.enabled()) return null;
         Theme.ThemeInfo active = Theme.getActiveTheme();
-        if (active == null) return 0;
-        boolean night = "Night".equals(active.name);
-        if (!night && !"Day".equals(active.name)) return 0;
-        if (!isOut) return night ? 0xFF314052 : 0xFFC3D2E2;
-        if (isSelected) return night ? 0xFF7EB6E4 : 0xFF3E7EB4;
-        return night ? 0xFF4C8EC4 : 0xFF5B93C4;
+        if (active == null || (!"Night".equals(active.name) && !"Day".equals(active.name))) return null;
+        return Theme.getCodexPixelStyle();
+    }
+
+    /** 五张已选设计图的低圆角；明确半径和圆化动画仍优先走原路径。 */
+    private static int textBubbleRadiusDp(int styleId) {
+        switch (styleId) {
+            case com.butang.codextop.CodexPixelPalette.STYLE_TERMINAL: return 2;
+            case com.butang.codextop.CodexPixelPalette.STYLE_INDUSTRIAL: return 3;
+            case com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT: return 6;
+            default: return 4;
+        }
     }
 
     public Drawable getTransitionDrawable(int color) {
@@ -833,7 +853,7 @@ public class MessageDrawable extends Drawable {
         }
         if (gradientShader == null) {
             Drawable background = getBackgroundDrawable();
-            if (background.getAlpha() != alpha) {
+            if (background != null && background.getAlpha() != alpha) {
                 background.setAlpha(alpha);
             }
         }

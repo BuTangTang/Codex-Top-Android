@@ -1256,6 +1256,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
     CharSequence accessibilityText;
     private boolean accessibilityTextUnread, accessibilityTextContentUnread;
     private long accessibilityTextFileSize;
+    private boolean accessibilityTextCodexDeliveryUncertain;
     private boolean wasTranscriptionOpen;
     private Path instantLinkArrowPath;
     private Paint instantLinkArrowPaint;
@@ -1817,6 +1818,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
     public int namesOffset;
 
     private int lastSendState;
+    private boolean lastCodexDeliveryUncertain;
     private int lastDeleteDate;
     private int lastViewsCount;
     private int lastRepliesCount;
@@ -6229,6 +6231,10 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         if (currentMessageObject != null && (!hasLinkPreview && MessageObject.getMedia(currentMessageObject.messageOwner) != null && MessageObject.getMedia(currentMessageObject.messageOwner).webpage instanceof TLRPC.TL_webPage)) {
             return true;
         }
+        // 原地参数更新不改变 send_state；缺用户资料时也必须重测原时间区域。
+        if (currentMessageObject != null && lastCodexDeliveryUncertain != com.butang.codextop.CodexRuntime.isMessageDeliveryUncertain(currentMessageObject)) {
+            return true;
+        }
         if (currentMessageObject == null || currentUser == null && currentChat == null) {
             return false;
         }
@@ -6930,6 +6936,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
             factCheckY = 0;
             lastTranslated = messageObject.translated;
             lastSendState = messageObject.messageOwner.send_state;
+            lastCodexDeliveryUncertain = com.butang.codextop.CodexRuntime.isMessageDeliveryUncertain(messageObject);
             lastDeleteDate = messageObject.messageOwner.destroyTime;
             lastViewsCount = messageObject.messageOwner.views;
             lastRepliesCount = getRepliesCount();
@@ -13346,6 +13353,15 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         isUpdating = true;
     }
 
+    /** 原状态通知仅重绑投递结果变化的可见消息，沿用原六参绑定与布局缓存。 */
+    public void refreshCodexDeliveryStatus() {
+        if (currentMessageObject != null && lastCodexDeliveryUncertain != com.butang.codextop.CodexRuntime.isMessageDeliveryUncertain(currentMessageObject)) {
+            setMessageObject(currentMessageObject, currentMessagesGroup, pinnedBottom, pinnedTop, firstInChat, lastInChatList);
+            requestLayout();
+            invalidate();
+        }
+    }
+
     public void setMessageObject(MessageObject messageObject,
                                  MessageObject.GroupedMessages groupedMessages,
                                  boolean bottomNear,
@@ -18619,6 +18635,11 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
             } else {
                 currentTimeString = TextUtils.concat(formatString(R.string.MessageScheduledRepeatSeconds, period), ", ", currentTimeString);
             }
+        }
+        // 普通消息的未知结果复用原时间字体、宽度与媒体底色，特殊预览和隐藏时间保持。
+        if (!timeString.isEmpty() && !currentMessageObject.preview && !currentMessageObject.isRepostPreview
+                && !currentMessageObject.sendPreview && com.butang.codextop.CodexRuntime.isMessageDeliveryUncertain(messageObject)) {
+            currentTimeString = "无法确认送达";
         }
         timeTextWidth = timeWidth = (int) Math.ceil(Theme.chat_timePaint.measureText(currentTimeString, 0, currentTimeString == null ? 0 : currentTimeString.length()));
         if (currentMessageObject.scheduled && currentMessageObject.messageOwner.date == 0x7FFFFFFE || currentMessageObject.notime) {
@@ -27182,7 +27203,8 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                 final boolean unread = currentMessageObject != null && currentMessageObject.isOut() && !currentMessageObject.scheduled && currentMessageObject.isUnread();
                 final boolean contentUnread = currentMessageObject != null && currentMessageObject.isContentUnread();
                 final long fileSize = currentMessageObject != null ? currentMessageObject.loadedFileSize : 0;
-                if (accessibilityText == null || accessibilityTextUnread != unread || accessibilityTextContentUnread != contentUnread || accessibilityTextFileSize != fileSize) {
+                final boolean deliveryUncertain = com.butang.codextop.CodexRuntime.isMessageDeliveryUncertain(currentMessageObject);
+                if (accessibilityText == null || accessibilityTextUnread != unread || accessibilityTextContentUnread != contentUnread || accessibilityTextFileSize != fileSize || accessibilityTextCodexDeliveryUncertain != deliveryUncertain) {
                     SpannableStringBuilder sb = new SpannableStringBuilder();
                     if (isChat && currentUser != null && !currentMessageObject.isOut()) {
                         sb.append(UserObject.getUserName(currentUser));
@@ -27262,7 +27284,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                         sb.append(messageText);
                     }
                     if (documentAttach != null && (documentAttachType == DOCUMENT_ATTACH_TYPE_DOCUMENT || documentAttachType == DOCUMENT_ATTACH_TYPE_GIF || documentAttachType == DOCUMENT_ATTACH_TYPE_VIDEO)) {
-                        if (buttonState == 1 && loadingProgressLayout != null) {
+                        if (!deliveryUncertain && buttonState == 1 && loadingProgressLayout != null) {
                             sb.append("\n");
                             final boolean sending = currentMessageObject.isSending();
                             final String key = sending ? "AccDescrUploadProgress" : "AccDescrDownloadProgress";
@@ -27327,7 +27349,9 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                         }
                     }
                     if (currentMessageObject.isOut()) {
-                        if (currentMessageObject.isSent()) {
+                        if (deliveryUncertain) {
+                            sb.append("\n无法确认送达");
+                        } else if (currentMessageObject.isSent()) {
                             sb.append("\n");
                             if (currentMessageObject.scheduled) {
                                 sb.append(formatString("AccDescrScheduledDate", R.string.AccDescrScheduledDate, currentTimeString));
@@ -27427,6 +27451,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                     accessibilityTextUnread = unread;
                     accessibilityTextContentUnread = contentUnread;
                     accessibilityTextFileSize = fileSize;
+                    accessibilityTextCodexDeliveryUncertain = deliveryUncertain;
                 }
 
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
@@ -29197,6 +29222,10 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
         }
 
         public int createStatusDrawableParams() {
+            // 未知结果不是在途、成功或明确失败；原 4→0 动画结束后保持静态说明。
+            if (com.butang.codextop.CodexRuntime.isMessageDeliveryUncertain(currentMessageObject)) {
+                return 0;
+            }
             if (currentMessageObject.isOutOwner()) {
                 boolean drawCheck1 = false;
                 boolean drawCheck2 = false;

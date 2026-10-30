@@ -13,13 +13,14 @@ import javax.tools.ToolProvider;
 
 /** 在受控队列执行原预取与摘要发布方法，真实消息及缓存窗口均使用合成来源。 */
 public final class RuntimeDialogPreviewTest {
-    /** 先验证现预取方法的可观察摘要，再验证真实发布方法的账号、连接及 pending 边界。 */
+    /** 执行真实预取与摘要构造，验证账号、待发及列表省布局而聊天保完整布局的边界。 */
     public static void main(String[] args) throws Exception {
         Path source = Path.of("TMessagesProj/src/main/java/com/butang/codextop");
         StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
         var unit = StaticJavaParser.parse(source.resolve("CodexRuntime.java"));
         var names = Set.of("prefetchDialogs", "isAccountCurrent", "dialogConnection", "restoreDialogPreviews",
-                "publishHistoryPreview", "publishPendingPreview", "publishDialogPreview", "sameDialogPreview", "previewCurrent", "ownsConversation", "publishHistoryRoot", "offerFirstVisibleHistory");
+                "publishHistoryPreview", "publishPendingPreview", "publishDialogPreview", "sameDialogPreview", "previewCurrent",
+                "historyObject", "ownsConversation", "isAttachmentMessage", "publishHistoryRoot", "offerFirstVisibleHistory");
         StringBuilder methods = new StringBuilder();
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class))
             if (names.contains(method.getNameAsString())) methods.append(method).append('\n');
@@ -53,7 +54,11 @@ public final class RuntimeDialogPreviewTest {
         Path temporary = Files.createTempDirectory("codex-dialog-preview-");
         try {
             Path probe = temporary.resolve("RuntimeDialogPreviewProbe.java");
-            Files.writeString(probe, FIXTURE + methods + SCENARIOS + "\n}");
+            // 共享夹具保留旧相邻测试的转换叶；本专项删除它，执行真实重载及附件就绪分支。
+            var fixture = StaticJavaParser.parse(FIXTURE + "}");
+            fixture.getClassByName("RuntimeDialogPreviewProbe").orElseThrow().getMethodsByName("historyObject").forEach(MethodDeclaration::remove);
+            String prefix = fixture.toString();
+            Files.writeString(probe, prefix.substring(0, prefix.lastIndexOf('}')) + methods + SCENARIOS + "\n}");
             Path flags = temporary.resolve("BuildVars.java"), log = temporary.resolve("Log.java"), account = temporary.resolve("UserConfig.java");
             Files.writeString(flags, "package org.telegram.messenger; public class BuildVars { public static final boolean DEBUG_VERSION=false; }");
             Files.writeString(log, "package android.util; public class Log { public static int i(String a,String b){return 0;} }");
@@ -104,7 +109,10 @@ public final class RuntimeDialogPreviewTest {
                 JsonObject readAfter(String remote,String cursor){calls++;return tail;}
             }
             static class TLRPC {static class Message {int id,date,send_state;long dialog_id;boolean out;String message,attachPath;Map<String,String> params=new HashMap<>();}static class TL_message extends Message {}}
-            static class MessageObject {TLRPC.Message messageOwner;MessageObject(TLRPC.Message m){messageOwner=m;}int getId(){return messageOwner.id;}long getDialogId(){return messageOwner.dialog_id;}}
+            /** Android构造叶只记录参数；不把此标记当作真实排版或emoji像素。 */
+            static class MessageObject {TLRPC.Message messageOwner;boolean layoutCreated,attachPathExists,mediaExists;
+                MessageObject(TLRPC.Message m){this(0,m,true,false);}MessageObject(int account,TLRPC.Message m,boolean layout,boolean media){messageOwner=m;layoutCreated=layout;}
+                int getId(){return messageOwner.id;}long getDialogId(){return messageOwner.dialog_id;}}
             static class MessagesController {
                 static final int UPDATE_MASK_MESSAGE_TEXT=4;static final MessagesController instance=new MessagesController();
                 final Map<Long,ArrayList<MessageObject>> dialogMessage=new HashMap<>();
@@ -118,6 +126,7 @@ public final class RuntimeDialogPreviewTest {
             static final Map<String,Long> ids=new HashMap<>();static final Map<Long,TranscriptWindow> histories=new HashMap<>();
             static final Map<Integer,HistoryView> historyViews=new HashMap<>();
             static final java.util.concurrent.atomic.AtomicLong historyTokens=new java.util.concurrent.atomic.AtomicLong();
+
             static final Map<Long,Long> prefetchedRevisions=new HashMap<>();static final Set<Long> prefetching=new HashSet<>();
             static final Map<String,MessageObject> pendingMessages=new HashMap<>();static final Map<Long,TranscriptWindow> disk=new HashMap<>();
             static final Queue prefetchQueue=new Queue(),historyQueue=new Queue();static int reads,saves;
@@ -125,15 +134,19 @@ public final class RuntimeDialogPreviewTest {
             static long bindDialog(String machine,String remote,PasswordLogin.Session owner,long epoch){long id=ids.computeIfAbsent(machine+":"+remote,k->++nextId);dialogMachines.put(id,machine);remoteIds.put(id,remote);return id;}
             static TranscriptWindow readHistory(long id,String remote){reads++;return disk.getOrDefault(id,new TranscriptWindow());}
             static boolean saveHistory(long id,String remote,TranscriptWindow history){saves++;return true;}
-            /** 摘要专项观察真实读取失败；聊天候选不应进入未打开的夹具。 */
+            // D44换页由独立专项执行；此夹具只观察原摘要边界，不替代调度或缓存决策。
             static void offerLatestHistory(long id,TranscriptWindow history){}
+            /** 本组不打开聊天页；意外进入UI候选直接失败，不能用空替身掩盖越界。 */
             static boolean offerLatestHistory(HistoryView view,TranscriptWindow history,boolean explicit){throw new AssertionError("unexpected opened history view");}
+
             static void logTranscriptFailure(String phase,Exception e,JsonObject page){lazyPreviewFailures++;}
             // 仅替代原 Android 消息转换边界，不在测试中实现预取、发布选择或迟到校验。
             static TLRPC.TL_message historyMessage(long id,TranscriptWindow.Entry entry){TLRPC.TL_message m=new TLRPC.TL_message();m.id=entry.id;m.dialog_id=id;m.date=(int)(entry.message.createdAtMs/1000);m.message=entry.message.text;m.out=entry.message.outgoing;if(entry.message.localId!=null)m.params.put("codexLocalId",entry.message.localId);if(!entry.message.attachments.isEmpty())m.params.put("codexAttachment","synthetic media");return m;}
+            /** 相邻摘要调度夹具仅观察构造边界；本专项会删除并提取真实historyObject。 */
             static MessageObject historyObject(int account,TLRPC.TL_message message){return new MessageObject(message);}
-            /** 与原测试相同的Android构造叶；新重载不替代摘要选择或IO算法。 */
-            static MessageObject historyObject(int account,TLRPC.TL_message message,boolean layout){return historyObject(account,message);}
+            static MessageObject historyObject(int account,TLRPC.TL_message message,boolean layout){return new MessageObject(account,message,layout,false);}
+            /** 本夹具只观察附件就绪位传递，真实文件归属由附件专项及完整构造联测验证。 */
+            static java.io.File attachmentFile(MessageObject object){return null;}
             static class OutboxStore {static class Item {String localId,text;int messageId,date;Item(String local,String body,int id,int date){this.localId=local;this.text=body;this.messageId=id;this.date=date;}}ArrayList<Item> rows=new ArrayList<>();ArrayList<Item> list(String remote)throws IOException{return new ArrayList<>(rows);}}
             static final OutboxStore outbox=new OutboxStore();static OutboxStore outboxStore(long id){return outbox;}
             static boolean batchEchoed(OutboxStore.Item item,Set<String> echoed){return echoed.contains(item.localId);}
@@ -203,6 +216,27 @@ public final class RuntimeDialogPreviewTest {
                 check(visible(id)==fresh,"late outbox restore overwrote a newly created pending");
                 check(NotificationCenter.instance.other==0,"cold outbox restore generated chat or old-message notifications");
             }
+            /** 摘要跳过完整布局，原聊天入口、正文身份和待发复用不变；不模拟实际字形。 */
+            static void previewLayoutBoundary()throws Exception{
+                for(String body:new String[]{"synthetic text","😀","👨‍👩‍👧‍👦 café 中文", "caption 😀"}){
+                    reset();long id=bindDialog("machine","qa",session,accountGeneration);
+                    TLRPC.TL_message message=historyMessage(id,history("layout-source",null,"agent",body,1000).before(0,1).get(0));
+                    message.params.put("codexSourceId","layout-source");
+                    if(body.startsWith("caption"))message.params.put("codexAttachment","synthetic attachment");
+                    publishDialogPreview(0,accountGeneration,id,"qa","machine",null,message,null,Set.of());
+                    MessageObject preview=visible(id),chat=historyObject(0,message);
+                    check(preview!=null&&!preview.layoutCreated,"历史摘要仍预建完整聊天布局");
+                    check(chat.layoutCreated&&chat!=preview,"聊天必须独立生成完整布局");
+                    check(preview.messageOwner==message&&chat.messageOwner==message&&body.equals(message.message)
+                            &&"layout-source".equals(message.params.get("codexSourceId")),"构造不得改正文或身份");
+                    check(!preview.attachPathExists&&!preview.mediaExists,"无本地附件不得伪造就绪");
+                    publishDialogPreview(0,accountGeneration,id,"qa","machine",null,message,null,Set.of());
+                    check(visible(id)==preview,"相同摘要不得重复构造");
+                    MessageObject waiting=pending(id,-7,"layout-pending",body,2);
+                    publishPendingPreview(0,accountGeneration,id,new ArrayList<>(List.of(waiting)),true);
+                    check(visible(id)==waiting&&waiting.layoutCreated,"待发对象须保留原完整布局");
+                }
+            }
             /** 单行索引故障只在实际Content读取时发生，允许验证预览不清空与队列后继。 */
             static int lazyPreviewReads,lazyPreviewFailures;
             static TranscriptWindow badPreview()throws Exception{
@@ -237,6 +271,6 @@ public final class RuntimeDialogPreviewTest {
                 System.out.println("PASS lazy preview stale guards run before body IO");
             }
 
-            public static void main(String[] args)throws Exception{lazyPreviewIo();lazyPreviewStale();cacheAndRevision();System.out.println("PASS cacheAndRevision");prefetchAndPending();System.out.println("PASS prefetchAndPending");lateOwners();System.out.println("PASS lateOwners");coldPending();System.out.println("PASS coldPending");}
+            public static void main(String[] args)throws Exception{lazyPreviewIo();lazyPreviewStale();previewLayoutBoundary();System.out.println("PASS previewLayoutBoundary");cacheAndRevision();System.out.println("PASS cacheAndRevision");prefetchAndPending();System.out.println("PASS prefetchAndPending");lateOwners();System.out.println("PASS lateOwners");coldPending();System.out.println("PASS coldPending");}
         """;
 }

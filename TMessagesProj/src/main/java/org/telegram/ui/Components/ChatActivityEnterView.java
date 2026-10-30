@@ -2646,6 +2646,12 @@ public class ChatActivityEnterView extends FrameLayout implements
 
         textFieldContainer = new FrameLayout(context) {
             @Override
+            protected void dispatchDraw(Canvas canvas) {
+                drawCodexComposeGrouping(canvas);
+                super.dispatchDraw(canvas);
+            }
+
+            @Override
             public boolean dispatchTouchEvent(MotionEvent ev) {
                 if (botWebViewButton != null && botWebViewButton.getVisibility() == VISIBLE) {
                     return botWebViewButton.dispatchTouchEvent(ev);
@@ -4928,6 +4934,7 @@ public class ChatActivityEnterView extends FrameLayout implements
         };
         messageSendPreview.setOnDismissListener(di -> {
             messageSendPreview = null;
+            applyCodexComposeLayout(false);
         });
 
         final boolean containsSendMessage = audioToSendMessageObject != null || messageEditText != null && !TextUtils.isEmpty(messageEditText.getText());
@@ -5152,6 +5159,7 @@ public class ChatActivityEnterView extends FrameLayout implements
         }
         messageSendPreview.setItemOptions(options);
 
+        applyCodexComposeLayout(false);
         messageSendPreview.show();
 
         try {
@@ -7927,6 +7935,7 @@ public class ChatActivityEnterView extends FrameLayout implements
 
     /** 按输入、录音和编辑状态更新原发送控件；电脑对话空输入时保留原附件入口。 */
     public void checkSendButton(boolean animated) {
+        applyCodexComposeLayout(false);
         if (editingMessageObject != null || recordingAudioVideo) {
             return;
         }
@@ -8129,7 +8138,7 @@ public class ChatActivityEnterView extends FrameLayout implements
             shownSendButton = true;
             final String caption = messageEditText == null ? null : messageEditText.getCaption();
             // 电脑对话保留发送态以隐藏录音，空普通输入仍沿原纸夹和输入框间距显示附件入口。
-            final boolean codexEmptyInput = com.butang.codextop.CodexRuntime.enabled() && sideButtons == null
+            final boolean codexEmptyInput = codexComposeGroupingActive || com.butang.codextop.CodexRuntime.enabled() && sideButtons == null
                 && message.length() == 0 && caption == null && !forceShowSendButton && !richDraftActive
                 && audioToSend == null && videoToSendMessageObject == null
                 && !(slowModeTimer == Integer.MAX_VALUE && !isSlowModeIgnored())
@@ -8804,7 +8813,9 @@ public class ChatActivityEnterView extends FrameLayout implements
         }
         FrameLayout.LayoutParams layoutParams = (FrameLayout.LayoutParams) messageEditText.getLayoutParams();
         int oldRightMargin = layoutParams.rightMargin;
-        if (isStories && isLiveComment) {
+        if (codexComposeGroupingActive) {
+            layoutParams.rightMargin = dp(8);
+        } else if (isStories && isLiveComment) {
             layoutParams.rightMargin = dp(suggestButtonVisible ? 50 : 2) + Math.max(0, sendButton.width() - dp(DEFAULT_HEIGHT));
         } else if (attachVisible == 1 || attachVisible == 2/* && layoutParams.rightMargin != dp(2)*/) {
             if (botButton != null && botButton.getVisibility() == VISIBLE && scheduledButton != null && scheduledButton.getVisibility() == VISIBLE && attachButton != null && attachButton.getVisibility() == VISIBLE) {
@@ -8852,6 +8863,7 @@ public class ChatActivityEnterView extends FrameLayout implements
 
     private int lastRecordState;
     protected void updateRecordInterface(int recordState, boolean animated) {
+        applyCodexComposeLayout(false);
         if (moveToSendStateRunnable != null) {
             AndroidUtilities.cancelRunOnUIThread(moveToSendStateRunnable);
             moveToSendStateRunnable = null;
@@ -9965,6 +9977,7 @@ public class ChatActivityEnterView extends FrameLayout implements
         createMessageEditText();
         boolean hadEditingMessage = editingMessageObject != null;
         editingMessageObject = messageObject;
+        if (editingMessageObject != null) applyCodexComposeLayout(false);
         editingCaption = caption;
         CharSequence textToSetWithKeyboard;
         if (editingMessageObject != null) {
@@ -10401,8 +10414,138 @@ public class ChatActivityEnterView extends FrameLayout implements
         return trendingStickersAlert;
     }
 
+    private boolean codexComposeGroupingEnabled;
+    private boolean codexComposeGroupingActive;
+    private org.telegram.ui.Components.chat.ChatInputViewsContainer codexComposeContainer;
+    private int codexAttachGravity, codexAttachLeft, codexAttachRight;
+    private int codexFieldLeft, codexFieldRight, codexEmojiVisibility, codexAttachVisibility;
+    private float codexAttachAlpha, codexAttachScaleX, codexAttachScaleY;
+
+    /** 普通 Codex 复用原纸夹；媒体、编辑及预览保持原输入栏。 */
+    public void setCodexComposeGrouping(boolean enabled, org.telegram.ui.Components.chat.ChatInputViewsContainer container) {
+        final boolean wasGrouped = codexComposeGroupingActive;
+        codexComposeGroupingEnabled = enabled;
+        codexComposeContainer = container;
+        applyCodexComposeLayout(false);
+        if (enabled || wasGrouped) checkSendButton(false);
+    }
+
+    private boolean isCodexComposeGroupingAllowed() {
+        return codexComposeGroupingEnabled && codexComposeContainer != null
+            && attachButton != null && messageEditText != null && sideButtons == null
+            && editingMessageObject == null && !recordingAudioVideo && recordInterfaceState == 0
+            && audioToSend == null && videoToSendMessageObject == null
+            && !isStories && !isLiveComment && !isInScheduleMode() && slowModeTimer == 0
+            && !forceShowSendButton && !richDraftActive && messageEditText.getCaption() == null
+            && !emojiViewVisible && !stickersExpanded
+            && (recordedAudioPanel == null || recordedAudioPanel.getVisibility() != VISIBLE)
+            && (botCommandsMenuButton == null || botCommandsMenuButton.getTag() == null)
+            && (senderSelectView == null || senderSelectView.getVisibility() != VISIBLE)
+            && (botButton == null || botButton.getVisibility() != VISIBLE)
+            && (notifyButton == null || notifyButton.getVisibility() != VISIBLE)
+            && (scheduledButton == null || scheduledButton.getVisibility() != VISIBLE && scheduledButton.getTag() == null)
+            && !animatorIsBlockedByStreaming.getValue() && animatorIsBlockedByStreaming.getFloatValue() == 0f
+            && !animatorEphemeralMessageVisibility.getValue() && animatorEphemeralMessageVisibility.getFloatValue() == 0f
+            && getStarsPrice() == 0 && sendButton.starsPrice == 0 && sendButton.animatedPriceVisible.get() == 0f
+            && !sendButton.isOpen() && sendButton.open.get() == 0f && messageSendPreview == null
+            && !sendButton.locked && !sendButton.loadingShown && sendButton.loadingAnimatedShown.get() == 0f
+            && sendButton.ephemeralFactor == 0f && sendButton.sameWidthFactor == 0f
+            && sendButton.emojiDrawable.getDrawable() == null && sendButton.emojiDrawable.isNotEmpty() == 0f
+            && TextUtils.isEmpty(sendButton.count.getText()) && sendButton.count.isNotEmpty() == 0f;
+    }
+
+    /** 同一入口处理测量重写和状态恢复；测量期间只改原 params，不再次请求布局。 */
+    private void applyCodexComposeLayout(boolean measuring) {
+        final boolean grouped = isCodexComposeGroupingAllowed();
+        if (!grouped && !codexComposeGroupingActive) return;
+        final boolean changed = codexComposeGroupingActive != grouped;
+        if (changed) {
+            // 先停止原附件目标；cancel 回调沿原身份门清引用，旧 end 不再隐藏新状态。
+            if (runningAnimation2 != null) {
+                runningAnimation2.cancel();
+                runningAnimation2 = null;
+            }
+            if (attachButtonAnimator != null) {
+                attachButtonAnimator.cancel();
+                attachButtonAnimator = null;
+            }
+        }
+        final FrameLayout.LayoutParams clip = (FrameLayout.LayoutParams) attachButton.getLayoutParams();
+        final FrameLayout.LayoutParams field = (FrameLayout.LayoutParams) messageEditText.getLayoutParams();
+        if (grouped && !codexComposeGroupingActive) {
+            codexAttachGravity = clip.gravity;
+            codexAttachLeft = clip.leftMargin;
+            codexAttachRight = clip.rightMargin;
+            codexFieldLeft = field.leftMargin;
+            codexFieldRight = field.rightMargin;
+            codexEmojiVisibility = emojiButton.getVisibility();
+            codexAttachVisibility = attachButton.getVisibility();
+            codexAttachAlpha = attachButtonAlpha;
+            codexAttachScaleX = attachButton.getScaleX();
+            codexAttachScaleY = attachButton.getScaleY();
+        }
+        final int gravity = grouped ? Gravity.BOTTOM | Gravity.LEFT : codexAttachGravity;
+        final int clipLeft = grouped ? dp(2) : codexAttachLeft;
+        final int clipRight = grouped ? 0 : codexAttachRight;
+        final int fieldLeft = grouped ? dp(56) : measuring ? field.leftMargin : codexFieldLeft;
+        final int fieldRight = grouped ? dp(8) : codexFieldRight;
+        final boolean clipChanged = clip.gravity != gravity || clip.leftMargin != clipLeft || clip.rightMargin != clipRight;
+        final boolean fieldChanged = field.leftMargin != fieldLeft || field.rightMargin != fieldRight;
+        clip.gravity = gravity;
+        clip.leftMargin = clipLeft;
+        clip.rightMargin = clipRight;
+        field.leftMargin = fieldLeft;
+        field.rightMargin = fieldRight;
+        if (!measuring) {
+            if (clipChanged) attachButton.setLayoutParams(clip);
+            if (fieldChanged) messageEditText.setLayoutParams(field);
+        }
+        codexComposeGroupingActive = grouped;
+        codexComposeContainer.setCodexComposeGroupingActive(grouped);
+        if (grouped) {
+            emojiButton.setVisibility(GONE);
+            attachButton.setVisibility(VISIBLE);
+            attachButton.setAlpha(attachButtonAlpha = 1f);
+            attachButton.setScaleX(1f);
+            attachButton.setScaleY(1f);
+        } else {
+            emojiButton.setVisibility(codexEmojiVisibility);
+            attachButton.setVisibility(codexAttachVisibility);
+            attachButton.setAlpha(attachButtonAlpha = codexAttachAlpha);
+            attachButton.setScaleX(codexAttachScaleX);
+            attachButton.setScaleY(codexAttachScaleY);
+            updateFieldRight(lastAttachVisible);
+        }
+        updateAttachButtonTranslationX();
+        if (changed) textFieldContainer.invalidate();
+    }
+
+    /** 背景跟随原 actor 的实际布局和位移；原发送块独立绘制。 */
+    private void drawCodexComposeGrouping(Canvas canvas) {
+        if (!codexComposeGroupingActive) return;
+        final float clipLeft = messageEditTextContainer.getLeft() + attachButton.getX() + dp(3);
+        final float clipTop = messageEditTextContainer.getTop() + attachButton.getY() + dp(3);
+        final float clipRight = clipLeft + attachButton.getWidth() - dp(6);
+        final float clipBottom = clipTop + attachButton.getHeight() - dp(6);
+        final float fieldLeft = messageEditTextContainer.getLeft() + messageEditText.getX() - dp(6);
+        final float fieldRight = fieldLeft + messageEditText.getWidth() + dp(12);
+        final float fieldTop = messageEditTextContainer.getTop() + dp(3);
+        final float fieldBottom = messageEditTextContainer.getBottom() - dp(3);
+        final float sendRight = sendButtonContainer.getX() + sendButton.getX() + sendButton.getWidth() - dp(3);
+        codexComposeContainer.drawCodexComposeGrouping(canvas, clipLeft, clipTop, clipRight, clipBottom,
+            fieldLeft, fieldTop, fieldRight, fieldBottom, sendRight);
+    }
+
+    /** 只给普通 Codex 会话的原发送按钮启用外观，编辑完成与共享预览按钮保持原样。 */
+    public void setCodexSendButtonAppearance(boolean enabled) {
+        sendButton.setCodexSendAppearance(enabled);
+    }
+
     @Override
     public void updateColors() {
+        sendButton.updateCodexSendColors();
+        applyCodexComposeLayout(false);
+        if (codexComposeGroupingActive) textFieldContainer.invalidate();
         if (messageSendPreview != null) {
             messageSendPreview.updateColors();
         }
@@ -10805,6 +10948,7 @@ public class ChatActivityEnterView extends FrameLayout implements
         if (richDraftPreview == null) return;
         final boolean wasActive = richDraftActive;
         richDraftActive = richDraftMessage != null && editingMessageObject == null;
+        if (richDraftActive) applyCodexComposeLayout(false);
         if (richDraftActive) {
             richDraftPreview.setResourcesProvider(resourcesProvider);
             richDraftPreview.set(richDraftMessage);
@@ -10825,6 +10969,7 @@ public class ChatActivityEnterView extends FrameLayout implements
             sendButton.setLocked(false);
         }
         updateButtons();
+        applyCodexComposeLayout(false);
         if (wasActive != richDraftActive) {
             checkSendButton(true);
         }
@@ -13152,6 +13297,16 @@ public class ChatActivityEnterView extends FrameLayout implements
         return audioToSendMessageObject != null || videoToSendMessageObject != null;
     }
 
+    /** 失败纯文本仅能放入真正空闲的输入框；空白文字、富文本和录制中间态均不可覆盖。 */
+    public boolean canRestorePlainTextDraft() {
+        return messageEditText != null && messageEditText.length() == 0 && messageEditText.getCaption() == null
+                && editingMessageObject == null && replyingMessageObject == null && replyingQuote == null
+                && !richDraftActive && richDraftMessage == null && !forceShowSendButton
+                && !isRecordingAudioVideo() && recordInterfaceState == 0 && moveToSendStateRunnable == null
+                && audioToSend == null && audioToSendMessageObject == null && videoToSendMessageObject == null
+                && (recordedAudioPanel == null || recordedAudioPanel.getVisibility() != VISIBLE);
+    }
+
     public void openKeyboard() {
         if (hasBotWebView() && botCommandsMenuIsShowing() || BaseFragment.hasSheets(parentFragment)) {
             return;
@@ -14589,6 +14744,7 @@ public class ChatActivityEnterView extends FrameLayout implements
                 ((MarginLayoutParams) richDraftPreview.getLayoutParams()).leftMargin = dp(50);
             }
         }
+        applyCodexComposeLayout(true);
         updateBotCommandsMenuContainerTopPadding();
         super.onMeasure(widthMeasureSpec, heightMeasureSpec);
 
@@ -14837,6 +14993,10 @@ public class ChatActivityEnterView extends FrameLayout implements
 
     private void updateAttachButtonTranslationX() {
         if (attachButton == null) return;
+        if (codexComposeGroupingActive) {
+            attachButton.setTranslationX(emojiButton.getTranslationX());
+            return;
+        }
         attachButton.setTranslationX(attachLayoutPaddingTranslationX + attachLayoutTranslationX + (sendButton != null ? (
             -Math.max(0, sendButton.width() - dp(DEFAULT_HEIGHT + 12)) * sendButton.getAlpha()
         ) : 0));
@@ -14940,6 +15100,54 @@ public class ChatActivityEnterView extends FrameLayout implements
         public boolean center;
 
         private final Paint backgroundPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        private boolean codexSendAppearance;
+        private boolean codexSendColorsApplied;
+        private int codexSendStyle;
+        private float codexSendRadius;
+        private int codexSendArrowColor;
+        private PorterDuffColorFilter codexSendArrowFilter;
+        private Paint codexSendFillPaint;
+        private Paint codexSendStrokePaint;
+        private RectF codexSendRect;
+
+        /** 只由原普通聊天实例接线，不复制到媒体或发送预览。 */
+        private void setCodexSendAppearance(boolean enabled) {
+            codexSendAppearance = enabled;
+            updateCodexSendColors();
+            if (!enabled) {
+                updateColors();
+            }
+            invalidate();
+        }
+
+        /** 沿原主题刷新缓存五图颜色与轮廓，draw 不查询样式或创建画笔。 */
+        private void updateCodexSendColors() {
+            if (!codexSendAppearance) {
+                return;
+            }
+            final com.butang.codextop.CodexPixelPalette.Style style = Theme.getCodexPixelStyle();
+            codexSendStyle = style.id;
+            if (codexSendFillPaint == null) {
+                codexSendFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                codexSendStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                codexSendStrokePaint.setStyle(Paint.Style.STROKE);
+                codexSendRect = new RectF();
+            }
+            final boolean filled = style.id == com.butang.codextop.CodexPixelPalette.STYLE_EDITORIAL
+                || style.id == com.butang.codextop.CodexPixelPalette.STYLE_LIME;
+            codexSendFillPaint.setColor(filled ? style.accentFill : style.surface);
+            codexSendStrokePaint.setColor(style.outlineColor);
+            codexSendStrokePaint.setStrokeWidth(dp(1));
+            codexSendRadius = dp(style.id == com.butang.codextop.CodexPixelPalette.STYLE_LIME ? 2
+                : style.id == com.butang.codextop.CodexPixelPalette.STYLE_EDITORIAL ? 3 : 4);
+            final int arrow = filled ? style.onAccentFill : style.accentText;
+            if (codexSendArrowFilter == null || codexSendArrowColor != arrow) {
+                codexSendArrowColor = arrow;
+                codexSendArrowFilter = new PorterDuffColorFilter(arrow, PorterDuff.Mode.SRC_IN);
+            }
+            invalidate();
+        }
 
         public SendButton(Context context, int resId, Theme.ResourcesProvider resourcesProvider) {
             this(context, resId, resourcesProvider, false);
@@ -15201,10 +15409,38 @@ public class ChatActivityEnterView extends FrameLayout implements
             if (!isNewDesignSendButton) {
                 canvas.saveLayerAlpha(0, 0, getWidth(), getHeight(), 0xFF, Canvas.ALL_SAVE_FLAG);
             }
-            updateColors();
+            // 原预览、付费及其退出动画、调度、锁定、临时与 loading 状态完整走原绘制。
+            final boolean codexSend = codexSendAppearance && isNewDesignSendButton
+                && resId == R.drawable.send_plane_24 && !isOpen() && open.get() == 0f
+                && !isInScheduleMode() && !isInactive() && !locked
+                && starsPrice == 0 && animatedPriceVisible.get() == 0f
+                && ephemeralFactor == 0f && sameWidthFactor == 0f
+                && !loadingShown && loadingAnimatedShown.get() == 0f
+                && emojiDrawable.getDrawable() == null && emojiDrawable.isNotEmpty() == 0f
+                && TextUtils.isEmpty(count.getText()) && count.isNotEmpty() == 0f;
+            if (codexSend) {
+                drawable.setColorFilter(codexSendArrowFilter);
+                codexSendColorsApplied = true;
+            } else {
+                updateColors();
+            }
             checkBackgroundRect();
             if (isNewDesignSendButton) {
-                canvas.drawRoundRect(backgroundRect, dp(RADIUS), dp(RADIUS), backgroundPaint);
+                if (codexSend) {
+                    // 06 的青箭头归输入框右端，保留原按钮边界，不另画圆盘或独立色块。
+                    if (codexSendStyle != com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT) {
+                        canvas.drawRoundRect(backgroundRect, codexSendRadius, codexSendRadius, codexSendFillPaint);
+                        if (codexSendStyle == com.butang.codextop.CodexPixelPalette.STYLE_TERMINAL
+                            || codexSendStyle == com.butang.codextop.CodexPixelPalette.STYLE_LIME) {
+                            codexSendRect.set(backgroundRect);
+                            float halfStroke = codexSendStrokePaint.getStrokeWidth() / 2f;
+                            codexSendRect.inset(halfStroke, halfStroke);
+                            canvas.drawRoundRect(codexSendRect, codexSendRadius, codexSendRadius, codexSendStrokePaint);
+                        }
+                    }
+                } else {
+                    canvas.drawRoundRect(backgroundRect, dp(RADIUS), dp(RADIUS), backgroundPaint);
+                }
             }
 
             final boolean inactive = isInactive();
@@ -15466,7 +15702,8 @@ public class ChatActivityEnterView extends FrameLayout implements
 
         public void updateColors() {
             int color = isNewDesignSendButton ? Color.WHITE : Theme.getColor(Theme.key_chat_messagePanelSend, resourcesProvider);
-            if (color != drawableColor) {
+            if (color != drawableColor || codexSendColorsApplied) {
+                codexSendColorsApplied = false;
                 drawableColor = color;
                 drawable.setColorFilter(new PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN));
                 int c = Theme.getColor(Theme.key_glass_defaultIcon, resourcesProvider);
@@ -15626,6 +15863,7 @@ public class ChatActivityEnterView extends FrameLayout implements
     private ChatActivitySideControlsButtonsLayout sideButtons;
     public void setSideButtonsForAttach(ChatActivitySideControlsButtonsLayout sideButtons) {
         this.sideButtons = sideButtons;
+        applyCodexComposeLayout(false);
     }
 
     public boolean isInTopViewVisibilityAnimating() {
@@ -15728,6 +15966,7 @@ public class ChatActivityEnterView extends FrameLayout implements
     public void setLiveComment(boolean isLiveComment, boolean isAdmin) {
         if (this.isLiveComment == isLiveComment) return;
         this.isLiveComment = isLiveComment;
+        if (isLiveComment) applyCodexComposeLayout(false);
         attachButton.setVisibility(isLiveComment ? View.GONE : View.VISIBLE);
         if (isLiveComment) {
             AndroidUtilities.removeFromParent(notifyButton);

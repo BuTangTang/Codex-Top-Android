@@ -25,6 +25,7 @@ import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.Rect;
@@ -116,6 +117,7 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
     private boolean interceptTouches = true;
     private boolean forceSkipTouches;
     private int extraHeight;
+    private CodexRootHeader codexRootHeader;
     private AnimatorSet actionModeAnimation;
     private View actionModeExtraView;
     private View actionModeTranslationView;
@@ -194,10 +196,205 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
     }
 
     private boolean glassMode;
+    private boolean codexPlainChatHeader;
+    private boolean codexPlainChatHeaderDividerVisible;
+    private int codexPlainChatHeaderStyleId;
+    private Paint codexPlainChatHeaderDividerPaint;
     private boolean glassOnlyBack;
     private boolean glassModeIsForum;
 
     private ChatAvatarContainer chatAvatarContainer;
+
+    /** 仅由三个 Codex 根页显式启用页头；0 恢复原布局，不从标题或包名推断页面身份。 */
+    public void setCodexRootHeader(int page) {
+        if (page < 1 || page > 3) {
+            if (codexRootHeader != null) {
+                for (SimpleTextView title : titleTextView) {
+                    if (title != null) {
+                        title.setGravity(isCenterTitle ? Gravity.CENTER : Gravity.LEFT | Gravity.CENTER_VERTICAL);
+                        title.setTextSize(glassMode ? 17 : !AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 18 : 20);
+                        title.setTextColor(titleColorToSet != 0 ? titleColorToSet : getThemedColor(Theme.key_actionBarDefaultTitle));
+                    }
+                }
+            }
+            codexRootHeader = null;
+        } else {
+            codexRootHeader = new CodexRootHeader(page);
+            codexRootHeader.updateStyle(Theme.getCodexPixelStyle());
+        }
+        requestLayout();
+        invalidate();
+    }
+
+    /** 查询本实例是否由三栏根页显式启用，供列表保留非根页的原占位表达式。 */
+    public boolean hasCodexRootHeader() {
+        return codexRootHeader != null;
+    }
+
+    /** 返回不含状态栏的实际标题区及原扩展高度，供根页列表与搜索使用同一占位。 */
+    public int getHeaderContentHeight() {
+        return (codexRootHeader == null ? getCurrentActionBarHeight() : codexRootHeader.bodyHeight) + extraHeight;
+    }
+
+    /** 根页静态图形与字体几何；只在测量和主题刷新时准备，绘制不查状态或分配对象。 */
+    private static final class CodexRootHeader {
+        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path block = new Path();
+        private final String pageNumber;
+        private final String fixedTitle;
+        private int styleId;
+        private int bodyHeight;
+        private int width;
+        private int safeRight;
+        private int titleLeft;
+        private int blockRight;
+        private boolean rtl;
+        private boolean drawBrand;
+        private float brandWidth;
+        private float numberWidth;
+        private float brandBaseline;
+        private int titleColor;
+        private int titleOnAccent;
+
+        /** 保存真实页序和标题；数字仅表示会话、电脑、我的三个固定页码。 */
+        private CodexRootHeader(int page) {
+            pageNumber = page == 1 ? "01" : page == 2 ? "02" : "03";
+            fixedTitle = page == 1 ? "会话" : page == 2 ? "电脑" : "我的";
+            stroke.setStyle(Paint.Style.STROKE);
+            label.setTypeface(AndroidUtilities.bold());
+        }
+
+        /** 缓存已应用样式；不保存偏好，既有系统明暗切换仍由 Theme 管理。 */
+        private void updateStyle(com.butang.codextop.CodexPixelPalette.Style style) {
+            styleId = style.id;
+            fill.setColor(style.accentFill);
+            stroke.setColor(styleId == 4 ? style.ink : style.accentText);
+            stroke.setStrokeWidth(dp(styleId == 4 ? 1.1f : 1f));
+            label.setColor(style.secondary);
+            label.setTextSize(dp(11));
+            brandWidth = label.measureText("Codex Top");
+            numberWidth = label.measureText(pageNumber);
+            titleColor = style.ink;
+            titleOnAccent = style.onAccentFill;
+            bodyHeight = Math.max(bodyHeight, dp(minimumBodyDp()));
+        }
+
+        /** 对照参考图保留各自标题区高度；更大字体实际测量后可以增长。 */
+        private int minimumBodyDp() {
+            switch (styleId) {
+                case 2: return 108;
+                case 4: return 88;
+                case 6: return 72;
+                default: return 76;
+            }
+        }
+
+        /** 参考图的字号层级；这里只作用于两个字的根页标题。 */
+        private int titleSizeDp() {
+            switch (styleId) {
+                case 2: return 42;
+                case 3: return 28;
+                case 4: return 34;
+                case 6: return 28;
+                default: return 30;
+            }
+        }
+
+        /** 每轮测量先回到样式基准，再合并两个原标题视图的高度，避免覆盖动画使占位缩小。 */
+        private void beginMeasure() {
+            bodyHeight = dp(minimumBodyDp());
+            blockRight = 0;
+        }
+
+        /** 测量真实标题并扩容高度；窄屏先让出产品字样，保留菜单安全区与完整根页标题。 */
+        private void measureTitle(SimpleTextView title, int availableWidth, int originalLeft,
+                                  int fullWidth, int menuWidth, float fontScale, boolean isRtl) {
+            width = fullWidth;
+            rtl = isRtl;
+            int indent = dp(styleId == 2 ? 36 : styleId == 3 ? 26 : styleId == 4 ? 28 : 18);
+            titleLeft = Math.max(originalLeft, indent);
+            int titleWidth = Math.max(0, availableWidth - (titleLeft - originalLeft));
+            safeRight = Math.max(titleLeft, fullWidth - menuWidth - dp(16));
+            boolean rootText = TextUtils.equals(fixedTitle, title.getText());
+            int size = Math.max(1, Math.round(dp(rootText ? titleSizeDp() : 20) * Math.max(1f, fontScale)));
+            title.setTextSizePx(size);
+            title.setTextColor(styleId == 3 || styleId == 4 ? titleOnAccent : titleColor);
+            // 原连接状态等覆盖标题仍按单行省略；固定的两字页名才按安全宽度收缩。
+            if (rootText && titleWidth > 0) {
+                float textWidth = title.getTextPaint().measureText(fixedTitle);
+                if (textWidth > titleWidth) title.setTextSizePx(Math.max(1, (int) (size * titleWidth / textWidth)));
+            }
+            title.setGravity((rtl ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL);
+            title.measure(MeasureSpec.makeMeasureSpec(titleWidth, MeasureSpec.AT_MOST),
+                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+            int numberHeight = dp(styleId == 2 ? 26 : 0);
+            bodyHeight = Math.max(bodyHeight, title.getTextHeight() + numberHeight + Math.max(dp(24), title.getPaddingTop() * 2));
+            blockRight = Math.max(blockRight, Math.min(safeRight, Math.max(titleLeft + title.getTextWidth() + dp(24), dp(styleId == 4 ? 144 : 156))));
+        }
+
+        /** 将本轮真实文字尺寸准备成静态路径；绘制阶段只消费缓存。 */
+        private void finishMeasure() {
+            drawBrand = (styleId == 2 || styleId == 3 || styleId == 4)
+                    && safeRight - blockRight >= brandWidth + dp(16);
+            brandBaseline = (bodyHeight - label.ascent() - label.descent()) / 2f;
+            block.reset();
+            if (styleId == 3 || styleId == 4) {
+                float cut = dp(styleId == 3 ? 24 : 12);
+                float left = dp(12), top = dp(12), bottom = bodyHeight - dp(12);
+                block.moveTo(left, top);
+                block.lineTo(blockRight - cut, top);
+                block.lineTo(blockRight, styleId == 3 ? top : top + cut);
+                block.lineTo(styleId == 3 ? blockRight - cut : blockRight, bottom);
+                block.lineTo(left, bottom);
+                block.close();
+            }
+        }
+
+        /** 按真实文本宽度镜像标题；菜单继续使用原位置和命中范围。 */
+        private int titleX(int measuredWidth) {
+            return rtl ? dp(12) + safeRight - titleLeft - measuredWidth : titleLeft;
+        }
+
+        /** 页码在大标题上方占独立空间，其余样式在标题区内垂直居中。 */
+        private int titleY(int textHeight) {
+            int numberHeight = dp(styleId == 2 ? 26 : 0);
+            return numberHeight + (bodyHeight - numberHeight - textHeight) / 2;
+        }
+
+        /** 在原 titlesContainer 内绘制，让搜索和多选的原透明度统一隐藏静态装饰。 */
+        private void draw(Canvas canvas, int statusHeight) {
+            canvas.save();
+            canvas.translate(0, statusHeight);
+            if (rtl) {
+                canvas.translate(dp(12) + safeRight, 0);
+                canvas.scale(-1, 1);
+            }
+            if (styleId == 2) {
+                canvas.drawRect(dp(18), dp(14), dp(24), bodyHeight - dp(18), fill);
+            } else if (styleId == 3 || styleId == 4) {
+                canvas.drawPath(block, fill);
+                if (styleId == 4) {
+                    canvas.drawPath(block, stroke);
+                    canvas.drawRect(dp(12), dp(12), safeRight, bodyHeight - dp(12), stroke);
+                    canvas.drawLine(blockRight, dp(24), blockRight, bodyHeight - dp(12), stroke);
+                } else {
+                    canvas.drawLine(safeRight - dp(8), dp(24), safeRight, dp(24), stroke);
+                    canvas.drawLine(safeRight, dp(24), safeRight, dp(44), stroke);
+                    canvas.drawLine(safeRight - dp(8), dp(44), safeRight, dp(44), stroke);
+                }
+            }
+            canvas.restore();
+            // 字符本身不随图形镜像；绘制只消费测量时缓存的几何，不引入提示或统计。
+            if (styleId == 2) {
+                canvas.drawText(pageNumber, rtl ? dp(12) + safeRight - titleLeft - numberWidth : titleLeft, statusHeight + dp(25), label);
+            }
+            if (drawBrand) {
+                canvas.drawText("Codex Top", rtl ? dp(12) : safeRight - brandWidth, statusHeight + brandBaseline, label);
+            }
+        }
+    }
 
     public void setGlassOnlyBack() {
         glassOnlyBack = true;
@@ -207,13 +404,74 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         this.chatAvatarContainer = chatAvatarContainer;
     }
 
+    /** 为普通 Codex 会话恢复原平面导航；兼容已有玻璃控件，不改搜索或多选动画进度。 */
+    public void setupPlainChatHeader(int backgroundColor) {
+        setClipChildren(false);
+        codexPlainChatHeader = true;
+        glassMode = false;
+        glassModeIsForum = false;
+        glassOnlyBack = false;
+        glassDrawable = null;
+        glassDrawableBack = null;
+        glassDrawableMenu = null;
+        chatAvatarContainer = null;
+
+        if (menu != null) {
+            menu.setTranslationX(0);
+            menu.setGlassMode(false);
+            menu.setCodexPlainHeader(true);
+        }
+        if (actionMode != null) {
+            actionMode.setTranslationX(0);
+            actionMode.setGlassMode(false);
+            actionMode.setCodexPlainHeader(true);
+            actionMode.setBackgroundColor(getThemedColor(Theme.key_actionBarActionModeDefault));
+        }
+        if (backButtonImageView != null) {
+            backButtonImageView.setTranslationX(0);
+        }
+        setBackgroundColor(backgroundColor);
+        setCodexPlainChatHeaderDividerVisible(true);
+    }
+
+    /** 仅撤销或恢复已显式启用的普通聊天底边，保留原预览及导航状态。 */
+    public void setCodexPlainChatHeaderDividerVisible(boolean visible) {
+        codexPlainChatHeaderDividerVisible = visible && codexPlainChatHeader;
+        updateCodexPlainChatHeaderDividerColors();
+        invalidate();
+    }
+
+    /** 颜色只沿初始化和原主题刷新缓存，绘制不查询主题。 */
+    private void updateCodexPlainChatHeaderDividerColors() {
+        if (!codexPlainChatHeader || !codexPlainChatHeaderDividerVisible) {
+            return;
+        }
+        final com.butang.codextop.CodexPixelPalette.Style style = Theme.getCodexPixelStyle();
+        codexPlainChatHeaderStyleId = style.id;
+        if (style.id == com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT) {
+            if (codexPlainChatHeaderDividerPaint == null) {
+                codexPlainChatHeaderDividerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            }
+            codexPlainChatHeaderDividerPaint.setColor(style.outlineColor);
+        }
+        invalidate();
+    }
+
     public void setupGlass(BlurredBackgroundDrawableViewFactory factory, BlurredBackgroundColorProvider colorProvider) {
         setupGlass(factory, colorProvider, false);
     }
 
+    /** 恢复原玻璃导航；只撤销本实例此前由 Codex 平面模式安装的多选背景。 */
     public void setupGlass(BlurredBackgroundDrawableViewFactory factory,
                            BlurredBackgroundColorProvider colorProvider,
                            boolean isForum) {
+        if (codexPlainChatHeader) {
+            setCodexPlainChatHeaderDividerVisible(false);
+            codexPlainChatHeader = false;
+            if (actionMode != null) {
+                actionMode.setBackground(null);
+            }
+        }
         setBackground(null);
         setClipChildren(false);
         glassMode = true;
@@ -1207,6 +1465,9 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         ValueAnimator alphaUpdate = ValueAnimator.ofFloat(searchFieldVisibleAlpha, visible ? 1f : 0f);
         alphaUpdate.addUpdateListener(anm -> {
             searchFieldVisibleAlpha = (float) anm.getAnimatedValue();
+            if (codexPlainChatHeaderDividerVisible && codexPlainChatHeaderStyleId == com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT) {
+                invalidate();
+            }
 
             if (glassDrawable != null && glassModeIsForum) {
                 final float r1 = dp(23);
@@ -1268,6 +1529,9 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
                     if (!visible) {
                         avatarSearchImageView.setVisibility(View.GONE);
                     }
+                }
+                if (codexPlainChatHeaderDividerVisible && codexPlainChatHeaderStyleId == com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT) {
+                    invalidate();
                 }
             }
         });
@@ -1380,6 +1644,7 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
     }
 
 
+    /** 原导航控件保持其测量；显式 Codex 根页为实际大标题另留足高度。 */
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         int width = MeasureSpec.getSize(widthMeasureSpec);
@@ -1434,44 +1699,54 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
 
         }
 
+        // 原搜索会隐藏标题；保留已测过的根页高度，避免搜索开始时突然缩小安全区。
+        if (codexRootHeader != null && titleTextView[0] != null && titleTextView[0].getVisibility() != GONE) {
+            codexRootHeader.beginMeasure();
+        }
         for (int i = 0; i < 2; i++) {
             if (titleTextView[0] != null && titleTextView[0].getVisibility() != GONE || subtitleTextView != null && subtitleTextView.getVisibility() != GONE) {
                 int availableWidth = width - (menu != null ? menu.getMeasuredWidth() : 0) - dp(16) - textLeft - titleRightMargin;
                 availableWidth = Math.max(availableWidth, 0);
 
-                if (((fromBottom && i == 0) || (!fromBottom && i == 1)) && overlayTitleAnimation && titleAnimationRunning) {
-                    titleTextView[i].setTextSize(glassMode ? 17 : !AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 18 : 20);
+                if (codexRootHeader != null && titleTextView[i] != null && titleTextView[i].getVisibility() != GONE) {
+                    codexRootHeader.measureTitle(titleTextView[i], availableWidth, textLeft, width,
+                            menu != null ? menu.getMeasuredWidth() : 0,
+                            getResources().getConfiguration().fontScale, LocaleController.isRTL);
                 } else {
-                    if (titleTextView[0] != null && titleTextView[0].getVisibility() != GONE && subtitleTextView != null && subtitleTextView.getVisibility() != GONE) {
-                        if (titleTextView[i] != null) {
-                            titleTextView[i].setTextSize(glassMode ? 17 : AndroidUtilities.isTablet() ? 20 : 18);
-                        }
-                        subtitleTextView.setTextSize(AndroidUtilities.isTablet() ? 16 : 14);
-                        if (additionalSubtitleTextView != null) {
-                            additionalSubtitleTextView.setTextSize(AndroidUtilities.isTablet() ? 16 : 14);
-                        }
+                    if (((fromBottom && i == 0) || (!fromBottom && i == 1)) && overlayTitleAnimation && titleAnimationRunning) {
+                        titleTextView[i].setTextSize(glassMode ? 17 : !AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 18 : 20);
                     } else {
-                        if (titleTextView[i] != null && titleTextView[i].getVisibility() != GONE) {
-                            titleTextView[i].setTextSize(glassMode ? 17 : !AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 18 : 20);
-                        }
-                        if (subtitleTextView != null && subtitleTextView.getVisibility() != GONE) {
-                            subtitleTextView.setTextSize(!AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 14 : 16);
-                        }
-                        if (additionalSubtitleTextView != null) {
-                            additionalSubtitleTextView.setTextSize(!AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 14 : 16);
+                        if (titleTextView[0] != null && titleTextView[0].getVisibility() != GONE && subtitleTextView != null && subtitleTextView.getVisibility() != GONE) {
+                            if (titleTextView[i] != null) {
+                                titleTextView[i].setTextSize(glassMode ? 17 : AndroidUtilities.isTablet() ? 20 : 18);
+                            }
+                            subtitleTextView.setTextSize(AndroidUtilities.isTablet() ? 16 : 14);
+                            if (additionalSubtitleTextView != null) {
+                                additionalSubtitleTextView.setTextSize(AndroidUtilities.isTablet() ? 16 : 14);
+                            }
+                        } else {
+                            if (titleTextView[i] != null && titleTextView[i].getVisibility() != GONE) {
+                                titleTextView[i].setTextSize(glassMode ? 17 : !AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 18 : 20);
+                            }
+                            if (subtitleTextView != null && subtitleTextView.getVisibility() != GONE) {
+                                subtitleTextView.setTextSize(!AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 14 : 16);
+                            }
+                            if (additionalSubtitleTextView != null) {
+                                additionalSubtitleTextView.setTextSize(!AndroidUtilities.isTablet() && getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? 14 : 16);
+                            }
                         }
                     }
-                }
 
-                if (titleTextView[i] != null && titleTextView[i].getVisibility() != GONE) {
-                    titleTextView[i].measure(MeasureSpec.makeMeasureSpec(availableWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(dp(24) + titleTextView[i].getPaddingTop() + titleTextView[i].getPaddingBottom(), MeasureSpec.AT_MOST));
-                    if (centerScale) {
-                        CharSequence text = titleTextView[i].getText();
-                        titleTextView[i].setPivotX(titleTextView[i].getTextPaint().measureText(text, 0, text.length()) / 2f);
-                        titleTextView[i].setPivotY((dp(24) >> 1));
-                    } else {
-                        titleTextView[i].setPivotX(0);
-                        titleTextView[i].setPivotY(0);
+                    if (titleTextView[i] != null && titleTextView[i].getVisibility() != GONE) {
+                        titleTextView[i].measure(MeasureSpec.makeMeasureSpec(availableWidth, MeasureSpec.AT_MOST), MeasureSpec.makeMeasureSpec(dp(24) + titleTextView[i].getPaddingTop() + titleTextView[i].getPaddingBottom(), MeasureSpec.AT_MOST));
+                        if (centerScale) {
+                            CharSequence text = titleTextView[i].getText();
+                            titleTextView[i].setPivotX(titleTextView[i].getTextPaint().measureText(text, 0, text.length()) / 2f);
+                            titleTextView[i].setPivotY((dp(24) >> 1));
+                        } else {
+                            titleTextView[i].setPivotX(0);
+                            titleTextView[i].setPivotY(0);
+                        }
                     }
                 }
                 if (subtitleTextView != null && subtitleTextView.getVisibility() != GONE) {
@@ -1493,13 +1768,23 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
             );
         }
 
+        if (codexRootHeader != null) {
+            codexRootHeader.finishMeasure();
+            setMeasuredDimension(width, getHeaderContentHeight() + (occupyStatusBar ? AndroidUtilities.statusBarHeight : 0));
+        }
+
         int childCount = getChildCount();
         for (int i = 0; i < childCount; i++) {
             View child = getChildAt(i);
             if (child.getVisibility() == GONE || child == titleTextView[0] || child == titleTextView[1] || child == additionalSubTitleOverlayContainer || child == subtitleTextView || child == menu || child == backButtonImageView || child == additionalSubtitleTextView || child == avatarSearchImageView) {
                 continue;
             }
-            measureChildWithMargins(child, widthMeasureSpec, 0, MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY), 0);
+            if (codexRootHeader != null && child == actionMode) {
+                // 多选控件仍使用原导航高度；大标题的静态留白不扩大原按钮命中区。
+                child.measure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(actionBarHeight + (occupyStatusBar ? AndroidUtilities.statusBarHeight : 0), MeasureSpec.EXACTLY));
+            } else {
+                measureChildWithMargins(child, widthMeasureSpec, 0, MeasureSpec.makeMeasureSpec(getMeasuredHeight(), MeasureSpec.EXACTLY), 0);
+            }
         }
     }
 
@@ -1509,6 +1794,7 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
 
     int prevWidth;
 
+    /** 根页标题采用测量过的安全区域，其余标题、返回及菜单沿用原布局。 */
     @Override
     protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
         int additionalTop = occupyStatusBar ? AndroidUtilities.statusBarHeight : 0;
@@ -1534,7 +1820,9 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         for (int i = 0; i < 2; i++) {
             if (titleTextView[i] != null && titleTextView[i].getVisibility() != GONE) {
                 int textTop;
-                if (((fromBottom && i == 0) || (!fromBottom && i == 1)) && overlayTitleAnimation && titleAnimationRunning) {
+                if (codexRootHeader != null) {
+                    textTop = codexRootHeader.titleY(titleTextView[i].getTextHeight());
+                } else if (((fromBottom && i == 0) || (!fromBottom && i == 1)) && overlayTitleAnimation && titleAnimationRunning) {
                     textTop = (getCurrentActionBarHeight() - titleTextView[i].getTextHeight()) / 2;
                 } else {
                     if ((subtitleTextView != null && subtitleTextView.getVisibility() != GONE)) {
@@ -1543,7 +1831,8 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
                         textTop = (getCurrentActionBarHeight() - titleTextView[i].getTextHeight()) / 2;
                     }
                 }
-                titleTextView[i].layout(textLeft, additionalTop + textTop - titleTextView[i].getPaddingTop(), textLeft + titleTextView[i].getMeasuredWidth(), additionalTop + textTop + titleTextView[i].getTextHeight() - titleTextView[i].getPaddingTop() + titleTextView[i].getPaddingBottom());
+                int titleLeft = codexRootHeader == null ? textLeft : codexRootHeader.titleX(titleTextView[i].getMeasuredWidth());
+                titleTextView[i].layout(titleLeft, additionalTop + textTop - titleTextView[i].getPaddingTop(), titleLeft + titleTextView[i].getMeasuredWidth(), additionalTop + textTop + titleTextView[i].getTextHeight() - titleTextView[i].getPaddingTop() + titleTextView[i].getPaddingBottom());
             }
         }
         if (additionalSubTitleOverlayContainer != null) {
@@ -2285,6 +2574,14 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         }
 
         super.dispatchDraw(canvas);
+        if (codexPlainChatHeader && codexPlainChatHeaderDividerVisible
+            && codexPlainChatHeaderStyleId == com.butang.codextop.CodexPixelPalette.STYLE_BLUEPRINT
+            && codexRootHeader == null && codexPlainChatHeaderDividerPaint != null
+            && !isSearchFieldVisible && searchFieldVisibleAlpha == 0f && searchFactor == 0f
+            && (searchVisibleAnimator == null || !searchVisibleAnimator.isRunning())
+            && !actionModeVisible && (actionMode == null || actionMode.getVisibility() != View.VISIBLE || actionModeFactor == 0f) && actionModeAnimation == null) {
+            canvas.drawRect(0, getHeight() - dp(1), getWidth(), getHeight(), codexPlainChatHeaderDividerPaint);
+        }
     }
 
     public void setForceSkipTouches(boolean forceSkipTouches) {
@@ -2298,10 +2595,20 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         }
     }
 
+    /** 保留原标题容器布局，仅在显式根页绘制缓存的静态装饰。 */
     public void setUseContainerForTitles() {
         this.useContainerForTitles = true;
         if (titlesContainer == null) {
             titlesContainer = new FrameLayout(getContext()) {
+                /** 静态页头属于原标题容器，随原搜索、多选和可见性动画一起绘制。 */
+                @Override
+                protected void dispatchDraw(Canvas canvas) {
+                    if (codexRootHeader != null) {
+                        codexRootHeader.draw(canvas, occupyStatusBar ? AndroidUtilities.statusBarHeight : 0);
+                    }
+                    super.dispatchDraw(canvas);
+                }
+
                 @Override
                 protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
                     setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.getSize(heightMeasureSpec));
@@ -2320,8 +2627,14 @@ public class ActionBar extends FrameLayout implements FactorAnimator.Target, The
         return titlesContainer;
     }
 
+    /** 主题切换时刷新根页缓存并重新测量；普通导航继续原换色路径。 */
     @Override
     public void updateColors() {
+        updateCodexPlainChatHeaderDividerColors();
+        if (codexRootHeader != null) {
+            codexRootHeader.updateStyle(Theme.getCodexPixelStyle());
+            requestLayout();
+        }
         adaptive_updateColor();
         if (glassDrawable != null) {
             glassDrawable.updateColors();

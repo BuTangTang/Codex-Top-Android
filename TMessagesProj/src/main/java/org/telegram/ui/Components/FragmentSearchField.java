@@ -184,25 +184,51 @@ public class FragmentSearchField extends FrameLayout implements FactorAnimator.T
 
     private Drawable bg;
 
+    private boolean codexPageChrome;
+    private final android.graphics.Paint codexSearchFillPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+    private final android.graphics.Paint codexSearchOutlinePaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+    private final android.graphics.RectF codexSearchFillBounds = new android.graphics.RectF();
+    private final android.graphics.RectF codexSearchOutlineBounds = new android.graphics.RectF();
+    private float codexSearchRadius;
+    private float codexSearchOutlineInset;
+    private float codexSearchOutlineRadius;
+
+    public void setCodexPageChrome(boolean enabled) {
+        if (codexPageChrome == enabled) {
+            return;
+        }
+        codexPageChrome = enabled;
+        updateColors();
+    }
+
     @Override
     protected void dispatchDraw(@NonNull Canvas canvas) {
         canvas.save();
-        if (bg != null) {
-            bg.setBounds(
-                getPaddingLeft(),
-                getPaddingTop(),
-                getWidth() - getPaddingRight(),
-                getHeight() - getPaddingBottom()
-            );
-            bg.draw(canvas);
-        }
-        if (blurredBackgroundDrawable != null) {
-            blurredBackgroundDrawable.setBounds(
-                    getPaddingLeft() - dp(4),
-                    getPaddingTop() - dp(4),
-                    getWidth() - getPaddingRight() + dp(4),
-                    (getHeight() - getPaddingBottom()) + dp(4));
-            blurredBackgroundDrawable.draw(canvas);
+        if (codexPageChrome) {
+            codexSearchFillBounds.set(getPaddingLeft(), getPaddingTop(),
+                    getWidth() - getPaddingRight(), getHeight() - getPaddingBottom());
+            codexSearchOutlineBounds.set(codexSearchFillBounds);
+            codexSearchOutlineBounds.inset(codexSearchOutlineInset, codexSearchOutlineInset);
+            canvas.drawRoundRect(codexSearchFillBounds, codexSearchRadius, codexSearchRadius, codexSearchFillPaint);
+            canvas.drawRoundRect(codexSearchOutlineBounds, codexSearchOutlineRadius, codexSearchOutlineRadius, codexSearchOutlinePaint);
+        } else {
+            if (bg != null) {
+                bg.setBounds(
+                    getPaddingLeft(),
+                    getPaddingTop(),
+                    getWidth() - getPaddingRight(),
+                    getHeight() - getPaddingBottom()
+                );
+                bg.draw(canvas);
+            }
+            if (blurredBackgroundDrawable != null) {
+                blurredBackgroundDrawable.setBounds(
+                        getPaddingLeft() - dp(4),
+                        getPaddingTop() - dp(4),
+                        getWidth() - getPaddingRight() + dp(4),
+                        (getHeight() - getPaddingBottom()) + dp(4));
+                blurredBackgroundDrawable.draw(canvas);
+            }
         }
         super.dispatchDraw(canvas);
         canvas.restore();
@@ -277,6 +303,18 @@ public class FragmentSearchField extends FrameLayout implements FactorAnimator.T
         bg = isSectionBackground ?
             Theme.createRoundRectDrawableShadowed(dp(20), getThemedColor(Theme.key_windowBackgroundWhite)) :
             Theme.createRoundRectDrawable(dp(20), isWhiteBackground ? getThemedColor(Theme.key_windowBackgroundWhite) : getThemedColor(Theme.key_windowBackgroundWhiteBlackText, isDark ? 0.07f : 0.05f));
+        if (codexPageChrome) {
+            final com.butang.codextop.CodexPixelPalette.Style style = Theme.getCodexPixelStyle();
+            codexSearchFillPaint.setColor(getThemedColor(isSectionBackground || isWhiteBackground
+                    ? Theme.key_windowBackgroundWhite : Theme.key_dialogSearchBackground));
+            codexSearchOutlinePaint.setColor(style.id == 6 ? style.accentText
+                    : getThemedColor(style.id == 4 ? Theme.key_windowBackgroundWhiteBlackText : Theme.key_divider));
+            codexSearchOutlinePaint.setStyle(android.graphics.Paint.Style.STROKE);
+            codexSearchOutlinePaint.setStrokeWidth(dp(1));
+            codexSearchRadius = dp(style.id == 3 ? 8 : style.id == 2 || style.id == 6 ? 2 : 6);
+            codexSearchOutlineInset = codexSearchOutlinePaint.getStrokeWidth() / 2.0f;
+            codexSearchOutlineRadius = Math.max(0, codexSearchRadius - codexSearchOutlineInset);
+        }
         searchIcon.setColorFilter(getThemedColor(Theme.key_windowBackgroundWhiteBlackText, 0.6f), PorterDuff.Mode.MULTIPLY);
         closeIcon.setColorFilter(getThemedColor(Theme.key_windowBackgroundWhiteBlackText, 0.6f), PorterDuff.Mode.MULTIPLY);
         closeIcon.setBackground(Theme.createSelectorDrawable(getThemedColor(Theme.key_listSelector), 1, dp(17)));

@@ -18,7 +18,7 @@ public final class DesktopQuestionTest {
         check(action.getAsJsonObject("answers").keySet().iterator().next().equals("choice"), "回答未按原题排序");
         check(action.getAsJsonObject("answers").getAsJsonArray("free").get(0).getAsString().equals("合成内容"), "自填回答丢失");
         check(numeric.questions.get(1).isSecret, "秘密题目未标记");
-        check(!numeric.questions.get(0).accepts("其它"), "原题未授权自填却接受");
+        check(numeric.questions.get(0).accepts("其它"), "缺失 isOther 的题目仍应接受自填");
         JsonObject stringId = snapshot.deepCopy(); request(stringId).addProperty("requestId", "7");
         DesktopQuestion string = DesktopQuestion.read(stringId).get(0);
         check(!string.identity().equals(numeric.identity()), "数字与字符串身份发生合并");
@@ -30,9 +30,18 @@ public final class DesktopQuestionTest {
             expectCannotSubmit(DesktopQuestion.read(closed).get(0), answers);
         }
         LinkedHashMap<String, String> missing = new LinkedHashMap<>(answers); missing.remove("free"); expectCannotSubmit(numeric, missing);
-        LinkedHashMap<String, String> invalid = new LinkedHashMap<>(answers); invalid.put("choice", "其它"); expectCannotSubmit(numeric, invalid);
-        JsonObject other = snapshot.deepCopy(); request(other).getAsJsonArray("questions").get(0).getAsJsonObject().addProperty("isOther", true);
-        check(DesktopQuestion.read(other).get(0).action("m", "s", "op", invalid).getAsJsonObject("answers").has("choice"), "原题允许自填却拒绝");
+        LinkedHashMap<String, String> invalid = new LinkedHashMap<>(answers);
+        for (String empty : new String[]{null, "", " \n "}) {
+            invalid.put("choice", empty); expectCannotSubmit(numeric, invalid);
+        }
+        invalid.put("choice", "其它");
+        for (Boolean isOther : new Boolean[]{null, false, true}) {
+            JsonObject custom = snapshot.deepCopy();
+            JsonObject choice = request(custom).getAsJsonArray("questions").get(0).getAsJsonObject();
+            if (isOther != null) choice.addProperty("isOther", isOther);
+            JsonObject customAction = DesktopQuestion.read(custom).get(0).action("m", "s", "op", invalid);
+            check(customAction.getAsJsonObject("answers").getAsJsonArray("choice").get(0).getAsString().equals("其它"), "自填答案未完整提交");
+        }
         JsonObject partial = snapshot.deepCopy(); request(partial).add("answers", JsonParser.parseString("{\"choice\":[\"乙\"]}"));
         DesktopQuestion partlyAnswered = DesktopQuestion.read(partial).get(0);
         check(partlyAnswered.answers.get("choice").equals("乙"), "桌面已答项丢失");

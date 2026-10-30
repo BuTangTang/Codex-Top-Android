@@ -250,6 +250,12 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
 //        int bottom = offset + animationSupportListView.getPaddingTop() + itemsToEnd * cellHeight + itemsToEnd - 1;
         //fix height changed
         int top = offset + animationSupportListView.getPaddingTop() - p * cellHeight - p;
+        for (int i = 0; i < p && i < itemInternals.size(); i++) {
+            ItemInternal item = itemInternals.get(i);
+            if (item.viewType == VIEW_TYPE_DIALOG) {
+                top -= getDialogCellHeight(item) - cellHeight;
+            }
+        }
 //        int additionalHeight = 0;
 //        if (hasStories) {
 //            additionalHeight += AndroidUtilities.dp(DialogStoriesCell.HEIGHT_IN_DP);
@@ -283,6 +289,7 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
         TLRPC.Dialog dialog;
         private int codexDate;
         private String codexTitle;
+        private String codexMachineName;
         TLRPC.RecentMeUrl recentMeUrl;
         TLRPC.TL_contact contact;
         boolean isForumCell;
@@ -351,7 +358,9 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
             this.dialog = dialog;
             if (dialog != null && com.butang.codextop.CodexRuntime.enabled()) {
                 codexDate = dialog.last_message_date;
-                codexTitle = com.butang.codextop.CodexRuntime.conversationInfo(dialog.id).title;
+                com.butang.codextop.CodexRuntime.ConversationInfo info = com.butang.codextop.CodexRuntime.conversationInfo(dialog.id);
+                codexTitle = info.title;
+                codexMachineName = info.machineName;
             }
             if (dialog != null) {
                 int currentId = dialogsStableIds.get(dialog.id, -1);
@@ -583,12 +592,13 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                 return oldItems.get(oldItemPosition).compare(newItems.get(newItemPosition));
             }
 
-            /** Codex 只对标题或时间变化的稳定行重新绑定，其余行不因周期同步重建。 */
+            /** 标题、时间或真实来源变化才重绑稳定行，不因相同快照反复重建。 */
             @Override
             public boolean areContentsTheSame(int oldItemPosition, int newItemPosition) {
                 ItemInternal oldItem = oldItems.get(oldItemPosition), newItem = newItems.get(newItemPosition);
                 if (com.butang.codextop.CodexRuntime.enabled() && oldItem.dialog != null && newItem.dialog != null
-                        && (oldItem.codexDate != newItem.codexDate || !java.util.Objects.equals(oldItem.codexTitle, newItem.codexTitle))) return false;
+                        && (oldItem.codexDate != newItem.codexDate || !java.util.Objects.equals(oldItem.codexTitle, newItem.codexTitle)
+                        || !java.util.Objects.equals(oldItem.codexMachineName, newItem.codexMachineName))) return false;
                 return oldItem.viewType == newItem.viewType;
             }
         };
@@ -1516,7 +1526,7 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
                         if (itemInternals.get(i).isForumCell && !collapsedView) {
                             dialogsHeight += AndroidUtilities.dp(SharedConfig.useThreeLinesLayout ? 86 : 91);
                         } else {
-                            dialogsHeight += cellHeight;
+                            dialogsHeight += getDialogCellHeight(itemInternals.get(i));
                         }
                     } else  if (itemInternals.get(i).viewType == VIEW_TYPE_FLICKER) {
                         dialogsHeight += cellHeight;
@@ -1821,12 +1831,21 @@ public class DialogsAdapter extends RecyclerListView.SelectionAdapter implements
         }
     }
 
+    /** 与真实普通行共用03/06来源门；保留原固定70/76高度及论坛特殊高度。 */
+    private int getDialogCellHeight(ItemInternal item) {
+        boolean sourceThreeLines = !isTransitionSupport && !item.isForumCell && item.dialog != null
+                && !(item.dialog instanceof TLRPC.TL_dialogFolder)
+                && !(item.dialog instanceof TLRPC.TL_dialogCommunity)
+                && DialogCell.codexSourceName(item.dialog.id) != null;
+        return AndroidUtilities.dp(SharedConfig.useThreeLinesLayout || sourceThreeLines ? 76 : 70);
+    }
+
     public int getItemHeight(int position) {
         if (itemInternals.get(position).viewType == VIEW_TYPE_DIALOG) {
             if (itemInternals.get(position).isForumCell && !collapsedView) {
                 return AndroidUtilities.dp(SharedConfig.useThreeLinesLayout ? 86 : 91) + 1;
             } else {
-                return AndroidUtilities.dp(SharedConfig.useThreeLinesLayout ? 76 : 70) + 1;
+                return getDialogCellHeight(itemInternals.get(position)) + 1;
             }
         }
         return 0;

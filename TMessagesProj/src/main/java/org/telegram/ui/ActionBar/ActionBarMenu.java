@@ -38,6 +38,7 @@ public class ActionBarMenu extends LinearLayout {
     protected ActionBar parentActionBar;
     protected boolean isActionMode;
     private boolean glassMode;
+    private boolean codexPlainHeader;
 
     private ArrayList<Integer> ids;
 
@@ -632,21 +633,32 @@ public class ActionBarMenu extends LinearLayout {
         this.onLayoutListener = listener;
     }
 
+    /** 切换原玻璃菜单；重新进入玻璃时撤销 Codex 的平面边距恢复标记。 */
     public void setGlassMode(boolean glassMode) {
         this.glassMode = glassMode;
+        if (glassMode) {
+            codexPlainHeader = false;
+        }
     }
 
+    /** 仅供普通 Codex 顶栏恢复本菜单原有的图标和文字外边距。 */
+    public void setCodexPlainHeader(boolean codexPlainHeader) {
+        this.codexPlainHeader = codexPlainHeader;
+    }
+
+    /** 测量前恢复已复用菜单的原边距，普通 Telegram 菜单保持原测量行为。 */
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        if (glassMode) {
+        if (glassMode || codexPlainHeader) {
             for (int a = 0, N = getChildCount(); a < N; a++) {
                 final View view = getChildAt(a);
                 if (view instanceof ActionBarMenuItem) {
                     final ViewGroup.LayoutParams lp = view.getLayoutParams();
                     if (lp instanceof MarginLayoutParams) {
                         MarginLayoutParams mlp = (MarginLayoutParams) lp;
-                        mlp.leftMargin = -dp(5);
-                        mlp.rightMargin = -dp(5);
+                        int margin = glassMode ? -dp(5) : ((ActionBarMenuItem) view).textView != null ? dp(14) : 0;
+                        mlp.leftMargin = margin;
+                        mlp.rightMargin = margin;
                     }
                 }
             }

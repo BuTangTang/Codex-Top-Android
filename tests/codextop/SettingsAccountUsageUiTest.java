@@ -27,11 +27,12 @@ public final class SettingsAccountUsageUiTest {
                 "codexUsageLoading", "codexUsageGeneration", "codexUsageMachine", "codexUsageMachineName", "codexUsageSourcesRequested",
                 "codexBrowseRequested"))
             actual.append(source.getFieldByName(field).orElseThrow()).append('\n');
-        for (String method : List.of("codexQuota", "codexQuotaDetail", "codexMyRoot", "codexUsageMachineId",
+        for (String method : List.of("codexAppearance", "codexQuota", "codexQuotaDetail", "codexMyRoot", "codexUsageMachineId",
                 "codexUsageSourceLabel", "selectCodexUsageMachine", "applyCodexUsageSources", "loadCodexUsageSources",
                 "loadCodexUsage", "restoreCodexUsageFromCache", "codexBrowser", "codexConversations", "applyCodexBrowse",
-                "loadCodexBrowser", "onResume", "onFragmentDestroy"))
+                "loadCodexBrowser", "onResume", "onFragmentDestroy", "codexQuotaTime", "codexQuotaWindow", "codexUsageItem", "fillCodexUsageItems"))
             for (var overload : source.getMethodsByName(method)) actual.append(overload).append('\n');
+        appendOverviewItems(source, actual);
         Path temp = Files.createTempDirectory("codex-settings-usage-");
         try {
             Path probe = temp.resolve("SettingsUsageProbe.java"), runtime = temp.resolve("CodexRuntime.java");
@@ -57,6 +58,41 @@ public final class SettingsAccountUsageUiTest {
         }
     }
 
+    /** 执行真实 My 尾部分支及实际工厂；替身只记录 UItem，不复制页面顺序或额度判断。 */
+    private static void appendOverviewItems(ClassOrInterfaceDeclaration source, StringBuilder actual) {
+        var codex = source.getMethodsByName("fillItems").get(0).getBody().orElseThrow().getStatement(0)
+                .asIfStmt().getThenStmt().asBlockStmt();
+        boolean copying = false;
+        actual.append("void fillMyItems(ArrayList<UItem> items) {\n");
+        for (var statement : codex.getStatements()) {
+            if (statement.isExpressionStmt() && statement.asExpressionStmt().getExpression().isMethodCallExpr()
+                    && statement.asExpressionStmt().getExpression().asMethodCallExpr().getNameAsString().equals("fillCodexUsageItems")) copying = true;
+            if (copying) actual.append(statement).append('\n');
+        }
+        if (!copying) throw new AssertionError("真实 My 分支未找到");
+        actual.append("}\n");
+        for (String cellName : List.of("UsageCell", "AccountMetaCell", "SettingCell")) {
+            var cell = source.findAll(ClassOrInterfaceDeclaration.class).stream()
+                    .filter(type -> type.getNameAsString().equals(cellName)).findFirst().orElseThrow();
+            var factory = cell.findAll(ClassOrInterfaceDeclaration.class).stream()
+                    .filter(type -> type.getNameAsString().equals("Factory")).findFirst().orElseThrow();
+            actual.append("static class ").append(cellName).append(" {\n");
+            for (String model : cellName.equals("UsageCell") ? List.of("MeterLine", "State")
+                    : cellName.equals("AccountMetaCell") ? List.of("State") : List.<String>of()) {
+                actual.append(cell.findAll(ClassOrInterfaceDeclaration.class).stream()
+                        .filter(type -> type.getNameAsString().equals(model)).findFirst().orElseThrow()).append('\n');
+            }
+            actual.append("static class Factory {\n");
+            if (cellName.equals("SettingCell")) {
+                for (String flag : List.of("CODEX_ROW", "CODEX_TITLE_TWO", "CODEX_SUBTITLE_TWO"))
+                    actual.append(factory.getFieldByName(flag).orElseThrow()).append('\n');
+                for (var method : factory.getMethodsByName("ofCodex")) actual.append(method).append('\n');
+            }
+            for (var method : factory.getMethodsByName("of")) actual.append(method).append('\n');
+            actual.append("}}\n");
+        }
+    }
+
     // 替身只存回调和计数；来源选择、缓存应用、去重及迟到保护全部来自实际设置页方法。
     private static final String RUNTIME = """
         package com.butang.codextop;
@@ -73,6 +109,9 @@ public final class SettingsAccountUsageUiTest {
             public static final List<Read> reads = new ArrayList<>();
             public static final List<BrowseCallback> browses = new ArrayList<>();
             public static final List<String> cursors = new ArrayList<>();
+            public static final class AccountInfo { public String loginName="synthetic-account", connectionLabel="synthetic-connection"; }
+            public static AccountInfo accountInfo() { return new AccountInfo(); }
+            public static int recentDialogLimit() { return 20; }
             /** 返回合成开关，不读取应用或账号。 */
             public static boolean enabled() { return active; }
             /** 返回指定来源的合成快照，不复制产品缓存规则。 */
@@ -110,6 +149,7 @@ public final class SettingsAccountUsageUiTest {
                 boolean getBoolean(String key, boolean fallback) { return containsKey(key) ? (Boolean)get(key) : fallback; }
                 /** 对应原 Bundle 的字符串读取。 */
                 String getString(String key) { return (String)get(key); }
+                String getString(String key, String fallback) { return containsKey(key) ? (String)get(key) : fallback; }
                 /** 对应原 Bundle 的字符串列表读取。 */
                 ArrayList<String> getStringArrayList(String key) { Object value=get(key); return value instanceof ArrayList ? (ArrayList<String>)value : null; }
             }
@@ -124,6 +164,19 @@ public final class SettingsAccountUsageUiTest {
                 /** 只计生命周期注销，不构造通知逻辑。 */
                 void removeObserver(Object owner, int event) {}
             }
+            static final class Theme {
+                static String appearance="synthetic-style";
+                static String getCodexPixelAppearanceLabel() { return appearance; }
+            }
+            static final class UItem {
+                int id, flags, iconResId; long longValue; boolean enabled=true;
+                CharSequence text, subtext, textValue; Object object, object2;
+                static UItem ofFactory(Class<?> factory) { return new UItem(); }
+                static UItem asHeader(String text) { UItem item=new UItem();item.id=-2;item.text=text;return item; }
+                static UItem asShadow(String text) { UItem item=new UItem();item.id=-1;item.text=text;return item; }
+                UItem setEnabled(boolean value) { enabled=value;return this; }
+            }
+            static String getVersionName() { return "synthetic-version"; }
             final Args args = new Args(); Object listView = new Object(); int currentAccount, renders;
             /** 仅提供平台参数容器。 */
             Args getArguments() { return args; }
@@ -210,6 +263,54 @@ public final class SettingsAccountUsageUiTest {
                 check(page.codexBrowseError!=null&&!page.codexBrowseLoading&&CodexRuntime.reads.isEmpty(),"source failure invented quota or blocked retry");
                 page.loadCodexUsageSources();check(CodexRuntime.browses.size()==3,"explicit source retry did not read");
             }
+            /** 外观页隔离额度与电脑读取；返回根页仍沿已有来源和缓存恢复。 */
+            static void appearanceScopeAndReturn() throws Exception {
+                SettingsUsageProbe page=reset();AccountUsage cached=usage(66);
+                CodexRuntime.selected="A";CodexRuntime.cache.put("A",cached);CodexRuntime.snapshot=sources("A");
+                page.args.put("codexAppearance",true);
+                check(page.codexAppearance()&&!page.codexMyRoot()&&page.codexUsageMachineId()==null,
+                        "appearance entered the quota root scope");
+                page.onResume();page.onResume();page.restoreCodexUsageFromCache();page.loadCodexUsageSources();page.loadCodexUsage();
+                check(CodexRuntime.browses.isEmpty()&&CodexRuntime.reads.isEmpty()&&page.codexUsage==null&&page.renders==0,
+                        "appearance performed quota or computer reads");
+                page.args.remove("codexAppearance");page.onResume();
+                check(page.codexUsage==cached&&"A".equals(page.codexUsageMachine)&&CodexRuntime.reads.isEmpty()
+                        &&CodexRuntime.browses.size()==1,"return to my root lost cached source or reread fresh quota");
+            }
+            static int itemIndex(List<UItem> items, int id) {
+                for(int i=0;i<items.size();i++)if(items.get(i).id==id)return i;
+                return -1;
+            }
+            /** 实际 fill 方法与实际工厂决定顺序、行标记和状态，平台不拼接预期页面。 */
+            static void overviewItems() throws Exception {
+                SettingsUsageProbe page=reset();page.codexUsageMachine="A";page.codexUsageMachineName="synthetic-long-computer-name";
+                page.codexUsage=usage(66);ArrayList<UItem> items=new ArrayList<>();page.fillMyItems(items);
+                int source=itemIndex(items,25), usage=itemIndex(items,40), appearance=itemIndex(items,34), count=itemIndex(items,6);
+                check(source>=0&&source<usage&&(items.get(source).flags&SettingCell.Factory.CODEX_SUBTITLE_TWO)!=0,
+                        "selected source did not precede quota or allow two lines");
+                int group=-1,meta=-1;
+                for(int i=0;i<items.size();i++){
+                    if("账号与外观".contentEquals(String.valueOf(items.get(i).text)))group=i;
+                    if("codex-account".equals(items.get(i).object2))meta=i;
+                }
+                check(group>usage&&meta==group+1&&appearance==meta+1&&count==appearance+1,
+                        "account, appearance and count no longer form the approved group");
+                AccountMetaCell.State account=(AccountMetaCell.State)items.get(meta).object;
+                check(account.server==null&&account.cache==null&&Theme.appearance.contentEquals(items.get(appearance).subtext),
+                        "group added removed explanations or lost the actual appearance label");
+                check(CodexRuntime.reads.isEmpty()&&CodexRuntime.browses.isEmpty(),"drawing My started a read");
+                page.args.put("codexQuota",true);page.args.put("codexMachine","A");page.args.put("codexMachineName","synthetic-detail-source");
+                items.clear();page.fillCodexUsageItems(items);source=itemIndex(items,30);usage=itemIndex(items,40);
+                check(source>=0&&source<usage&&!items.get(source).enabled
+                        &&(items.get(source).flags&SettingCell.Factory.CODEX_SUBTITLE_TWO)!=0,"detail source moved after quota, became clickable or single line");
+                page=reset();items.clear();page.fillMyItems(items);
+                check(itemIndex(items,25)>=0&&itemIndex(items,40)<0&&items.stream().anyMatch(item->item.id==-1
+                        &&"选择来源电脑后显示该电脑的 Codex 额度".contentEquals(String.valueOf(item.text))),"missing source invented quota or removed its original state");
+                page.codexUsageMachine="A";page.codexUsageError="synthetic-unavailable";items.clear();page.fillMyItems(items);
+                check(itemIndex(items,40)<0&&items.stream().anyMatch(item->item.id==-1
+                        &&"synthetic-unavailable".contentEquals(String.valueOf(item.text))),"missing quota hid the original unavailable state");
+                check(CodexRuntime.reads.isEmpty()&&CodexRuntime.browses.isEmpty(),"overview or detail items started a read");
+            }
             /** 磁盘阶段可独立于电脑名单到达；恢复明确来源，临时失败保留旧值，账号变化清旧值。 */
             static void persistedAndStale()throws Exception {
                 SettingsUsageProbe page=reset();page.onResume();AccountUsage old=usage(10);CodexRuntime.selected="B";CodexRuntime.cache.put("B",old);
@@ -261,8 +362,8 @@ public final class SettingsAccountUsageUiTest {
             }
             /** 各组只驱动真实生产方法和保存的原回调，不重写额度决策。 */
             public static void main(String[] args) throws Exception {
-                cacheAndRevisit();firstReadAndRefresh();sourceSwitch();destruction();scopesAndMissing();persistedAndStale();browserReturn();
-                System.out.println("PASS SettingsAccountUsageUiTest: cache, source callbacks, revisit, same source, refresh, switch, destroy, scopes");
+                cacheAndRevisit();firstReadAndRefresh();sourceSwitch();destruction();scopesAndMissing();appearanceScopeAndReturn();persistedAndStale();browserReturn();overviewItems();
+                System.out.println("PASS SettingsAccountUsageUiTest: cache, source callbacks, revisit, same source, refresh, switch, destroy, scopes, appearance, overview items");
             }
         """;
 }

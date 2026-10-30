@@ -46,7 +46,7 @@ public final class RuntimeQuestionRefreshTest {
             try (var loader = new URLClassLoader(new java.net.URL[]{temporary.toUri().toURL()}, RuntimeQuestionRefreshTest.class.getClassLoader())) {
                 Class<?> type = loader.loadClass("com.butang.codextop.QuestionRefreshProbe");
                 for (String method : hasRefresh ? new String[]{"main", "refreshScenarios", "staleScenarios", "linkedScenarios",
-                        "readIdentityScenarios", "identityScenarios", "openBootstrapScenarios", "deadlineScenarios",
+                        "readIdentityScenarios", "readFailureScenarios", "identityScenarios", "openBootstrapScenarios", "deadlineScenarios",
                         "knownLinkedScenarios", "independentReadScenarios", "returnedKeyScenarios"}
                         : new String[]{"main"}) {
                     try { type.getMethod(method, String[].class).invoke(null, (Object) new String[0]); }
@@ -211,6 +211,19 @@ public final class RuntimeQuestionRefreshTest {
                 reset();review=read();request=review.requests.get(0);session=new PasswordLogin.Session();
                 answerQuestions(review,request,Map.of("a","one","b","two"),(s,m)->{});pump();
                 check(desktop.sends==0,"换账号对象后仍派发");
+            }
+            /** 超时保留读取失败文案；成功返回后身份真变化仍按原守卫拒绝。 */
+            public static void readFailureScenarios(String[] ignored)throws Exception{
+                reset();desktop.onRead=()->{throw new RuntimeException(new java.util.concurrent.TimeoutException());};
+                QuestionReview[] loaded={null};String[] failure={null};
+                readQuestions(1,(review,error)->{loaded[0]=review;failure[0]=error;});pump();
+                check(loaded[0]==null&&"暂时无法读取问题，请稍后重试。".equals(failure[0]),
+                        "RPC失败被误报为电脑连接变化: "+failure[0]);
+                reset();failure[0]=null;
+                readQuestions(1,(review,error)->{loaded[0]=review;failure[0]=error;});
+                approvalQueue.all();desktopConnections.put("machine",new DesktopConnection());ui.all();
+                check(loaded[0]==null&&"电脑连接已变化，请重新查看问题。".equals(failure[0]),
+                        "真正连接变化没有保持原拒绝");
             }
             public static void openBootstrapScenarios(String[] ignored)throws Exception{
                 reset();linkedSessions.remove(1L);desktop.openedId="opened-original";
